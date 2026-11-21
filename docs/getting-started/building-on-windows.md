@@ -6,7 +6,7 @@ setup script for MSVC.
 
 | Route | Compiler | GPU backends | CI job ([`libvmaf-build-matrix.yml`](https://github.com/vidiko/vmafx/blob/master/.github/workflows/libvmaf-build-matrix.yml)) |
 | --- | --- | --- | --- |
-| [MSYS2 / MinGW-w64](#msys2-and-mingw-w64) | GCC (UCRT64) | none | `Windows UCRT64`: builds and runs the tests |
+| [MSYS2 / MinGW-w64](#msys2-and-mingw-w64) | GCC (UCRT64), clang (CLANG64), GCC (MINGW64/MSVCRT) | none | `Windows UCRT64`, `Windows CLANG64`, `Windows MINGW64 (MSVCRT)`: build and run the tests |
 | [Native MSVC, x64](#native-msvc-and-cuda) | `cl.exe` | CUDA; SYCL with `icx-cl` | `Windows MSVC+CUDA`, `Windows MSVC+SYCL`: build and install, no GPU tests |
 | [Native MSVC, ARM64](#native-msvc-on-windows-arm64) | `cl.exe` for ARM64 | none | `Windows ARM64 MSVC`: builds and runs the fast tests |
 
@@ -46,6 +46,26 @@ and run `pip install python/` from the repository root.
     meson install -C build
     python3 scripts/ci/run_meson_test.py -- -C build
     ```
+
+CI runs the same flow in three MSYS2 environments: `UCRT64` with GCC,
+`CLANG64` with clang/libc++, and `MINGW64` (MSVCRT) with GCC. To build locally
+in CLANG64 or MINGW64, open the matching MSYS2 shell and replace `ucrt-x86_64`
+in the package names above with `clang-x86_64` or `x86_64`. CLANG64 has no
+GCC: install `mingw-w64-clang-x86_64-clang` in place of the `gcc` package, which
+supplies `clang`/`clang++`. The CLANG64 lane checks the same DLL
+exports, but skips the GCC runtime-archive half of the thunk check because it
+has no `libgcc_eh.a`/`libgcc.a`/`libwinpthread.a` in the GCC layout. All three
+MSYS2 lanes build with `-Dwerror=true`, the deprecated MINGW64 (MSVCRT)
+compatibility lane included.
+
+CI keeps `-mthreads` in `CFLAGS` and `CXXFLAGS` for the GCC environments only.
+Leave it out in CLANG64: [Clang's MinGW driver](https://github.com/llvm/llvm-project/blob/llvmorg-23.1.5/clang/lib/Driver/ToolChains/MinGW.cpp)
+uses it only when linking, so compile-only checks reject it as an unused argument
+and can misreport a failed `std::expected` probe. The existing Meson
+`dependency('threads')` supplies `-pthread` for the project's pthread calls.
+CLANG64's [libc++ package](https://github.com/msys2/MINGW-packages/blob/efc96badda99c076509ef01986c673d1cd30f725/mingw-w64-libc%2B%2B/PKGBUILD)
+uses the Win32 thread API for C++ library threads. Compiler and linker warnings
+remain errors in every environment.
 
 The 32-bit MINGW32 environment is not supported: its scores do not match. The
 CI job also runs `scripts/ci/check-win64-stack-alignment.py`, because GCC's
