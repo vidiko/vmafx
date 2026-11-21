@@ -306,7 +306,10 @@ body {
   border-bottom: 0.05rem solid var(--vx-ink-line);
 }
 
+/* An explicit background lets automated contrast checks measure the tab
+ * label against the bar instead of the page behind it. */
 .md-tabs__link {
+  background-color: var(--vx-ink);
   font-size: var(--vx-text-nav);
   font-weight: 500;
   color: var(--vx-ink-fg-2);
@@ -329,6 +332,12 @@ body {
 .md-nav {
   font-size: var(--vx-text-nav);
   line-height: 1.45;
+}
+
+/* Repository facts sit on the dark header; keep them above 4.5:1. */
+.md-source__facts,
+.md-source__fact {
+  color: var(--vx-hero-fg-2);
 }
 
 .md-nav__link {
