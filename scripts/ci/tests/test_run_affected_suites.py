@@ -11,9 +11,11 @@ installer is involved.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -22,7 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,15 +34,28 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import run_affected_suites as runner  # noqa: E402
 from scripts.ci import suite_registry as registry_lib  # noqa: E402
 from scripts.lib import push_head  # noqa: E402
-from scripts.lib.safe_subprocess import TextCommandResult  # noqa: E402
+from scripts.lib.safe_subprocess import CommandTimedOut, TextCommandResult  # noqa: E402
 from scripts.lib.safe_subprocess import run as run_command  # noqa: E402
 
 SCRIPT = ROOT / "scripts" / "ci" / "run_affected_suites.py"
 GIT = shutil.which("git")
 TIMEOUT_SECONDS = 300
+MAX_LINE_LENGTH = 100
 LOCK = "pkg/requirements-dev-lock.txt"
 ROCM_SCRIPT = "scripts/ci/" + "install-rocm-" + "from-image.sh"
 ROCM_NAME = Path(ROCM_SCRIPT).name
+
+
+def _python_complexity(target: Callable[..., object]) -> int:
+    """Count repository Python cyclomatic complexity over a function's AST."""
+    branch_nodes = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.ExceptHandler)
+    score = 1
+    for node in ast.walk(ast.parse(inspect.getsource(target))):
+        if isinstance(node, branch_nodes):
+            score += 1
+        elif isinstance(node, ast.BoolOp):
+            score += len(node.values) - 1
+    return score
 
 
 def manifest() -> dict[str, object]:
@@ -508,6 +523,42 @@ class LoadCapTests(unittest.TestCase):
         self.assertIn("--timeout=7", argv)
         self.assertNotIn("--timeout=3", argv)
 
+    def test_scaled_cap_guards_zero_cpus(self) -> None:
+        zero_cpu_cap = runner.scaled_time_cap(900, 8, 8, 0)
+        self.assertEqual(zero_cpu_cap, runner.scaled_time_cap(900, 8, 8, 1))
+        self.assertLessEqual(zero_cpu_cap, 4 * 900)
+
+    def test_missing_getloadavg_reports_unavailable(self) -> None:
+        with patch.object(os, "getloadavg", side_effect=AttributeError, create=True):
+            self.assertIsNone(runner.read_host_load())
+            cap, description = runner._cap_description("pkg", 900)
+        self.assertEqual(cap, 900)
+        self.assertIn("load unavailable", description)
+
+    def test_process_cpu_count_wins_over_cpu_count(self) -> None:
+        with (
+            patch.object(os, "getloadavg", return_value=(1.0, 2.0, 3.0), create=True),
+            patch.object(os, "process_cpu_count", return_value=3, create=True),
+            patch.object(os, "cpu_count", return_value=64),
+        ):
+            self.assertEqual(runner.read_host_load(), (1.0, 2.0, 3))
+
+    def test_import_probe_timeout_raises_runner_error(self) -> None:
+        suite = registry_lib.Suite("pkg", ("t/",), ("c",))
+
+        def probe_timeout(
+            argv: Sequence[str], _root: Path, timeout: float, _env: dict[str, str] | None = None
+        ) -> TextCommandResult:
+            if "import pytest_timeout" in argv:
+                raise CommandTimedOut(tuple(argv), timeout, "", "")
+            raise AssertionError(f"unexpected command: {argv}")
+
+        with (
+            patch.object(runner, "_run", side_effect=probe_timeout),
+            self.assertRaisesRegex(runner.RunnerError, "pytest-timeout import check timed out"),
+        ):
+            runner._suite_timeout(Path(), suite, "python", {}, 3)
+
 
 class TimeoutArgvTests(unittest.TestCase):
     def suite(self, method: str = "signal") -> registry_lib.Suite:
@@ -561,6 +612,44 @@ class SkipPolicyTests(unittest.TestCase):
     def test_an_unrelated_skip_is_not_a_violation(self) -> None:
         """A skip unrelated to packages or declared inputs is no violation."""
         self.assertEqual(runner.skip_violations(self.suite(None), [("t::a", "needs a GPU")]), [])
+
+
+class ParseArgsTests(unittest.TestCase):
+    def test_non_positive_and_non_finite_caps_are_refused(self) -> None:
+        flags = ("--time-cap", "--per-test-timeout", "--install-cap")
+        for flag in flags:
+            for bad in ("0", "-1", "nan", "inf"):
+                with self.subTest(flag=flag, value=bad):
+                    stderr = io.StringIO()
+                    with (
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        runner.parse_args(["--files", "x", flag, bad])
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn("time caps must be positive", stderr.getvalue())
+            parsed = runner.parse_args(["--files", "x", flag, "1"])
+            self.assertEqual(getattr(parsed, flag[2:].replace("-", "_")), 1.0)
+
+    def test_run_pytest_and_helpers_complexity(self) -> None:
+        targets = (
+            runner.run_pytest,
+            runner.parse_args,
+            runner._suite_cap,
+            runner._failure_details,
+            runner._positive_finite,
+        )
+        for target in targets:
+            with self.subTest(function=target.__name__):
+                self.assertLessEqual(_python_complexity(target), 10)
+
+    def test_no_runner_line_past_100_columns(self) -> None:
+        overlong = [
+            f"{lineno}:{len(line)}"
+            for lineno, line in enumerate(SCRIPT.read_text(encoding="utf-8").splitlines(), start=1)
+            if len(line) > MAX_LINE_LENGTH
+        ]
+        self.assertEqual(overlong, [])
 
 
 @unittest.skipIf(GIT is None, "git is required to build the fixture repositories")
@@ -740,6 +829,17 @@ class RunTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 60)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("per-test timeout (2 s)", result.stderr)
+
+    def test_plain_failure_does_not_name_per_test_timeout(self) -> None:
+        spec = importlib.util.find_spec("pytest_timeout")
+        self.assertIsNotNone(spec, "pytest-timeout is required for this test")
+        self.build({"pkg/tests/test_plain.py": "def test_plain():\n    assert False\n"})
+        result = self.run_script(
+            "--per-test-timeout", "2", "--time-cap", "120", "--files", "pkg/tests/test_plain.py"
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAILED pkg.tests.test_plain::test_plain", result.stderr)
+        self.assertNotIn("per-test timeout (", result.stdout + result.stderr)
 
     def test_missing_timeout_plugin_is_reported(self) -> None:
         self.build({"pkg/tests/test_ok.py": "def test_ok():\n    assert True\n"})

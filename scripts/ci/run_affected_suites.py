@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -549,10 +550,36 @@ def _suite_timeout(
         raise RunnerError(f"{suite.name}: pytest-timeout import check timed out") from None
     if installed.returncode != 0:
         print(
-            f"{suite.name}: runs without a per-test timeout because pytest-timeout is not installed there"
+            f"{suite.name}: runs without a per-test timeout "
+            "because pytest-timeout is not installed there",
+            flush=True,
         )
         return None
     return suite.pytest_timeout if suite.pytest_timeout is not None else per_test_timeout
+
+
+def _suite_cap(suite_name: str, cap: float, timeout: float | None) -> tuple[float, str]:
+    if timeout is None:
+        return (
+            cap,
+            f"{suite_name}: time cap {cap:g} s (base, not load-scaled: no per-test timeout)",
+        )
+    return _cap_description(suite_name, cap)
+
+
+def _failure_details(
+    summary: JunitSummary,
+    violations: Sequence[str],
+    proc: TextCommandResult,
+    timeout: float | None,
+) -> list[str]:
+    details = [f"FAILED {name}" for name in summary.failures[:LISTED_FAILURES]]
+    details += violations[:LISTED_FAILURES]
+    if summary.failed and timeout is not None and "Timeout (>" in proc.stdout:
+        details.append(f"per-test timeout ({timeout:g} s) exceeded")
+    if proc.returncode != 0 and not (summary.failed or violations):
+        details.append(f"pytest exit {proc.returncode}:\n{proc.stdout[-3000:]}")
+    return details
 
 
 def run_pytest(
@@ -570,15 +597,8 @@ def run_pytest(
         return result, []
     junit = Path(tempfile.gettempdir()) / f"vmafx-affected-{suite.name}-{os.getpid()}.xml"
     junit.unlink(missing_ok=True)
-    details: list[str] = []
     timeout = _suite_timeout(root, suite, python, env, per_test_timeout)
-    if timeout is None:
-        effective_cap = cap
-        description = (
-            f"{suite.name}: time cap {cap:g} s (base, not load-scaled: no per-test timeout)"
-        )
-    else:
-        effective_cap, description = _cap_description(suite.name, cap)
+    effective_cap, description = _suite_cap(suite.name, cap, timeout)
     print(description, flush=True)
     try:
         proc = _run(
@@ -594,14 +614,10 @@ def run_pytest(
     junit.unlink(missing_ok=True)
     result.passed, result.failed, result.skipped = summary.passed, summary.failed, summary.skipped
     violations = skip_violations(suite, summary.skips)
+    details: list[str] = []
     if summary.failed or violations or proc.returncode != 0:
         result.status = "failed"
-        details += [f"FAILED {name}" for name in summary.failures[:LISTED_FAILURES]]
-        details += violations[:LISTED_FAILURES]
-        if summary.failed and timeout is not None and "Timeout (>" in proc.stdout:
-            details.append(f"per-test timeout ({timeout:g} s) exceeded")
-        if not (summary.failed or violations):
-            details.append(f"pytest exit {proc.returncode}:\n{proc.stdout[-3000:]}")
+        details = _failure_details(summary, violations, proc, timeout)
     return result, details
 
 
@@ -825,6 +841,10 @@ def format_result(result: SuiteResult) -> str:
     )
 
 
+def _positive_finite(value: float) -> bool:
+    return math.isfinite(value) and value > 0
+
+
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """Require one unambiguous source of changed paths for selection."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -858,7 +878,9 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     modes = sum(value is not None for value in (args.base, args.files, args.merge_base))
     if modes != 1 or (args.base is None) != (args.head is None):
         parser.error("give --base with --head, --files, or --merge-base (mutually exclusive)")
-    if args.time_cap <= 0 or args.per_test_timeout <= 0:
+    if not all(
+        _positive_finite(cap) for cap in (args.time_cap, args.per_test_timeout, args.install_cap)
+    ):
         parser.error("time caps must be positive")
     return args
 

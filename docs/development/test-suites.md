@@ -283,7 +283,13 @@ run with `pytest -p no:cacheprovider -rs` and a 300 s per-test timeout
 lacks pytest-timeout, the runner reports that tests run without this timeout.
 For suites with a per-test timeout, the 900 s base cap (`--time-cap`) is multiplied by
 `min(4, 1 + max(load1, load5) / CPUs)`; if load is unavailable, the multiplier is 1.
-Suites without a per-test timeout retain the unscaled base cap.
+Suites without a per-test timeout retain the unscaled base cap. When the child
+environment sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD`, the runner passes
+`-p pytest_timeout` ahead of `--timeout` so the plugin still loads. Where
+`signal.SIGALRM` is missing (Windows), a suite whose timeout method is `signal`
+runs with `thread` instead, and the runner prints that substitution. The
+`--time-cap`, `--per-test-timeout` and `--install-cap` values must be finite and
+above zero.
 
 Measured on a loaded 32-core workstation with a warm `uv` wheel cache: a venv
 builds in 1 to 7 s (the first build with an empty wheel cache downloads the
