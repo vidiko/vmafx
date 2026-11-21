@@ -741,23 +741,9 @@ def _is_object_id(value: str) -> bool:
     return all(ch in "0123456789abcdef" for ch in value)
 
 
-def push_branch(
-    wt: Path,
-    branch: str,
-    old_sha: str,
-    new_sha: str,
-    fork: str = "",
-    *,
-    base_sha: str = "upstream/master",
-    self_review: Path | None = None,
-) -> tuple[bool, str]:
-    """Push the verified ``new_sha``, never the symbolic HEAD, under a lease on ``old_sha``."""
-    if fork:
-        url_ok, url_detail = check_origin_url(wt, fork)
-        if not url_ok:
-            return False, f"push refused: {url_detail}"
-    if not _is_object_id(new_sha):
-        return False, "push refused: no verified commit SHA"
+def _upstream_gate_refusal(
+    wt: Path, base_sha: str, new_sha: str, self_review: Path | None
+) -> str | None:
     # Import lazily: the gate shares this module's bounded Git and signature helpers.
     from scripts.dev.upstream_push_gate import (  # noqa: PLC0415 - gate imports sweep helpers
         MAX_CLASSES,
@@ -775,12 +761,35 @@ def push_branch(
             mechanical_only=mechanical_only,
         )
     except (OSError, ValueError, RuntimeError, UsageError) as exc:
-        return False, f"push refused: upstream gate could not run ({type(exc).__name__})"
+        return f"push refused: upstream gate could not run ({type(exc).__name__})"
     for result in results[:MAX_CLASSES]:
         print(result.line(), file=sys.stderr)
     for result in results[:MAX_CLASSES]:
         if result.verdict.status == "FAIL":
-            return False, result.line()
+            return result.line()
+    return None
+
+
+def push_branch(
+    wt: Path,
+    branch: str,
+    old_sha: str,
+    new_sha: str,
+    fork: str = "",
+    *,
+    base_sha: str = "upstream/master",
+    self_review: Path | None = None,
+) -> tuple[bool, str]:
+    """Push the verified ``new_sha``, never the symbolic HEAD, under a lease on ``old_sha``."""
+    if fork:
+        url_ok, url_detail = check_origin_url(wt, fork)
+        if not url_ok:
+            return False, f"push refused: {url_detail}"
+    if not _is_object_id(new_sha):
+        return False, "push refused: no verified commit SHA"
+    gate_refusal = _upstream_gate_refusal(wt, base_sha, new_sha, self_review)
+    if gate_refusal is not None:
+        return False, gate_refusal
     refspec = f"{new_sha}:refs/heads/{branch}"
     lease = f"--force-with-lease=refs/heads/{branch}:{old_sha}"
     rc, out, err = git_cmd(wt, ["push", lease, "origin", refspec], timeout=60.0)

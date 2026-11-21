@@ -356,6 +356,17 @@ class PushGateTest(SweepFixtureCase):
             set(SELF_IDS),
         )
 
+    def test_absent_self_review_file_exits_two(self) -> None:
+        absent = str(self.root / "absent.txt")
+        rc, output = self.run_gate("--self-review", absent, review=False)
+        self.assertEqual(rc, 2, output)
+        self.assertIn("upstream-push-gate: error", output)
+        rc, output = self.run_gate(
+            "--self-review", absent, "--mechanical-only", "rebase-only push", review=False
+        )
+        self.assertEqual(rc, 2, output)
+        self.assertIn("upstream-push-gate: error", output)
+
     def test_empty_or_short_review_answer(self) -> None:
         self.add_review("C12", "")
         self.assert_failure("C12")
@@ -635,6 +646,10 @@ class PushGateTest(SweepFixtureCase):
                 self.repo, self.base, head, allow_foreign_authors=True
             )
             self.assertTrue(ok, detail)
+
+    def test_push_branch_and_gate_refusal_complexity(self) -> None:
+        self.assertLessEqual(_mccabe_complexity(sweep.push_branch), 10)
+        self.assertLessEqual(_mccabe_complexity(sweep._upstream_gate_refusal), 10)
 
 
 def _mccabe_complexity(func: Callable[..., object]) -> int:

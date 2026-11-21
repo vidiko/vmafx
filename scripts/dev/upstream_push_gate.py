@@ -237,7 +237,7 @@ def resolve_commit(repo: Path, revision: str) -> str:
 
 def read_answers(path: Path | None) -> dict[str, str]:
     answers: dict[str, str] = {}
-    if path is None or not path.exists():
+    if path is None:
         return answers
     for lineno, line in enumerate(bounded_lines(read_text(path), str(path)), 1):
         if not line.strip():
