@@ -206,11 +206,9 @@ jobs:
               // `# required-aggregator` markers and they agreed: the gap was
               // not drift, it was the declared state.
               //
-              // NOTE for anyone editing the comments in this array: the
-              // checker extracts names with a single-quote regex over the
-              // whole block, so prose here must contain no apostrophes and no
-              // single-quoted phrases. Write "the ADR-0313 rule", not
-              // "ADR-0313" followed by an apostrophe.
+              // NOTE: contract tests extract required[] with a single-quote
+              // regex, so comments here must contain no apostrophes or single
+              // quotes (write "the ADR-0313 rule", no apostrophe).
               //
               // Platform build legs (libvmaf-build-matrix.yml). The shipped
               // library must compile on every platform and toolchain the
@@ -298,8 +296,6 @@ jobs:
               // length of time before that workflow existed. `E2E — kind +
               // kuttl` does not cover it: that lane is label-gated, so it does
               // not run on the pull request that breaks the chart. This does.
-              // NOTE: no apostrophes in this block — check-aggregator-names.sh
-              // extracts required[] by matching single-quoted literals.
               'helm lint + template',
               // Documentation surfaces. `Docs Site Build` was reported under
               // the bare job id `build` until this change renamed it; a
@@ -558,21 +554,16 @@ jobs:
               'Semgrep OSS',
               'gitleaks',
             ];
-            // ADR-3556: GitHub merge queue (merge_group) event-scoped exemption.
+            // ADR-3556: merge_group exempts Scorecard Master Gate (runs on push; PR gate ran).
             const mergeGroupExempt = [
-              // It runs on the master push after the merge, and the PR gate ran on the pull request.
               'Scorecard Master Gate',
             ];
-            const eventExempt = new Set();
-            const mergeGroupExemptSet = new Set();
+            const mergeGroupExemptSet = new Set(
+              context.eventName === 'merge_group' ? mergeGroupExempt : []
+            );
+            const eventExempt = new Set(mergeGroupExemptSet);
             if (context.eventName !== 'pull_request') {
               for (const name of pullRequestOnly) eventExempt.add(name);
-            }
-            if (context.eventName === 'merge_group') {
-              for (const name of mergeGroupExempt) {
-                eventExempt.add(name);
-                mergeGroupExemptSet.add(name);
-              }
             }
             // ADR-2169 — contexts the tier of this event does not owe. A tier
             // that is not named (a push, a fork pull request, a labelled own
