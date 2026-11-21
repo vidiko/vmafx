@@ -871,15 +871,70 @@ def test_unimported_intel_dlls_are_dropped_until_nothing_changes(tmp_path: Path)
     names = {"sycl9.dll", "ur_win_proxy_loader.dll", "libmmd.dll", "ur_loader_shared.dll", "umf.dll",
              "libhwloc-15.dll", "libirngmd.dll", "libircmd.dll"}  # fmt: skip
     assert builder.drop_unimported_vendor_dlls(tmp_path, names) == [
-        "libirngmd.dll",
-        "ur_loader_shared.dll",
-        "libircmd.dll",
-        "umf.dll",
-        "libhwloc-15.dll",
+        "build/tools/libirngmd.dll",
+        "build/tools/ur_loader_shared.dll",
+        "tests/libirngmd.dll",
+        "tests/ur_loader_shared.dll",
+        "build/tools/libircmd.dll",
+        "build/tools/umf.dll",
+        "tests/libircmd.dll",
+        "tests/umf.dll",
+        "build/tools/libhwloc-15.dll",
+        "tests/libhwloc-15.dll",
     ]
     left = sorted(p.name for p in (tmp_path / "tests").iterdir())
     assert left == ["libmmd.dll", "prog.exe", "sycl9.dll", "ur_win_proxy_loader.dll"]  # fmt: skip
     assert builder.drop_unimported_vendor_dlls(tmp_path, names) == []
+
+
+def test_unimported_intel_dlls_drop_per_directory_not_across_directories(tmp_path: Path) -> None:
+    pe = make_pe(0x8664, ["kernel32.dll"])
+    write_pe(tmp_path, "build/tools/prog.exe", make_pe(0x8664, ["sycl9.dll"]))
+    write_pe(tmp_path, "tests/prog.exe", make_pe(0x8664, ["sycl9.dll", "svml_dispmd.dll"]))
+    write_pe(tmp_path, "build/tools/svml_dispmd.dll", pe)
+    write_pe(tmp_path, "tests/svml_dispmd.dll", pe)
+    for name in builder.LOADED_AT_RUN_TIME:
+        write_pe(tmp_path, f"build/tools/{name}", pe)
+        write_pe(tmp_path, f"tests/{name}", pe)
+    names = {"sycl9.dll", "svml_dispmd.dll", *builder.LOADED_AT_RUN_TIME}  # fmt: skip
+    assert builder.drop_unimported_vendor_dlls(tmp_path, names) == ["build/tools/svml_dispmd.dll"]
+    assert (tmp_path / "tests/svml_dispmd.dll").is_file()
+    assert not (tmp_path / "build/tools/svml_dispmd.dll").exists()
+
+
+def test_unimported_intel_dlls_keep_dlls_imported_or_loaded_in_each_directory(
+    tmp_path: Path,
+) -> None:
+    pe = make_pe(0x8664, ["kernel32.dll"])
+    for directory in builder.PROGRAM_DIRS:
+        write_pe(tmp_path, f"{directory}/prog.exe", make_pe(0x8664, ["svml_dispmd.dll"]))
+        write_pe(tmp_path, f"{directory}/svml_dispmd.dll", pe)
+        for name in builder.LOADED_AT_RUN_TIME:
+            write_pe(tmp_path, f"{directory}/{name}", pe)
+    names = {"svml_dispmd.dll", *builder.LOADED_AT_RUN_TIME}  # fmt: skip
+    assert builder.drop_unimported_vendor_dlls(tmp_path, names) == []
+
+
+def test_unimported_intel_dlls_orphan_chain_drops_one_directory_only(tmp_path: Path) -> None:
+    pe = make_pe(0x8664, ["kernel32.dll"])
+    write_pe(tmp_path, "build/tools/prog.exe", make_pe(0x8664, ["sycl9.dll"]))
+    write_pe(tmp_path, "build/tools/libirngmd.dll", make_pe(0x8664, ["libircmd.dll"]))
+    write_pe(tmp_path, "build/tools/libircmd.dll", pe)
+    write_pe(tmp_path, "tests/prog.exe", make_pe(0x8664, ["libirngmd.dll", "libircmd.dll"]))
+    write_pe(tmp_path, "tests/libirngmd.dll", make_pe(0x8664, ["libircmd.dll"]))
+    write_pe(tmp_path, "tests/libircmd.dll", pe)
+    for name in builder.LOADED_AT_RUN_TIME:
+        write_pe(tmp_path, f"build/tools/{name}", pe)
+        write_pe(tmp_path, f"tests/{name}", pe)
+    names = {"libirngmd.dll", "libircmd.dll", *builder.LOADED_AT_RUN_TIME}  # fmt: skip
+    assert builder.drop_unimported_vendor_dlls(tmp_path, names) == [
+        "build/tools/libirngmd.dll",
+        "build/tools/libircmd.dll",
+    ]
+    assert (tmp_path / "tests/libirngmd.dll").is_file()
+    assert (tmp_path / "tests/libircmd.dll").is_file()
+    assert not (tmp_path / "build/tools/libirngmd.dll").exists()
+    assert not (tmp_path / "build/tools/libircmd.dll").exists()
 
 
 def test_the_shipped_windows_sycl_runtime_list_names_redistributable_dlls() -> None:

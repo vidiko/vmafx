@@ -398,27 +398,40 @@ def check_runtime_dll_references(bundle: Path, names: set[str]) -> None:
     print(f"::notice::Intel run-time DLL references: {notice}", flush=True)
 
 
+def _drop_unimported_vendor_dlls_in_directory(
+    bundle: Path, directory: str, names: set[str], read: Callable[[bytes], Any]
+) -> list[str]:
+    """Remove listed Intel DLLs under one program directory that nothing there imports."""
+    imported: set[str] = set(LOADED_AT_RUN_TIME)
+    present: set[str] = set()
+    root = bundle / directory
+    for path in sorted(root.iterdir()):
+        if path.is_file() and path.suffix.lower() in PE_SUFFIXES:
+            imported |= set(read(path.read_bytes())[1])
+            present.add(path.name.lower())
+    removed: list[str] = []
+    for name in sorted(names & present - imported):
+        remove(root / name)
+        removed.append(f"{directory}/{name}")
+    return removed
+
+
 def drop_unimported_vendor_dlls(bundle: Path, names: set[str]) -> list[str]:
-    """Remove the listed Intel DLLs that no file beside the programs imports and that
+    """Remove the listed Intel DLLs that no file in its own directory imports and that
     the SYCL runtime does not load by name (ADR-1503 rule 1: ship only what runs). One
     removal can orphan another, so it repeats until nothing changes."""
     read = pe_imports()
     dropped: list[str] = []
-    for _ in range(len(names) + 1):
-        imported: set[str] = set(LOADED_AT_RUN_TIME)
-        present: set[str] = set()
+    bound = len(names) * len(PROGRAM_DIRS) + 1
+    for _ in range(bound):
+        changed = False
         for directory in PROGRAM_DIRS:
-            for path in sorted((bundle / directory).iterdir()):
-                if path.is_file() and path.suffix.lower() in PE_SUFFIXES:
-                    imported |= set(read(path.read_bytes())[1])
-                    present.add(path.name.lower())
-        unused = sorted((names & present) - imported)
-        if not unused:
+            removed = _drop_unimported_vendor_dlls_in_directory(bundle, directory, names, read)
+            if removed:
+                changed = True
+                dropped.extend(removed)
+        if not changed:
             return dropped
-        for name in unused:
-            for directory in PROGRAM_DIRS:
-                remove(bundle / directory / name)
-            dropped.append(name)
     raise BuildError("dropping unimported Intel DLLs did not settle")
 
 
@@ -435,7 +448,7 @@ def stage_sycl(build: Path, bundle: Path) -> None:
     names = vendor_dll_names()
     stage_level_zero_loader(bundle, Path(os.environ["VMAFX_LEVEL_ZERO_PREFIX"]))
     dropped = drop_unimported_vendor_dlls(bundle, names)
-    check_runtime_dll_references(bundle, names.difference(dropped))
+    check_runtime_dll_references(bundle, names)
     versions = {"oneapi": os.environ["VMAFX_ONEAPI_VERSION"],
                 "level_zero_loader": os.environ["LEVEL_ZERO_VERSION"],
                 "intel_dlls_not_imported": ", ".join(dropped) or "none"}  # fmt: skip
