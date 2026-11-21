@@ -260,9 +260,10 @@ def http_fetch(
         sleep=sleep,
     )
     try:
-        return retrying(_http_get_once, url, headers)
+        body: bytes = retrying(_http_get_once, url, headers)
     except _HTTP_RETRY_EXCEPTIONS as last:
         raise FetchError(f"{url}: {last}") from last
+    return body
 
 
 def _token_fetcher(token: str) -> Fetcher:
