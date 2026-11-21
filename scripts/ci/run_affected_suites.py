@@ -70,6 +70,7 @@ VENV_FORMAT = "2-compile-bytecode"
 # inputs CI provides (fail_on_skip in the registry).
 MISSING_DEPENDENCY_SKIP = r"could not import|No module named|[Nn]ot installed"
 LISTED_FAILURES = 10
+THREAD_TIMEOUT_LINE = re.compile(r"^\++ Timeout \++\r?$", re.MULTILINE)
 
 
 class RunnerError(Exception):
@@ -582,6 +583,13 @@ def _failure_details(
     return details
 
 
+def _missing_results_details(proc: TextCommandResult, timeout: float | None) -> list[str]:
+    details = [f"pytest wrote no results (exit {proc.returncode}):", proc.stdout[-3000:]]
+    if timeout is not None and THREAD_TIMEOUT_LINE.search(proc.stdout):
+        return [f"per-test timeout ({timeout:g} s) exceeded", *details]
+    return details
+
+
 def run_pytest(
     root: Path,
     suite: registry_lib.Suite,
@@ -609,7 +617,7 @@ def run_pytest(
         return result, [f"pytest exceeded {description}"]
     if not junit.exists():
         result.status = "failed"
-        return result, [f"pytest wrote no results (exit {proc.returncode}):", proc.stdout[-3000:]]
+        return result, _missing_results_details(proc, timeout)
     summary = parse_junit(junit)
     junit.unlink(missing_ok=True)
     result.passed, result.failed, result.skipped = summary.passed, summary.failed, summary.skipped

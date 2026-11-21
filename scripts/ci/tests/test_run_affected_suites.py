@@ -499,11 +499,11 @@ class LoadCapTests(unittest.TestCase):
         self.assertEqual(runner.scaled_time_cap(900, 1000, 0, 16), 3600)
 
     def test_unavailable_load_and_cpu_fallback(self) -> None:
-        with patch.object(os, "getloadavg", side_effect=OSError):
+        with patch.object(os, "getloadavg", side_effect=OSError, create=True):
             cap, description = runner._cap_description("pkg", 900)
         self.assertEqual(cap, 900)
         self.assertIn("load unavailable", description)
-        with patch.object(os, "getloadavg", return_value=(1.0, 2.0, 3.0)):
+        with patch.object(os, "getloadavg", return_value=(1.0, 2.0, 3.0), create=True):
             with patch.object(os, "process_cpu_count", return_value=None, create=True):
                 with patch.object(os, "cpu_count", return_value=8):
                     self.assertEqual(runner.read_host_load(), (1.0, 2.0, 8))
@@ -595,6 +595,56 @@ class TimeoutArgvTests(unittest.TestCase):
             self.assertIn("--timeout-method=thread", args)
 
 
+class MissingResultsTests(unittest.TestCase):
+    def test_thread_timeout_banner_names_per_test_timeout(self) -> None:
+        stdout = "x\n" + "+" * 30 + " Timeout " + "+" * 31 + "\n"
+        proc = TextCommandResult((), 1, stdout, "")
+        self.assertEqual(
+            runner._missing_results_details(proc, 2),
+            [
+                "per-test timeout (2 s) exceeded",
+                "pytest wrote no results (exit 1):",
+                stdout,
+            ],
+        )
+
+    def test_missing_timeout_or_plain_output_keeps_missing_results_only(self) -> None:
+        banner = "x\n" + "+" * 30 + " Timeout " + "+" * 31 + "\n"
+        plain = "collected 1 item\n"
+        for stdout, timeout in ((banner, None), (plain, 2)):
+            with self.subTest(stdout=stdout, timeout=timeout):
+                proc = TextCommandResult((), 1, stdout, "")
+                self.assertEqual(
+                    runner._missing_results_details(proc, timeout),
+                    ["pytest wrote no results (exit 1):", stdout],
+                )
+
+    def test_thread_timeout_separator_boundaries(self) -> None:
+        for stdout in ("Timeout (>2.0s) from pytest-timeout.", "x + Timeout + y"):
+            with self.subTest(stdout=stdout):
+                proc = TextCommandResult((), 1, stdout, "")
+                self.assertEqual(
+                    runner._missing_results_details(proc, 2),
+                    ["pytest wrote no results (exit 1):", stdout],
+                )
+        for stdout in (
+            "+ Timeout +",
+            "a\n+ Timeout +\nb",
+            "+ Timeout +\r",
+            "a\r\n+ Timeout +\r\nb",
+        ):
+            with self.subTest(stdout=stdout):
+                proc = TextCommandResult((), 1, stdout, "")
+                self.assertEqual(
+                    runner._missing_results_details(proc, 2),
+                    [
+                        "per-test timeout (2 s) exceeded",
+                        "pytest wrote no results (exit 1):",
+                        stdout,
+                    ],
+                )
+
+
 class SkipPolicyTests(unittest.TestCase):
     def suite(self, fail_on_skip: str | None) -> registry_lib.Suite:
         return registry_lib.Suite("s", ("t/",), ("c",), fail_on_skip=fail_on_skip)
@@ -637,6 +687,7 @@ class ParseArgsTests(unittest.TestCase):
             runner.parse_args,
             runner._suite_cap,
             runner._failure_details,
+            runner._missing_results_details,
             runner._positive_finite,
         )
         for target in targets:
@@ -809,6 +860,30 @@ class RunTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 60)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("per-test timeout (2 s)", result.stderr)
+
+    def test_thread_method_timeout_is_named(self) -> None:
+        spec = importlib.util.find_spec("pytest_timeout")
+        self.assertIsNotNone(spec, "pytest-timeout is required for this test")
+        data = manifest()
+        suites = data["suites"]
+        assert isinstance(suites, list)
+        for entry in suites:
+            if isinstance(entry, dict) and entry.get("name") == "pkg":
+                entry["pytest"] = {"method": "thread"}
+        self.build(
+            {
+                ".github/test-suites.json": json.dumps(data),
+                "pkg/tests/test_hang.py": "import time\ndef test_hang():\n    time.sleep(600)\n",
+            }
+        )
+        started = time.monotonic()
+        result = self.run_script(
+            "--per-test-timeout", "2", "--time-cap", "120", "--files", "pkg/tests/test_hang.py"
+        )
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("per-test timeout (2 s) exceeded", result.stderr)
+        self.assertIn("pytest wrote no results", result.stderr)
 
     def test_per_test_timeout_stops_hang_with_autoload_disabled(self) -> None:
         spec = importlib.util.find_spec("pytest_timeout")
