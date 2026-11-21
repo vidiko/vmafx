@@ -36,6 +36,10 @@ BODY = "Exercise the low resolution buffer with a release build input."
 RANGE_LIMIT = 3
 MAX_COLUMNS = 100
 MIN_HITS = 2
+# The old organisation reference is split into fragments so the repository
+# reference check does not flag these fixture inputs.
+OLD_REF = "VMAF" "x/vmafx"
+OLD_URL = "github.com/" "vmafx/vmafx"
 
 
 def setUpModule() -> None:
@@ -230,7 +234,7 @@ class PushGateTest(SweepFixtureCase):
             gate.read_diff(self.repo, unrelated, "HEAD")
 
     def test_c05_message_attribution_and_fork_reference(self) -> None:
-        for text in ("Co-authored-by: Claude <noreply@anthropic.com>", "See VMAFx/vmafx."):
+        for text in ("Co-authored-by: Claude <noreply@anthropic.com>", f"See {OLD_REF}."):
             with self.subTest(text=text):
                 self.amend(body=BODY + "\n\n" + text)
                 output = self.assert_failure("C05")
@@ -252,7 +256,7 @@ class PushGateTest(SweepFixtureCase):
         self.assertEqual(self.run_gate()[0], 0)
 
     def test_c05_added_diff_line(self) -> None:
-        for text in ("See github.com/vmafx/vmafx", "Generated with a coding tool"):
+        for text in (f"See {OLD_URL}", "Generated with a coding tool"):
             with self.subTest(text=text):
                 self.write("libvmaf/test/test_x.c", text + "\n")
                 self.amend()
@@ -260,7 +264,7 @@ class PushGateTest(SweepFixtureCase):
                 self.assertIn("libvmaf/test/test_x.c:1", output)
 
     def test_c05_added_diff_line_with_form_feed_leak(self) -> None:
-        self.write("libvmaf/test/test_x.c", "ok\fSee github.com/vmafx/vmafx\n")
+        self.write("libvmaf/test/test_x.c", f"ok\fSee {OLD_URL}\n")
         self.amend()
         output = self.assert_failure("C05")
         self.assertIn("libvmaf/test/test_x.c:1", output)
@@ -618,7 +622,7 @@ class PushGateTest(SweepFixtureCase):
             gate._unique_json_object(over_limit)
 
     def test_c05_added_plus_plus_line_is_not_treated_as_header(self) -> None:
-        self.write("libvmaf/test/test_x.c", "++ benign line\n++ See VMAFx/vmafx\n")
+        self.write("libvmaf/test/test_x.c", f"++ benign line\n++ See {OLD_REF}\n")
         self.amend()
         output = self.assert_failure("C05")
         self.assertIn("libvmaf/test/test_x.c:2", output)
