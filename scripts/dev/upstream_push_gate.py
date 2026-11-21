@@ -120,10 +120,10 @@ class Context:
 def bounded_lines(text: str, source: str) -> list[str]:
     if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
         raise ValueError(f"{source}: exceeds {MAX_TEXT_BYTES} bytes")
-    lines = text.splitlines()
+    lines = text.removesuffix("\n").split("\n") if text else []
     if len(lines) > MAX_LINES:
         raise ValueError(f"{source}: exceeds {MAX_LINES} lines")
-    return lines
+    return [line.removesuffix("\r") for line in lines[:MAX_LINES]]
 
 
 def read_text(path: Path) -> str:

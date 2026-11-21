@@ -223,7 +223,7 @@ A source change under `libvmaf/src/`, `libvmaf/tools/`, or `python/vmaf/` withou
 
 `push_branch` calls the same gate directly on the resolved `base_sha..new_sha` immediately before pushing. A FAIL produces a REFUSED row whose detail is the first FAIL line, and no push runs. The gate verifies the proposed head even if a build moved symbolic HEAD. An empty `base..head` range or a range containing a merge commit is refused as an error before checks run.
 
-When `--self-review` is omitted, the sweep supplies `--mechanical-only "rebase-only push"`, which skips the six self-review classes and prints that reason. A person can use this mode for a pure rebase after reviewing the existing patch. It does not waive C04, C07, signatures, message shape, or any other mechanical check.
+When `--self-review` is omitted, the sweep supplies `--mechanical-only "rebase-only push"`, which skips the six self-review classes and prints that reason. A person can use this mode for a pure rebase after reviewing the existing patch. The other mechanical checks still run, C04, C07, signatures and message shape included; the sweep passes no draft files, so C09 reports SKIP ("no draft files supplied", `scripts/dev/upstream_push_gate.py:486-487`); whoever publishes hand-drafted pull-request or comment text first runs the gate with `--draft <file>` (`:612`) on the proposed head, so C09 checks the commit IDs in that text.
 
 When `--self-review /path/to/self-review.txt` is passed to the sweep,
 `--mechanical-only` is omitted so all six self-review classes run alongside the

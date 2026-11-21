@@ -259,6 +259,27 @@ class PushGateTest(SweepFixtureCase):
                 output = self.assert_failure("C05")
                 self.assertIn("libvmaf/test/test_x.c:1", output)
 
+    def test_c05_added_diff_line_with_form_feed_leak(self) -> None:
+        self.write("libvmaf/test/test_x.c", "ok\fSee github.com/vmafx/vmafx\n")
+        self.amend()
+        output = self.assert_failure("C05")
+        self.assertIn("libvmaf/test/test_x.c:1", output)
+
+    def test_c05_added_diff_line_with_benign_form_feed(self) -> None:
+        self.write("libvmaf/test/test_x.c", "ok\fbenign page break\n")
+        self.amend()
+        rc, output = self.run_gate()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("PASS C05 ", output)
+
+    def test_bounded_lines_lf_only_boundaries(self) -> None:
+        self.assertEqual(gate.bounded_lines("a\fb\n", "src"), ["a\fb"])
+        self.assertEqual(gate.bounded_lines("a\r\nb", "src"), ["a", "b"])
+        self.assertEqual(gate.bounded_lines("", "src"), [])
+        self.assertEqual(gate.bounded_lines("a\n\nb\n", "src"), ["a", "", "b"])
+        with self.assertRaisesRegex(ValueError, f"exceeds {gate.MAX_LINES} lines"):
+            gate.bounded_lines("a\n" * (gate.MAX_LINES + 1), "src")
+
     def test_c06_upstream_conflict(self) -> None:
         self.write("libvmaf/src/x.c", "upstream\n")
         git_run(self.repo, "add", ".")
