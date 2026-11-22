@@ -25,10 +25,12 @@
 #include <unistd.h>
 #endif
 
+#include "compat/crt_portable.h"
 #include "mu_table.h"
 #include "test.h"
 
 #include "dnn/model_loader.h"
+#include "signer_fixtures.h"
 
 /* NOLINTBEGIN(modernize-use-nullptr): C translation unit. The fork builds C as
  * C23, where clang-tidy also proposes the `nullptr` keyword, but MSVC's
@@ -44,6 +46,10 @@ static char *test_verify_null_path(void)
 }
 
 #ifndef _WIN32
+#define TEST_BUFFER_256 256u
+#define TEST_BUFFER_512 512u
+#define TEST_BUFFER_4096 4096u
+
 /* Helper: write a tiny scratch file + return its path inside `out_path`.
  *
  * Uses open(O_CREAT|O_WRONLY|O_TRUNC, 0600) instead of fopen("wb") so the
@@ -260,10 +266,10 @@ static char *test_verify_registry_no_slash_in_path(void)
     return NULL;
 }
 
-/* Build a fake `cosign` shell script under <dir>/cosign that exits
- * `exit_code`. Used to exercise the posix_spawnp + waitpid paths
- * without requiring the real Sigstore toolchain. Mode 0700 (owner
- * read/write/exec; CodeQL-clean). */
+/* Build a fake `cosign` shell script under <dir>/cosign that writes its
+ * arguments, one per line, to <dir>/argv.txt and exits `exit_code`. Used to
+ * exercise the posix_spawnp + waitpid paths without requiring the real
+ * Sigstore toolchain. Mode 0700 (owner read/write/exec; CodeQL-clean). */
 static int write_fake_cosign(const char *dir, int exit_code)
 {
     char path[512];
@@ -283,9 +289,17 @@ static int write_fake_cosign(const char *dir, int exit_code)
         (void)close(fd);
         return -1;
     }
-    /* Minimal shebang stub. The fork's verify-blob argv gets ignored
-     * — only the exit code matters for branch coverage. */
-    if (fprintf(f, "#!/bin/sh\nexit %d\n", exit_code) < 0) {
+    /* Minimal shebang stub: record argv for the identity checks, then exit. */
+    if (fprintf(
+            f,
+            "#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s/argv.txt'\n"
+            "for arg in \"$@\"; do case \"$arg\" in --bundle=*) p=${arg#--bundle=};; esac; done\n"
+            "d=$(/usr/bin/dirname \"$p\")\n"
+            "(/usr/bin/stat -c '%%a' \"$d\" 2>/dev/null || "
+            "/usr/bin/stat -f '%%Lp' \"$d\") > '%s/mode.txt'\n"
+            "/usr/bin/cmp -s \"$p\" '%s/k.onnx.sigstore.json' && printf same > '%s/bytes.txt'\n"
+            "exit %d\n",
+            dir, dir, dir, dir, exit_code) < 0) {
         (void)fclose(f);
         return -1;
     }
@@ -298,25 +312,155 @@ static int write_fake_cosign(const char *dir, int exit_code)
  * run_with_fake_cosign. Extracted so the caller's branch count stays inside
  * the readability-function-size budget: a helper `if (msg) return msg;` is
  * one branch versus the two each mu_assert contributes at the call site. */
-static char *setup_fake_cosign_fixture(char *dir, size_t dir_sz, int exit_code)
+static char *setup_fake_cosign_fixture(char *dir, size_t dir_sz, int exit_code, const char *bundle)
 {
     mu_assert("setup scratch dir",
               setup_scratch_dir(dir, dir_sz, exit_code == 0 ? "cosign_ok" : "cosign_fail") == 0);
-    /* Registry + bundle + onnx all under <dir>. The bundle must be a
-     * regular file (any contents — the fake cosign ignores them). */
+    /* Registry + bundle + onnx all under <dir>. The bundle's signing
+     * certificate is checked before cosign runs (ADR-2985); the fake cosign
+     * ignores the file. */
     const char *reg_body = "{\"models\":[{\"id\":\"k\",\"onnx\":\"k.onnx\",\"sha256\":\"00\","
                            "\"sigstore_bundle\":\"k.onnx.sigstore.json\"}]}";
     mu_assert("write registry", write_in_dir(dir, "registry.json", reg_body) == 0);
-    mu_assert("write bundle", write_in_dir(dir, "k.onnx.sigstore.json", "{}") == 0);
+    mu_assert("write bundle", write_in_dir(dir, "k.onnx.sigstore.json", bundle) == 0);
     mu_assert("write onnx", write_in_dir(dir, "k.onnx", "fake") == 0);
     mu_assert("write fake cosign", write_fake_cosign(dir, exit_code) == 0);
     return NULL;
 }
 
-static char *run_with_fake_cosign(int exit_code, int expected_err)
+static FILE *open_read_stream(const char *path)
+{
+    int fd = openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return NULL;
+    FILE *stream = fdopen(fd, "rb");
+    if (!stream && close(fd) != 0)
+        return NULL;
+    return stream;
+}
+
+/* Read <dir>/argv.txt, the arguments the fake cosign received, into @p out
+ * (empty when cosign never ran). */
+static void read_recorded_argv_with_buffers(const char *dir, char *out, size_t out_sz, char *path)
+{
+    out[0] = '\0';
+    const int n = snprintf(path, TEST_BUFFER_512, "%s/argv.txt", dir);
+    if (n < 0 || (size_t)n >= TEST_BUFFER_512)
+        return;
+    FILE *f = open_read_stream(path);
+    if (!f)
+        return;
+    const size_t r = fread(out, 1u, out_sz - 1u, f);
+    out[r] = '\0';
+    if (fclose(f) != 0)
+        out[0] = '\0';
+}
+
+static void read_recorded_argv(const char *dir, char *out, size_t out_sz)
+{
+    char *path = calloc(TEST_BUFFER_512, 1u);
+    if (!path) {
+        free(path);
+        out[0] = '\0';
+        return;
+    }
+    read_recorded_argv_with_buffers(dir, out, out_sz, path);
+    free(path);
+}
+
+static char *assert_copy_path_removed(char *copy_path)
+{
+    struct stat st;
+    mu_assert("copy removed", stat(copy_path, &st) != 0);
+    char *slash = strrchr(copy_path, '/');
+    mu_assert("directory path", slash != NULL);
+    *slash = '\0';
+    mu_assert("directory removed", stat(copy_path, &st) != 0);
+    return NULL;
+}
+
+static char *check_private_copy_removed_with_buffers(const char *dir, char *argv_seen, char *path)
+{
+    read_recorded_argv(dir, argv_seen, TEST_BUFFER_4096);
+    const char *arg = strstr(argv_seen, "--bundle=");
+    mu_assert("bundle argument recorded", arg != NULL);
+    // SAFETY: arg points to the matched "--bundle=" literal in argv_seen.
+    const char *copy = arg + (sizeof("--bundle=") - 1u);
+    const char *end = strchr(copy, '\n');
+    mu_assert("bundle argument ends", end != NULL);
+    // SAFETY: end was found by strchr starting at copy, so copy <= end in argv_seen.
+    int n = snprintf(path, TEST_BUFFER_512, "%.*s", (int)(end - copy), copy);
+    mu_assert("copy path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
+    mu_assert("different bundle path", strstr(path, "k.onnx.sigstore.json") == NULL);
+    return assert_copy_path_removed(path);
+}
+
+static char *check_private_copy_removed(const char *dir)
+{
+    char *argv_seen = calloc(TEST_BUFFER_4096, 1u);
+    char *path = calloc(TEST_BUFFER_512, 1u);
+    if (!argv_seen || !path) {
+        free(argv_seen);
+        free(path);
+        return "allocation failed";
+    }
+    char *result = check_private_copy_removed_with_buffers(dir, argv_seen, path);
+    free(argv_seen);
+    free(path);
+    return result;
+}
+
+static char *assert_bytes_observed(const char *dir, char *mode_path)
+{
+    int bn = snprintf(mode_path, TEST_BUFFER_512, "%s/bytes.txt", dir);
+    mu_assert("bytes path fits", bn > 0 && (size_t)bn < TEST_BUFFER_512);
+    struct stat st;
+    mu_assert("checked bytes passed to cosign", fstatat(AT_FDCWD, mode_path, &st, 0) == 0);
+    return NULL;
+}
+
+static char *check_copy_observation_with_buffers(const char *dir, int must_run, char *observation,
+                                                 char *mode_path)
+{
+    int mn = snprintf(mode_path, TEST_BUFFER_512, "%s/mode.txt", dir);
+    mu_assert("mode path fits", mn > 0 && (size_t)mn < TEST_BUFFER_512);
+    FILE *mode_file = open_read_stream(mode_path);
+    if (must_run)
+        mu_assert("private directory observed", mode_file != NULL);
+    if (mode_file) {
+        const int got_line = fgets(observation, TEST_BUFFER_512, mode_file) != NULL;
+        const int close_rc = fclose(mode_file);
+        char *copy_msg = check_private_copy_removed(dir);
+        if (copy_msg)
+            return copy_msg;
+        mu_assert("mode recorded", got_line);
+        mu_assert("close mode", close_rc == 0);
+        mu_assert("private directory mode", strcmp(observation, "700\n") == 0);
+        return assert_bytes_observed(dir, mode_path);
+    }
+    return NULL;
+}
+
+static char *check_copy_observation(const char *dir, int must_run)
+{
+    char *observation = calloc(TEST_BUFFER_512, 1u);
+    char *mode_path = calloc(TEST_BUFFER_512, 1u);
+    if (!observation || !mode_path) {
+        free(observation);
+        free(mode_path);
+        return "allocation failed";
+    }
+    char *result = check_copy_observation_with_buffers(dir, must_run, observation, mode_path);
+    free(observation);
+    free(mode_path);
+    return result;
+}
+
+static char *run_with_fake_cosign(const char *bundle, int exit_code, int expected_err,
+                                  char *argv_out, size_t argv_sz)
 {
     char dir[256];
-    char *setup_msg = setup_fake_cosign_fixture(dir, sizeof(dir), exit_code);
+    char *setup_msg = setup_fake_cosign_fixture(dir, sizeof(dir), exit_code, bundle);
     if (setup_msg)
         return setup_msg;
 
@@ -337,15 +481,28 @@ static char *run_with_fake_cosign(int exit_code, int expected_err)
     const int err = vmaf_dnn_verify_signature(onnx_path, reg_path);
 
     /* Restore PATH before assertion so a fail doesn't leak state. */
-    (void)setenv("PATH", path_save, 1);
+    mu_assert("restore PATH", setenv("PATH", path_save, 1) == 0);
+    if (argv_out)
+        read_recorded_argv(dir, argv_out, argv_sz);
+    char *copy_msg = check_copy_observation(dir, expected_err == 0 || exit_code != 0);
+    if (copy_msg)
+        return copy_msg;
     cleanup_in_dir(dir, "registry.json");
     cleanup_in_dir(dir, "k.onnx.sigstore.json");
     cleanup_in_dir(dir, "k.onnx");
     cleanup_in_dir(dir, "cosign");
+    cleanup_in_dir(dir, "argv.txt");
+    cleanup_in_dir(dir, "mode.txt");
+    cleanup_in_dir(dir, "bytes.txt");
     (void)rmdir(dir);
 
     mu_assert("verify_signature returned expected status", err == expected_err);
     return NULL;
+}
+
+static char *test_verify_copy_uses_private_directory(void)
+{
+    return run_with_fake_cosign(k_bundle_tag, 0, 0, NULL, 0u);
 }
 
 static char *test_verify_cosign_success(void)
@@ -354,7 +511,7 @@ static char *test_verify_cosign_success(void)
      * locate_cosign() success (lines 513-534), posix_spawnp() success
      * (line 648), waitpid() (line 653), and the WIFEXITED+0 success
      * tail (lines 657-659). */
-    return run_with_fake_cosign(0, 0);
+    return run_with_fake_cosign(k_bundle_tag, 0, 0, NULL, 0u);
 }
 
 static char *test_verify_cosign_nonzero_exit(void)
@@ -362,7 +519,269 @@ static char *test_verify_cosign_nonzero_exit(void)
     /* Fake cosign exits 1 -> verify_signature() returns -EPROTO.
      * Exercises the same locate/spawn/wait path plus the failure tail
      * at line 657. */
-    return run_with_fake_cosign(1, -EPROTO);
+    return run_with_fake_cosign(k_bundle_tag, 1, -EPROTO, NULL, 0u);
+}
+
+/* ADR-2985: the bundle's certificate must carry the vidiko owner ID and name
+ * its supply-chain workflow exactly. A cosign that accepts everything (the
+ * stub exits 0) must not make these pass. */
+static char *test_verify_wrong_owner_rejected(void)
+{
+    return run_with_fake_cosign(k_bundle_wrong_owner, 0, -EPROTO, NULL, 0u);
+}
+
+/* The owner ID of the account that held the repository before the move. */
+static char *test_verify_previous_owner_rejected(void)
+{
+    return run_with_fake_cosign(k_bundle_previous_owner, 0, -EPROTO, NULL, 0u);
+}
+
+static char *test_verify_prefix_identity_rejected(void)
+{
+    return run_with_fake_cosign(k_bundle_prefix, 0, -EPROTO, NULL, 0u);
+}
+
+static char *test_verify_suffix_identity_rejected(void)
+{
+    return run_with_fake_cosign(k_bundle_suffix, 0, -EPROTO, NULL, 0u);
+}
+
+/* cosign gets the anchored identity regexp and a private copy of the bundle
+ * that was checked, which is gone once verification returns. */
+static char *test_verify_cosign_gets_anchored_identity_with_buffers(char *argv_seen,
+                                                                    char *copy_path)
+{
+    char *msg = run_with_fake_cosign(k_bundle_tag, 0, 0, argv_seen, TEST_BUFFER_4096);
+    if (msg)
+        return msg;
+    mu_assert("anchored identity regexp",
+              strstr(argv_seen, "\n^https://github\\.com/vidiko/vmafx/\\.github/workflows/"
+                                "supply-chain\\.yml@refs/(heads/master|tags/"
+                                "v[0-9][0-9A-Za-z.+-]*)$\n") != NULL);
+    const char *bundle_arg = strstr(argv_seen, "--bundle=");
+    mu_assert("cosign got --bundle", bundle_arg != NULL);
+    // SAFETY: bundle_arg points to the matched "--bundle=" literal in argv_seen.
+    const char *copy = bundle_arg + (sizeof("--bundle=") - 1u);
+    const char *eol = strchr(copy, '\n');
+    mu_assert("bundle argument ends", eol != NULL);
+    // SAFETY: eol was found by strchr starting at copy, so copy <= eol in argv_seen.
+    const int n = snprintf(copy_path, TEST_BUFFER_512, "%.*s", (int)(eol - copy), copy);
+    mu_assert("snprintf copy path", n > 0 && (size_t)n < TEST_BUFFER_512);
+    mu_assert("private copy, not the registry's bundle", strstr(copy_path, "vmafx-bundle-"));
+    return assert_copy_path_removed(copy_path);
+}
+
+static char *test_verify_cosign_gets_anchored_identity(void)
+{
+    char *argv_seen = calloc(TEST_BUFFER_4096, 1u);
+    char *copy_path = calloc(TEST_BUFFER_512, 1u);
+    if (!argv_seen || !copy_path) {
+        free(argv_seen);
+        free(copy_path);
+        return "allocation failed";
+    }
+    char *result = test_verify_cosign_gets_anchored_identity_with_buffers(argv_seen, copy_path);
+    free(argv_seen);
+    free(copy_path);
+    return result;
+}
+
+static char *check_invalid_tmpdir_with_buffers(const char *value, int expected_err, char *saved,
+                                               char *argv_seen)
+{
+    const char *old = vmaf_getenv_portable("TMPDIR");
+    int had_old = old != NULL;
+    int n = snprintf(saved, TEST_BUFFER_4096, "%s", old ? old : "");
+    mu_assert("save TMPDIR", n >= 0 && (size_t)n < TEST_BUFFER_4096);
+    mu_assert("set TMPDIR", setenv("TMPDIR", value, 1) == 0);
+    char *msg = run_with_fake_cosign(k_bundle_tag, 0, expected_err, argv_seen, TEST_BUFFER_4096);
+    int restored = had_old ? setenv("TMPDIR", saved, 1) : unsetenv("TMPDIR");
+    mu_assert("restore TMPDIR", restored == 0);
+    if (msg)
+        return msg;
+    mu_assert("cosign not called", argv_seen[0] == '\0');
+    return NULL;
+}
+
+static char *check_invalid_tmpdir(const char *value, int expected_err)
+{
+    char *saved = calloc(TEST_BUFFER_4096, 1u);
+    char *argv_seen = calloc(TEST_BUFFER_4096, 1u);
+    if (!saved || !argv_seen) {
+        free(saved);
+        free(argv_seen);
+        return "allocation failed";
+    }
+    char *result = check_invalid_tmpdir_with_buffers(value, expected_err, saved, argv_seen);
+    free(saved);
+    free(argv_seen);
+    return result;
+}
+
+static char *test_tmpdir_requires_absolute_path(void)
+{
+    return check_invalid_tmpdir(".", -EINVAL);
+}
+
+static char *test_tmpdir_requires_directory(void)
+{
+    return check_invalid_tmpdir("/dev/null", -EINVAL);
+}
+
+static int set_directory_mode(const char *dir, mode_t mode)
+{
+    int fd = openat(AT_FDCWD, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = fchmod(fd, mode);
+    if (close(fd) != 0)
+        return -1;
+    return result;
+}
+
+static char *test_tmpdir_rejects_unprotected_shared_directory_with_buffer(char *dir)
+{
+    mu_assert("create temporary directory", setup_scratch_dir(dir, TEST_BUFFER_256, "shared") == 0);
+    mu_assert("make shared", set_directory_mode(dir, 0777) == 0);
+    char *msg = check_invalid_tmpdir(dir, -EACCES);
+    int chmod_rc = set_directory_mode(dir, S_IRWXU);
+    int remove_rc = rmdir(dir);
+    mu_assert("restore permissions", chmod_rc == 0);
+    mu_assert("remove test directory", remove_rc == 0);
+    return msg;
+}
+
+static char *test_tmpdir_rejects_unprotected_shared_directory(void)
+{
+    char *dir = calloc(TEST_BUFFER_256, 1u);
+    if (!dir)
+        return "allocation failed";
+    char *result = test_tmpdir_rejects_unprotected_shared_directory_with_buffer(dir);
+    free(dir);
+    return result;
+}
+
+static char *test_tmpdir_requires_writable_directory_with_buffer(char *dir)
+{
+    if (geteuid() == 0)
+        return NULL;
+    mu_assert("create temporary directory",
+              setup_scratch_dir(dir, TEST_BUFFER_256, "unwritable") == 0);
+    mu_assert("remove write permission", set_directory_mode(dir, S_IRUSR | S_IXUSR) == 0);
+    char *msg = check_invalid_tmpdir(dir, -EACCES);
+    int chmod_rc = set_directory_mode(dir, S_IRWXU);
+    int remove_rc = rmdir(dir);
+    mu_assert("restore permissions", chmod_rc == 0);
+    mu_assert("remove test directory", remove_rc == 0);
+    return msg;
+}
+
+static char *test_tmpdir_requires_writable_directory(void)
+{
+    if (geteuid() == 0)
+        return NULL;
+    char *dir = calloc(TEST_BUFFER_256, 1u);
+    if (!dir)
+        return "allocation failed";
+    char *result = test_tmpdir_requires_writable_directory_with_buffer(dir);
+    free(dir);
+    return result;
+}
+
+static char *check_valid_tmpdir_with_buffer(const char *value, char *saved)
+{
+    const char *old = vmaf_getenv_portable("TMPDIR");
+    const int had_old = old != NULL;
+    const int n = snprintf(saved, TEST_BUFFER_4096, "%s", old ? old : "");
+    mu_assert("save TMPDIR", n >= 0 && (size_t)n < TEST_BUFFER_4096);
+    mu_assert("set TMPDIR", setenv("TMPDIR", value, 1) == 0);
+    char *msg = run_with_fake_cosign(k_bundle_tag, 0, 0, NULL, 0u);
+    const int restored = had_old ? setenv("TMPDIR", saved, 1) : unsetenv("TMPDIR");
+    mu_assert("restore TMPDIR", restored == 0);
+    return msg;
+}
+
+static char *check_valid_tmpdir(const char *value)
+{
+    char *saved = calloc(TEST_BUFFER_4096, 1u);
+    if (!saved)
+        return "allocation failed";
+    char *result = check_valid_tmpdir_with_buffer(value, saved);
+    free(saved);
+    return result;
+}
+
+static char *test_tmpdir_accepts_sticky_shared_tmp(void)
+{
+    return check_valid_tmpdir("/tmp");
+}
+
+static char *test_tmpdir_accepts_private_under_0755_with_buffers(char *parent, char *child)
+{
+    mu_assert("create parent directory",
+              setup_scratch_dir(parent, TEST_BUFFER_256, "parent0755") == 0);
+    const mode_t mode_0755 =
+        (mode_t)S_IRWXU | (mode_t)S_IRGRP | (mode_t)S_IXGRP | (mode_t)S_IROTH | (mode_t)S_IXOTH;
+    mu_assert("set parent 0755", set_directory_mode(parent, mode_0755) == 0);
+    const int cn = snprintf(child, TEST_BUFFER_512, "%s/private", parent);
+    mu_assert("child path fits", cn > 0 && (size_t)cn < TEST_BUFFER_512);
+    (void)mkdir(child, S_IRWXU);
+    mu_assert("set child 0700", set_directory_mode(child, S_IRWXU) == 0);
+    char *msg = check_valid_tmpdir(child);
+    const int rm_child = rmdir(child);
+    const int rm_parent = rmdir(parent);
+    mu_assert("remove child directory", rm_child == 0);
+    mu_assert("remove parent directory", rm_parent == 0);
+    return msg;
+}
+
+static char *test_tmpdir_accepts_private_dir_under_0755_parent(void)
+{
+    char *parent = calloc(TEST_BUFFER_256, 1u);
+    char *child = calloc(TEST_BUFFER_512, 1u);
+    if (!parent || !child) {
+        free(parent);
+        free(child);
+        return "allocation failed";
+    }
+    char *result = test_tmpdir_accepts_private_under_0755_with_buffers(parent, child);
+    free(parent);
+    free(child);
+    return result;
+}
+
+static char *test_tmpdir_rejects_unprotected_shared_ancestor_with_buffers(char *parent, char *child)
+{
+    mu_assert("create parent directory",
+              setup_scratch_dir(parent, TEST_BUFFER_256, "parent0777") == 0);
+    const int cn = snprintf(child, TEST_BUFFER_512, "%s/private", parent);
+    mu_assert("child path fits", cn > 0 && (size_t)cn < TEST_BUFFER_512);
+    (void)mkdir(child, S_IRWXU);
+    mu_assert("set child 0700", set_directory_mode(child, S_IRWXU) == 0);
+    mu_assert("make parent 0777 without sticky", set_directory_mode(parent, 0777) == 0);
+    char *msg = check_invalid_tmpdir(child, -EACCES);
+    const int chmod_rc = set_directory_mode(parent, S_IRWXU);
+    const int rm_child = rmdir(child);
+    const int rm_parent = rmdir(parent);
+    mu_assert("restore parent permissions", chmod_rc == 0);
+    mu_assert("remove child directory", rm_child == 0);
+    mu_assert("remove parent directory", rm_parent == 0);
+    return msg;
+}
+
+static char *test_tmpdir_rejects_unprotected_shared_ancestor(void)
+{
+    char *parent = calloc(TEST_BUFFER_256, 1u);
+    char *child = calloc(TEST_BUFFER_512, 1u);
+    if (!parent || !child) {
+        free(parent);
+        free(child);
+        return "allocation failed";
+    }
+    char *result = test_tmpdir_rejects_unprotected_shared_ancestor_with_buffers(parent, child);
+    free(parent);
+    free(child);
+    return result;
 }
 
 /* Scratch-dir + registry + bundle + onnx setup shared by
@@ -557,6 +976,85 @@ static char *test_verify_bundle_is_directory(void)
     (void)rmdir(dir);
     return NULL;
 }
+
+static char *test_verify_bundle_rejects_parent_traversal_with_buffers(char *parent, char *sub,
+                                                                      char *reg_path)
+{
+    mu_assert("setup parent dir", setup_scratch_dir(parent, TEST_BUFFER_256, "traverse") == 0);
+    mu_assert("write outside bundle", write_in_dir(parent, "x.sigstore.json", k_bundle_tag) == 0);
+    const int sn = snprintf(sub, TEST_BUFFER_512, "%s/sub", parent);
+    mu_assert("sub path fits", sn > 0 && (size_t)sn < TEST_BUFFER_512);
+    (void)mkdir(sub, S_IRWXU);
+    mu_assert("chmod sub", set_directory_mode(sub, S_IRWXU) == 0);
+    const char *body = "{\"models\":[{\"id\":\"m\",\"onnx\":\"m.onnx\",\"sha256\":\"00\","
+                       "\"sigstore_bundle\":\"../x.sigstore.json\"}]}";
+    mu_assert("write sub registry", write_in_dir(sub, "registry.json", body) == 0);
+    const int rn = snprintf(reg_path, TEST_BUFFER_512, "%s/registry.json", sub);
+    mu_assert("reg path fits", rn > 0 && (size_t)rn < TEST_BUFFER_512);
+    const int err = vmaf_dnn_verify_signature("/tmp/m.onnx", reg_path);
+    cleanup_in_dir(sub, "registry.json");
+    (void)rmdir(sub);
+    cleanup_in_dir(parent, "x.sigstore.json");
+    (void)rmdir(parent);
+    mu_assert("parent traversal bundle path -> -EINVAL", err == -EINVAL);
+    return NULL;
+}
+
+static char *test_verify_bundle_rejects_parent_traversal(void)
+{
+    char *parent = calloc(TEST_BUFFER_256, 1u);
+    char *sub = calloc(TEST_BUFFER_512, 1u);
+    char *reg_path = calloc(TEST_BUFFER_512, 1u);
+    if (!parent || !sub || !reg_path) {
+        free(parent);
+        free(sub);
+        free(reg_path);
+        return "allocation failed";
+    }
+    char *result = test_verify_bundle_rejects_parent_traversal_with_buffers(parent, sub, reg_path);
+    free(parent);
+    free(sub);
+    free(reg_path);
+    return result;
+}
+
+static char *test_verify_bundle_rejects_absolute_path(void)
+{
+    const char *body = "{\"models\":[{\"id\":\"m\",\"onnx\":\"m.onnx\",\"sha256\":\"00\","
+                       "\"sigstore_bundle\":\"/tmp/m.onnx.sigstore.json\"}]}";
+    return run_with_registry_body(body, "/tmp/m.onnx", -EINVAL, "abs_bundle.json");
+}
+
+static char *test_verify_bundle_path_at_length_limit_with_buffers(char *rel, char *body)
+{
+    /* "/tmp" is 4 bytes; with '/' (1 byte) and NUL (1 byte), a relative path of
+     * TEST_BUFFER_4096 - 5 bytes (4091) makes dlen + 1 + blen + 1 == 4097 > PATH_MAX. */
+    const size_t rel_len = TEST_BUFFER_4096 - 5u;
+    for (size_t i = 0u; i < rel_len; i++)
+        rel[i] = (i % 64u == 63u) ? '/' : 'a';
+    rel[rel_len] = '\0';
+    const int n = snprintf(body, (size_t)TEST_BUFFER_4096 * 2u,
+                           "{\"models\":[{\"id\":\"m\",\"onnx\":\"m.onnx\",\"sha256\":\"00\","
+                           "\"sigstore_bundle\":\"%s\"}]}",
+                           rel);
+    mu_assert("registry body fits", n > 0 && (size_t)n < (size_t)TEST_BUFFER_4096 * 2u);
+    return run_with_registry_body(body, "/tmp/m.onnx", -ENAMETOOLONG, "long_bundle.json");
+}
+
+static char *test_verify_bundle_path_at_length_limit(void)
+{
+    char *rel = calloc(TEST_BUFFER_4096, 1u);
+    char *body = calloc((size_t)TEST_BUFFER_4096 * 2u, 1u);
+    if (!rel || !body) {
+        free(rel);
+        free(body);
+        return "allocation failed";
+    }
+    char *result = test_verify_bundle_path_at_length_limit_with_buffers(rel, body);
+    free(rel);
+    free(body);
+    return result;
+}
 #endif /* !_WIN32 */
 
 #ifdef _WIN32
@@ -590,8 +1088,24 @@ static const MuTest platform_tests[] = {
     MU_TEST(test_verify_malformed_bundle_no_close_quote),
     MU_TEST(test_verify_cosign_path_empty_string),
     MU_TEST(test_verify_cosign_not_on_path),
+    MU_TEST(test_verify_copy_uses_private_directory),
     MU_TEST(test_verify_cosign_success),
     MU_TEST(test_verify_cosign_nonzero_exit),
+    MU_TEST(test_verify_wrong_owner_rejected),
+    MU_TEST(test_verify_previous_owner_rejected),
+    MU_TEST(test_verify_prefix_identity_rejected),
+    MU_TEST(test_verify_suffix_identity_rejected),
+    MU_TEST(test_verify_cosign_gets_anchored_identity),
+    MU_TEST(test_tmpdir_requires_absolute_path),
+    MU_TEST(test_tmpdir_requires_directory),
+    MU_TEST(test_tmpdir_requires_writable_directory),
+    MU_TEST(test_tmpdir_rejects_unprotected_shared_directory),
+    MU_TEST(test_tmpdir_accepts_sticky_shared_tmp),
+    MU_TEST(test_tmpdir_accepts_private_dir_under_0755_parent),
+    MU_TEST(test_tmpdir_rejects_unprotected_shared_ancestor),
+    MU_TEST(test_verify_bundle_rejects_parent_traversal),
+    MU_TEST(test_verify_bundle_rejects_absolute_path),
+    MU_TEST(test_verify_bundle_path_at_length_limit),
 };
 #else
 static const MuTest platform_tests[] = {

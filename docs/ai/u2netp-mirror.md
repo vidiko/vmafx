@@ -115,15 +115,20 @@ certificate + Rekor entry) emitted by `cosign sign-blob` v3+.
 
 ## 5. How to verify the signature
 
-This step is **mandatory** before the binary is loaded by any
-production pipeline. The verify-blob check gates on Sigstore's
-keyless OIDC identity, so a tampered or wrong-origin binary
-fails verification:
+Verification is **mandatory** before the binary is loaded by any
+production pipeline. The manual `cosign verify-blob` command below
+checks the workflow identity and the OIDC issuer only; it does not
+check the signer's GitHub owner ID. Before loading the model, also run
+libvmaf's verification path (`vmaf_dnn_verify_signature()` /
+`--tiny-model-verify`, [ADR-2985](../adr/2985-signer-owner-id-binding.md)),
+which checks both the workflow identity and the numeric owner ID of
+`vidiko` (`340303765`) on the bundle's signing certificate before invoking
+`cosign`:
 
 ```bash
 cosign verify-blob \
   --bundle u2netp_mirror_v1.onnx.bundle \
-  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx' \
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   u2netp_mirror_v1.onnx
 ```

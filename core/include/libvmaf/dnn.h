@@ -428,7 +428,13 @@ VMAF_EXPORT const char *vmaf_dnn_session_attached_ep(VmafDnnSession *sess);
  * (T6-9 / ADR-0211). Looks up @p onnx_path's basename in
  * `model/tiny/registry.json` (alongside @p onnx_path unless
  * @p registry_path is non-NULL), reads the entry's `sigstore_bundle`
- * field, and shells out to `cosign verify-blob` via `posix_spawnp(3p)`.
+ * field (which must be a relative path confined to the registry directory),
+ * checks the bundle's signing certificate (the supply-chain workflow of
+ * vidiko/vmafx and the vidiko GitHub owner ID; ADR-2985) and shells out to
+ * `cosign verify-blob` via `posix_spawnp(3p)` on a private copy of the
+ * checked bundle (written inside a mode 0700 `mkdtemp(3)` directory under
+ * an existing absolute `TMPDIR`, else `/tmp`, whose base and ancestors are
+ * not group- or other-writable without the sticky bit, and removed).
  *
  * Designed to fail closed: any error short-circuits model load. Wired
  * through the CLI by `--tiny-model-verify`.
@@ -439,9 +445,18 @@ VMAF_EXPORT const char *vmaf_dnn_session_attached_ep(VmafDnnSession *sess);
  *
  * @return 0 on successful verification, -ENOENT on missing registry /
  *         missing bundle / no matching entry, -EACCES when `cosign` is
- *         not on PATH, -EPROTO when cosign exits non-zero, -ENOSYS on
+ *         not on PATH or `TMPDIR` (or `/tmp`) or any of its ancestors is
+ *         group- or other-writable without the sticky bit, -EPROTO when the
+ *         bundle is not a valid v0.3 bundle or its certificate names another
+ *         identity or owner or cosign exits non-zero, -EFBIG / -EIO /
+ *         -ENOMEM when the bundle cannot be read, -ENAMETOOLONG when a
+ *         derived path exceeds `PATH_MAX`, another negative errno
+ *         when its private copy cannot be written, -ENOSYS on
  *         Windows (the supply-chain workflow runs on Linux/macOS only),
- *         -EINVAL on a NULL @p onnx_path.
+ *         -EINVAL on a NULL @p onnx_path, a `sigstore_bundle` path that is
+ *         absolute, contains `..` or resolves outside the registry
+ *         directory, or a `TMPDIR` (or `/tmp`) that is relative, missing or
+ *         not a directory.
  *
  * @note Thread safety: Safe to call from any thread; uses no shared mutable state.
  */

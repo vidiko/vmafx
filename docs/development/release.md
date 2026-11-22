@@ -829,6 +829,27 @@ cosign verify ghcr.io/vidiko/vmafx-node@sha256:DIGEST \
 for every subject before the bundle can reach the release, so a release whose
 provenance does not verify is never published.
 
+#### Check the signer’s owner ID
+
+Certificate identity alone names the `vidiko` login; it does not bind the
+numeric owner ID. For a GitHub build-provenance attestation, verify its signer
+and source ref as in the recipe above, and check the owner identifier too:
+
+```bash
+set -o pipefail
+gh attestation verify vmaf --repo vidiko/vmafx \
+  --signer-workflow vidiko/vmafx/.github/workflows/supply-chain.yml \
+  --source-ref "refs/tags/${tag}" --format json \
+  | jq -e 'length > 0 and all(.[]; .verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier == "340303765")'
+```
+
+A release published before the move to `vidiko` (v1.0.0-rc.3 or earlier)
+carries `288567244`.
+
+This checks the attestation certificate, not the separate cosign blob signature.
+For tiny-model bundles, libvmaf checks the cosign certificate itself before
+verification ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
+
 ### Build provenance on release assets
 
 Every workflow that creates a GitHub release or publishes release assets
