@@ -458,6 +458,29 @@ class FreezeTests(unittest.TestCase):
         self.check_change(original.replace('(\told.md "Kept")', '(\tnew.md "Changed")'), 1)
         self.check_change(original.replace("( old.md )", "(old.md)"), 1)
 
+    def test_link_like_prose_is_content(self) -> None:
+        original = BASE.replace(
+            "Old context.",
+            "See [source]( old prose) and [single](old.md 'Kept').",
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("( old prose)", "( new prose)"), 1)
+        self.check_change(original.replace("(old.md 'Kept')", "(new.md 'Kept')"), 0)
+        self.check_change(original.replace("(old.md 'Kept')", "(new.md 'Changed')"), 1)
+
+    def test_reference_like_prose_is_content(self) -> None:
+        original = BASE.replace(
+            "Old context.",
+            "[bad]: old prose\n[ref]: old.md (Kept)",
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("[bad]: old prose", "[bad]: new prose"), 1)
+        self.check_change(original.replace("[ref]: old.md (Kept)", "[ref]: new.md (Kept)"), 0)
+
     def test_fenced_indentation_is_content(self) -> None:
         original = BASE.replace(
             "Old context.", "```python\nif ready:\n    start()\ncleanup()\n```\nOld context."

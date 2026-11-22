@@ -47,8 +47,11 @@ DIRECTIVE = re.compile(
 )
 # CommonMark allows spaces or tabs between '(' and the destination; they stay in
 # the preserved prefix so only the destination token is normalized.
-LINK = re.compile(r"(\[[^\]\n]*\]\([ \t]*)(?:<[^>\n]*>|[^\s)\n]*)([^\n)]*\))")
-REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(.*)$")
+# After the destination only an optional title and the closing parenthesis (or the
+# line end of a definition) may follow, so link-like prose stays unnormalized.
+LINK_TITLE = r"""(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*"""
+LINK = re.compile(r"(\[[^\]\n]*\]\([ \t]*)(?:<[^>\n]*>|[^\s)\n]*)(" + LINK_TITLE + r"\))")
+REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(" + LINK_TITLE + r")$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MESSAGE = (
     "body of an Accepted, Superseded or Deprecated ADR is frozen (docs/adr/README.md); "
