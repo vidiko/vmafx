@@ -219,17 +219,23 @@ class FatbinCheckTest(unittest.TestCase):
         checker.check_fatbin("k.fatbin", data)
 
     def test_raw_ptx_fails(self) -> None:
-        with self.assertRaisesRegex(checker.CompressionError, "entry 0 PTX sm_80 flags 0x11"):
+        with self.assertRaisesRegex(
+            checker.CompressionError, "entry 0 PTX sm_80 flags 0x11 stored raw"
+        ):
             checker.check_fatbin(
                 "k.fatbin", fatbin((1, 80, 0x11, b".version 9.0\n.target sm_80\n"))
             )
 
     def test_raw_cubin_fails(self) -> None:
-        with self.assertRaisesRegex(checker.CompressionError, "entry 0 cubin sm_90 flags 0x11"):
+        with self.assertRaisesRegex(
+            checker.CompressionError, "entry 0 cubin sm_90 flags 0x11 stored raw"
+        ):
             checker.check_fatbin("k.fatbin", fatbin((2, 90, 0x11, elf_header(190))))
 
     def test_raw_without_marker_fails(self) -> None:
-        with self.assertRaisesRegex(checker.CompressionError, "entry 0 PTX sm_80 flags 0x11"):
+        with self.assertRaisesRegex(
+            checker.CompressionError, "entry 0 PTX sm_80 flags 0x11 stored raw"
+        ):
             checker.check_fatbin("k.fatbin", fatbin((1, 80, 0x11, b"opaque")))
 
     def test_trailing_ptx_fails(self) -> None:
@@ -266,8 +272,19 @@ class FatbinCheckTest(unittest.TestCase):
     def test_entry_limit_fails(self) -> None:
         entry = (2, 90, 0x8011, b"")
         with patch.object(checker, "MAX_FATBIN_ENTRIES", 2):
-            with self.assertRaisesRegex(checker.CompressionError, "entry limit.*offset"):
+            with self.assertRaisesRegex(checker.CompressionError, "entry limit at offset 144"):
                 checker.check_fatbin("k.fatbin", fatbin(entry, entry, entry))
+
+    def test_entry_limit_across_containers_fails(self) -> None:
+        entry = (2, 90, 0x8011, b"")
+        with patch.object(checker, "MAX_FATBIN_ENTRIES", 2):
+            with self.assertRaisesRegex(checker.CompressionError, "entry limit at offset 160"):
+                checker.fatbin_entries("k.fatbin", fatbin(entry, entry) + fatbin(entry))
+
+    def test_entries_at_limit_pass(self) -> None:
+        entry = (2, 90, 0x8011, b"")
+        with patch.object(checker, "MAX_FATBIN_ENTRIES", 2):
+            self.assertEqual(len(checker.fatbin_entries("k.fatbin", fatbin(entry, entry))), 2)
 
     def test_wrong_magic_fails(self) -> None:
         with self.assertRaisesRegex(checker.CompressionError, "not a CUDA fatbin"):

@@ -133,7 +133,8 @@ def fatbin_entries(name: str, data: bytes) -> list[tuple[int, int, int, int, int
         if offset == len(data):
             return entries
         offset, end = fatbin_container_end(name, data, offset)
-        for _ in range(MAX_FATBIN_ENTRIES):
+        # One pass past the limit: it ends the container or raises the total check.
+        for _ in range(MAX_FATBIN_ENTRIES + 1):
             if offset == end:
                 break
             if len(entries) >= MAX_FATBIN_ENTRIES or offset + FATBIN_ENTRY_HEADER_SIZE > end:
@@ -153,9 +154,6 @@ def fatbin_entries(name: str, data: bytes) -> list[tuple[int, int, int, int, int
                 raise CompressionError(f"{name}: malformed entry at offset {offset}")
             entries.append((len(entries), kind, sm, flags, start, finish, compressed, decompressed))
             offset = finish
-        else:
-            if offset != end:
-                raise CompressionError(f"{name}: entry limit at offset {offset}")
     if offset != len(data):
         raise CompressionError(f"{name}: container limit at offset {offset}")
     return entries
