@@ -56,8 +56,10 @@ and follows the structure in [0000-template.md](0000-template.md):
   anywhere. Headings inside code fences are content, not sections. Prose may be
   rewrapped or respaced without changing its words, including blank lines and
   table spacing. A commit trailer `ADR-Body-Edit: <reason>` of at least 20
-  characters permits other body edits; carry the trailer into the squash commit
-  body so the reason remains in master history.
+  characters permits other body edits in the ADRs whose `ADR-NNNN` id the
+  reason names, and only in those; a reason that names no ADR id is refused.
+  Carry the trailer into the squash commit body so the reason remains in master
+  history.
   `scripts/ci/check-adr-body-freeze.py` enforces this rule.
 - **One decision per ADR** — if you find yourself writing "and also…", split it.
 - **Tagging**: use the flat tag palette below so `grep -l 'Tags:.*cuda'

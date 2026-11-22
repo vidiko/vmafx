@@ -5,8 +5,9 @@
 
 Allow status lines, References sections, appended dated status-update sections,
 new supersession notes directly below the status block, link target repairs,
-whole-line markdownlint directives, and whitespace-only reflow. A commit in the
-range may override refusals with an ADR-Body-Edit trailer of at least 20 characters.
+whole-line markdownlint directives, and whitespace-only reflow. An ADR-Body-Edit
+trailer of at least 20 characters on a commit in the range overrides refusals only in
+the ADRs whose ADR-NNNN id its reason names; a reason that names no ADR id is refused.
 Compare ADR changes from the merge base of the supplied revisions.
 """
 
@@ -37,6 +38,7 @@ status_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(status_module)
 STATUS_RE = status_module.STATUS_RE
 ADR = re.compile(r"^docs/adr/[0-9]{4}-[^/]*\.md$")
+ADR_ID = re.compile(r"\bADR-([0-9]{4})\b")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 UPDATE = re.compile(r"^#{2,3} Status update \d{4}-\d{2}-\d{2}(?:\b|$)")
 DIRECTIVE = re.compile(
@@ -250,20 +252,23 @@ class InvalidReason(Exception):
     """The override trailer does not explain its reason sufficiently."""
 
 
-def override(base: str, head: str) -> tuple[str, str] | None:
-    """Find and validate a trailer on a commit in the checked range."""
+def override(base: str, head: str) -> dict[str, tuple[str, str]]:
+    """Map each ADR number a trailer in the checked range names to its commit and reason."""
     output = git("log", "--format=%H%x00%(trailers:key=ADR-Body-Edit)%x00", f"{base}..{head}")
     fields = output.split("\0")
-    found = None
+    waivers: dict[str, tuple[str, str]] = {}
     for index in range(0, len(fields) - 1, 2):
         sha, trailers = fields[index].strip(), fields[index + 1].strip()
         for trailer in trailers.splitlines():
             reason = trailer.partition(":")[2].strip()
             if len(reason) < REASON_MIN_LENGTH:
                 raise InvalidReason("ADR-Body-Edit reason must contain at least 20 characters")
-            if found is None:
-                found = (sha[:10], reason)
-    return found
+            numbers = ADR_ID.findall(reason)
+            if not numbers:
+                raise InvalidReason("ADR-Body-Edit reason must name each waived ADR as ADR-NNNN")
+            for number in numbers:
+                waivers.setdefault(number, (sha[:10], reason))
+    return waivers
 
 
 def check(base: str, head: str) -> int:
@@ -276,8 +281,8 @@ def check(base: str, head: str) -> int:
     fields = git("diff", "--name-status", "-z", "-M", merge_base, head, "--", "docs/adr/").split(
         "\0"
     )
-    waiver = override(base, head)
-    failures: list[str] = []
+    waivers = override(base, head)
+    failures: list[tuple[str, str]] = []
     cursor = 0
     while cursor < len(fields) - 1:
         kind, path = fields[cursor : cursor + 2]
@@ -288,16 +293,24 @@ def check(base: str, head: str) -> int:
             cursor += 1
         if not ADR.fullmatch(path) or path.endswith("/0000-template.md") or kind == "A":
             continue
+        number = Path(target).name[:4]
         for line, heading in file_problems(merge_base, head, kind, path, target):
-            failures.append(f"{target}:{line}: {heading}: {MESSAGE}")
-    for failure in failures:
-        print(f"note: {failure}" if waiver else failure)
-    if failures and waiver:
-        print(
-            f"ADR body freeze: {len(failures)} hunk(s) accepted under ADR-Body-Edit in "
-            f"{waiver[0]}: {waiver[1]}"
-        )
-    return int(bool(failures) and not waiver)
+            failures.append((number, f"{target}:{line}: {heading}: {MESSAGE}"))
+    return report(failures, waivers)
+
+
+def report(failures: list[tuple[str, str]], waivers: dict[str, tuple[str, str]]) -> int:
+    """Print refusals and waived hunks; return 1 when a refusal has no waiver."""
+    for number, failure in failures:
+        print(f"note: {failure}" if number in waivers else failure)
+    for number, (sha, reason) in sorted(waivers.items()):
+        accepted = sum(1 for item, _ in failures if item == number)
+        if accepted:
+            print(
+                f"ADR body freeze: ADR-{number}: {accepted} hunk(s) accepted under "
+                f"ADR-Body-Edit in {sha}: {reason}"
+            )
+    return int(any(number not in waivers for number, _ in failures))
 
 
 def main() -> int:

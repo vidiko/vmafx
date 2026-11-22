@@ -286,12 +286,42 @@ class FreezeTests(unittest.TestCase):
 
     def test_override(self) -> None:
         self.write(ADR, BASE.replace("Old consequence.", "New consequence."))
-        self.commit("fixture\n\nADR-Body-Edit: redact a development host name from the record")
+        self.commit("fixture\n\nADR-Body-Edit: ADR-1234 redact a development host name")
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("note: docs/adr/1234-example.md:", result.stdout)
         self.assertIn("1 hunk(s) accepted under ADR-Body-Edit in", result.stdout)
-        self.assertIn("redact a development host name from the record", result.stdout)
+        self.assertIn("ADR-1234: 1 hunk(s) accepted", result.stdout)
+        self.assertIn("redact a development host name", result.stdout)
+
+    def test_override_names_other_adr(self) -> None:
+        self.write(ADR, BASE.replace("Old consequence.", "New consequence."))
+        self.commit("fixture\n\nADR-Body-Edit: ADR-9999 redact a development host name")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("## Consequences", result.stdout)
+        self.assertNotIn("note:", result.stdout)
+
+    def test_override_without_adr_id(self) -> None:
+        self.write(ADR, BASE.replace("Old consequence.", "New consequence."))
+        self.commit("fixture\n\nADR-Body-Edit: redact a development host name from the record")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("must name each waived ADR", result.stderr)
+
+    def test_override_covers_named_adr_only(self) -> None:
+        other = "docs/adr/1235-other.md"
+        self.write(other, BASE)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        for name in (ADR, other):
+            self.write(name, BASE.replace("Old consequence.", "New consequence."))
+        self.commit("fixture\n\nADR-Body-Edit: ADR-1234 redact a development host name")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("note: docs/adr/1234-example.md:", result.stdout)
+        self.assertIn("\ndocs/adr/1235-other.md:", "\n" + result.stdout)
+        self.assertIn("ADR-1234: 1 hunk(s) accepted", result.stdout)
 
     def test_override_short_reason(self) -> None:
         self.write(ADR, BASE.replace("Old consequence.", "New consequence."))
@@ -301,7 +331,7 @@ class FreezeTests(unittest.TestCase):
         self.assertIn("at least 20 characters", result.stderr)
 
     def test_override_outside_range(self) -> None:
-        self.commit("fixture\n\nADR-Body-Edit: redact a development host name from the record")
+        self.commit("fixture\n\nADR-Body-Edit: ADR-1234 redact a development host name")
         self.base = self.git("rev-parse", "HEAD").strip()
         self.write(ADR, BASE.replace("Old consequence.", "New consequence."))
         self.commit()
