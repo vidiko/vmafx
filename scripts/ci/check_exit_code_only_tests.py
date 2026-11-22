@@ -22,7 +22,9 @@ line. Findings exit 1. Added, type-changed, and untracked files, and files
 renamed from a path that is not a direct `test_*.py` child of
 `scripts/ci/tests/`, are checked in full. Unreadable files, files above 1 MiB,
 paths outside the repository root, changed or untracked test candidates inside
-`<pathspec>` not in the discovered test files, unsupported diff status letters,
+`<pathspec>` not in the discovered test files (a rename is judged by its
+destination path, so a test file renamed to a support module is ignored),
+unsupported diff status letters,
 exceeded file bounds (`MAX_AST_NODES` nodes per file, `MAX_DECORATORS` decorators
 on any test function or enclosing definition), a selected unescaped test function
 whose body exceeds `MAX_BODY_NODES` nodes, an assertion-walk bound exceeded in a
@@ -81,6 +83,7 @@ MAX_CALL_ARGS = 64
 MAX_DECORATORS = 32
 MAX_ASSIGN_TARGETS = 32
 MAX_ENV_VARS = 4_096
+MAX_SOURCE_TOKENS = 1_000_000
 MIN_REASON_LENGTH = 10
 TOP_FILES_LIMIT = 5
 EQUAL_OPERAND_COUNT = 2
@@ -719,23 +722,69 @@ def _extract_test_functions(
     raise ScanError(f"{rel_path}: exceeds {MAX_AST_NODES} AST nodes")
 
 
-def _definition_lines(node: DefNode) -> list[tuple[int, int]]:
-    """Return the definition line and all lines occupied by its decorators."""
+def _definition_lines(node: DefNode, header_ends: dict[int, int]) -> list[tuple[int, int]]:
+    """Return header (through terminating colon) and decorator line spans."""
     if len(node.decorator_list) > MAX_DECORATORS:
         raise ScanError(f"{node.name}: definition exceeds {MAX_DECORATORS} decorators")
-    return [(node.lineno, max(node.lineno, _statement_start(node.body[0]) - 1))] + [
+    fallback_end = max(node.lineno, _statement_start(node.body[0]) - 1)
+    header_end = header_ends.get(node.lineno, fallback_end)
+    return [(node.lineno, header_end)] + [
         (dec.lineno, dec.end_lineno or dec.lineno) for dec in node.decorator_list[:MAX_DECORATORS]
     ]
 
 
+def _source_token_maps(
+    source: str, rel_path: str
+) -> tuple[dict[int, tuple[str, int, bool]], dict[int, int]]:
+    """Return comment and definition-header-end maps from one tokenize pass."""
+    lines = source.split("\n")
+    comments: dict[int, tuple[str, int, bool]] = {}
+    header_ends: dict[int, int] = {}
+    pending_line: int | None = None
+    bracket_depth = 0
+    token_iter = tokenize.generate_tokens(io.StringIO(source).readline)
+    for index in range(MAX_SOURCE_TOKENS + 1):
+        try:
+            token = next(token_iter)
+        except StopIteration:
+            break
+        if index >= MAX_SOURCE_TOKENS:
+            raise ScanError(f"{rel_path}: exceeds {MAX_SOURCE_TOKENS} source tokens")
+        if token.type == tokenize.COMMENT:
+            line_no = token.start[0]
+            comments[line_no] = (
+                token.string,
+                token.start[1],
+                not lines[line_no - 1][: token.start[1]].strip(),
+            )
+        elif token.type == tokenize.NAME and token.string in ("def", "class"):
+            pending_line = token.start[0]
+            bracket_depth = 0
+        elif token.type == tokenize.OP:
+            if token.string in "([{":
+                bracket_depth += 1
+            elif token.string in ")]}":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif token.string == ":" and pending_line is not None and bracket_depth == 0:
+                header_ends[pending_line] = token.start[0]
+                pending_line = None
+    else:
+        raise ScanError(f"{rel_path}: exceeds {MAX_SOURCE_TOKENS} source tokens")
+    return comments, header_ends
+
+
 def _function_touched(
-    func: FuncNode, parents: tuple[DefNode, ...], end: int, hunks: list[tuple[int, int]]
+    func: FuncNode,
+    parents: tuple[DefNode, ...],
+    end: int,
+    hunks: list[tuple[int, int]],
+    header_ends: dict[int, int],
 ) -> bool:
     """Match a function span or an enclosing definition header against hunks."""
-    start = min(line for line, _ in _definition_lines(func))
+    start = min(line for line, _ in _definition_lines(func, header_ends))
     spans = [(start, end)]
     for parent in parents[:MAX_AST_NODES]:
-        spans.extend(_definition_lines(parent))
+        spans.extend(_definition_lines(parent, header_ends))
     return any(a <= end and start_line <= b for a, b in spans for start_line, end in hunks)
 
 
@@ -779,22 +828,13 @@ def file_findings(
         tree = ast.parse(source, filename=rel_path)
     except SyntaxError as exc:
         raise ScanError(f"{rel_path}:{exc.lineno or 1}: syntax error: {exc.msg}") from exc
-    lines = source.split("\n")
-    comments = {
-        token.start[0]: (
-            token.string,
-            token.start[1],
-            not lines[token.start[0] - 1][: token.start[1]].strip(),
-        )
-        for token in tokenize.generate_tokens(io.StringIO(source).readline)
-        if token.type == tokenize.COMMENT
-    }
-    funcs = _extract_test_functions(tree, rel_path, len(lines))
+    comments, header_ends = _source_token_maps(source, rel_path)
+    funcs = _extract_test_functions(tree, rel_path, len(source.split("\n")))
     findings: list[Finding] = []
     # len(funcs) <= MAX_AST_NODES is enforced by _extract_test_functions.
     for func, parents, end in funcs[:MAX_AST_NODES]:
         if hunks is not None and not (
-            _function_touched(func, parents, end, hunks)
+            _function_touched(func, parents, end, hunks, header_ends)
             or _marker_touched(func, comments, hunks, removed or {}, added or set())
         ):
             continue
@@ -960,9 +1000,7 @@ def _changed_files_by_path(
     # len(changes) <= 2 * MAX_TEST_FILES is enforced by _parse_name_status_z
     # and _add_untracked_files.
     for changed_path in list(changes)[: 2 * MAX_TEST_FILES]:
-        if (
-            _is_test_candidate(changed_path) or _is_test_candidate(changes[changed_path] or "")
-        ) and changed_path not in discovered_rels:
+        if _is_test_candidate(changed_path) and changed_path not in discovered_rels:
             raise ScanError(
                 f"{changed_path}: changed or untracked Python path is not in discovered test files"
             )

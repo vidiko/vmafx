@@ -181,6 +181,30 @@ class ExitCodeOnlyMarkersTest(ExitCodeOnlyFixture):
         self.assertEqual(rc, 1, err)
         self.assertIn("test_weak", err)
 
+    def test_changed_class_body_comment_does_not_select_method(self) -> None:
+        source = (
+            "class TestX:\n    # class note\n    def test_weak(self):\n"
+            "        rc = run_checker()\n        assert rc == 0\n"
+        )
+        target = self._commit_file(REL_TEST_FILE, source)
+        target.write_text(source.replace("# class note", "# class note changed"), encoding="utf-8")
+        rc, out, err = self._run_checker("--changed-against", "HEAD")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("0 exit-code-only test findings", out)
+
+        header_source = (
+            "class TestX:  # note\n    def test_weak(self):\n"
+            "        rc = run_checker()\n        assert rc == 0\n"
+        )
+        header_target = self._commit_file(REL_TEST_FILE, header_source)
+        header_target.write_text(
+            header_source.replace("# note", "# note changed"),
+            encoding="utf-8",
+        )
+        rc_header, _, err_header = self._run_checker("--changed-against", "HEAD")
+        self.assertEqual(rc_header, 1, err_header)
+        self.assertIn("test_weak", err_header)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,16 @@ class ExitCodeOnlyDiffSelectionTest(ExitCodeOnlyFixture):
         self.assertEqual(rc, 1, err)
         self.assertIn("test_weak: asserts only exit code 0", err)
 
+    def test_rename_test_file_to_support_module_is_ignored(self) -> None:
+        old = "scripts/ci/tests/test_old.py"
+        new = "scripts/ci/tests/helper.py"
+        self._commit_file(old, "def test_weak():\n    rc = run_checker()\n    assert rc == 0\n")
+        self._git("mv", old, new)
+        self._git("commit", "-q", "-m", "rename")
+        rc, out, err = self._run_checker("--changed-against", "HEAD~1")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("0 exit-code-only test findings", out)
+
     def test_r11_f10_outgoing_oserror(self) -> None:
         self._commit_file(REL_TEST_FILE, "# base\n")
         for attr in ("revision_modes", "revision_bytes"):

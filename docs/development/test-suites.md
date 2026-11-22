@@ -365,8 +365,10 @@ python3 scripts/ci/check_exit_code_only_tests.py --changed-against origin/master
   `git diff --name-status -z -M --no-color --no-ext-diff <merge-base> -- <pathspec>`
   and `git ls-files -z --others --exclude-standard -- <pathspec>`, and checks
   weak tests when a zero-context diff hunk touches their span (including
-  decorators), or a definition or decorator line of an enclosing function or
-  class. A pure deletion touches its new-side start and the next line. A comment
+  decorators), or a header line (through its terminating colon) or decorator
+  line of an enclosing function or class; a comment between a class header and
+  its first method is not a header line. A pure deletion touches its new-side
+  start and the next line. A comment
   edit inside an old weak test therefore reports it. A test's span extends to
   the line before the next statement in its enclosing body, or to the end of
   its enclosing definition's extended span (file end at top level). Consequently,
@@ -374,7 +376,9 @@ python3 scripts/ci/check_exit_code_only_tests.py --changed-against origin/master
   Added, type-changed, and
   untracked files, and files renamed from a path that is not a direct
   `test_*.py` child of `scripts/ci/tests/`, are checked in full; a pure rename
-  from one such test file to another has no hunks and reports nothing.
+  from one such test file to another has no hunks and reports nothing. A rename
+  is judged by its destination: a test file renamed to a support module such as
+  `helper.py` is not a test candidate and is ignored.
   When `PRE_COMMIT_TO_REF` is set, it compares the merge base with that
   outgoing commit and reads its files, ignoring working-tree and untracked files.
   The check exits `1` on findings (`0` when clean). An
