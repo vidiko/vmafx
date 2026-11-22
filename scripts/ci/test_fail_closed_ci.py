@@ -2195,6 +2195,8 @@ class FailClosedCIContract(unittest.TestCase):
                     pytest_step, r"(?m)^          PYTHONPATH: \$\{\{ github\.workspace \}\}/python$"
                 )
                 self.assertNotRegex(pytest_step, r"PYTHO\dPATH")
+                self.assertIn("-- @scripts/ci/pytest-coverage-shard.args", pytest_step)
+                self.assertNotIn("--deselect", pytest_step)
 
         gpu_coverage = workflow_job(workflow, "coverage-gpu")
         self.assertIn("name: Coverage GPU", gpu_coverage)
@@ -2202,6 +2204,24 @@ class FailClosedCIContract(unittest.TestCase):
         self.assertNotIn("continue-on-error", gpu_coverage)
         aggregator = (WORKFLOWS / "required-aggregator.yml").read_text(encoding="utf-8")
         self.assertIn("'Coverage GPU',", aggregator)
+
+    def test_pytest_coverage_shard_argfile_lists_shared_runner_arguments(self) -> None:
+        """Assert coverage shards read pytest arguments from one argfile, not inline copies."""
+        argfile = ROOT / "scripts" / "ci" / "pytest-coverage-shard.args"
+        lines = argfile.read_text(encoding="utf-8").splitlines()
+        expected = [
+            "python/test/",
+            "-v",
+            "-m",
+            "not slow",
+            "--tb=short",
+            "--timeout=600",
+            "--timeout-method=thread",
+            "--ignore=python/test/resource",
+            "--deselect",
+            "python/test/command_line_test.py::CommandLineTest",
+        ]
+        self.assertEqual(lines, expected)
 
     def test_coverage_shard_assertion_names_why_a_shard_was_skipped(self) -> None:
         """Assert that the coverage workflow identifies why a skipped shard was skipped."""
