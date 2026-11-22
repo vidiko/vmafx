@@ -64,11 +64,16 @@ class ExitCodeOnlyHandlersTest(ExitCodeOnlyFixture):
     def test_branch_join_and_compound_statements(self) -> None:
         prefix = "def test_case(x):\n    proc = run_checker()\n    value = proc.returncode\n"
         cases = (
-            "    if x:\n        value = len(proc.stdout)\n    else:\n        value = len(proc.stdout)\n    assert value == 0\n",
-            "    try:\n        value = len(proc.stdout)\n    except ValueError:\n        assert value == 0\n",
-            "    match x:\n        case 1:\n            value = len(proc.stdout)\n        case _:\n            assert value == 0\n",
-            "    for x in ():\n        value = len(proc.stdout)\n    else:\n        assert value == 0\n",
-            "    while x:\n        value = len(proc.stdout)\n    else:\n        assert value == 0\n",
+            "    if x:\n        value = len(proc.stdout)\n"
+            "    else:\n        value = len(proc.stdout)\n    assert value == 0\n",
+            "    try:\n        value = len(proc.stdout)\n"
+            "    except ValueError:\n        assert value == 0\n",
+            "    match x:\n        case 1:\n            value = len(proc.stdout)\n"
+            "        case _:\n            assert value == 0\n",
+            "    for x in ():\n        value = len(proc.stdout)\n"
+            "    else:\n        assert value == 0\n",
+            "    while x:\n        value = len(proc.stdout)\n"
+            "    else:\n        assert value == 0\n",
             "    with context():\n        value = len(proc.stdout)\n    assert value == 0\n",
         )
         for index, body in enumerate(cases):
@@ -78,14 +83,20 @@ class ExitCodeOnlyHandlersTest(ExitCodeOnlyFixture):
 
     def test_compound_flow_carries_body_bindings(self) -> None:
         cases = (
-            "    try:\n        rc = run_checker()\n    except ValueError:\n        pass\n    else:\n        assert rc == 0\n",
+            "    try:\n        rc = run_checker()\n    except ValueError:\n        pass\n"
+            "    else:\n        assert rc == 0\n",
             "    for x in [1]:\n        rc = run_checker()\n    else:\n        assert rc == 0\n",
-            "    async for x in items:\n        rc = run_checker()\n    else:\n        assert rc == 0\n",
+            "    async for x in items:\n        rc = run_checker()\n"
+            "    else:\n        assert rc == 0\n",
             "    while x:\n        rc = run_checker()\n    else:\n        assert rc == 0\n",
-            "    try:\n        rc = run_checker()\n    except ValueError:\n        pass\n    assert rc == 0\n",
-            "    try:\n        rc = run_checker()\n    except ValueError:\n        assert rc == 0\n",
-            "    for x in [1]:\n        rc = run_checker()\n        break\n    else:\n        rc = 5\n    assert rc == 0\n",
-            "    try:\n        rc = run_checker()\n    except ValueError:\n        pass\n    finally:\n        assert rc == 0\n",
+            "    try:\n        rc = run_checker()\n    except ValueError:\n        pass\n"
+            "    assert rc == 0\n",
+            "    try:\n        rc = run_checker()\n"
+            "    except ValueError:\n        assert rc == 0\n",
+            "    for x in [1]:\n        rc = run_checker()\n        break\n"
+            "    else:\n        rc = 5\n    assert rc == 0\n",
+            "    try:\n        rc = run_checker()\n    except ValueError:\n        pass\n"
+            "    finally:\n        assert rc == 0\n",
         )
         for index, body in enumerate(cases):
             with self.subTest(case=index):
@@ -215,7 +226,8 @@ class ExitCodeOnlyHandlersTest(ExitCodeOnlyFixture):
 
     def test_compound_paths_replace_bindings(self) -> None:
         cases = (
-            "    try:\n        rc = 1\n    except ValueError:\n        rc = 2\n    assert rc == 0\n",
+            "    try:\n        rc = 1\n    except ValueError:\n        rc = 2\n"
+            "    assert rc == 0\n",
             "    if (rc := run_checker()):\n        pass\n    else:\n        assert rc == 0\n",
             "    while (rc := run_checker()):\n        break\n    else:\n        assert rc == 0\n",
         )

@@ -341,9 +341,10 @@ python3 scripts/ci/check_exit_code_only_tests.py --changed-against origin/master
   (`assert`, `self.assert*`, and `pytest.raises`); assertions inside helpers such
   as `check_output(out)` are not visible. Add an inline output assertion, for
   example `assert out.stdout == "expected"`.
-- **Escape comment**: place `# exit-code-only: <reason>` on the `def` line or
-  the line immediately above it (or its first decorator), with `<reason>` at
-  least 10 characters long. An empty or shorter reason is reported as a finding.
+- **Escape comment**: place `# exit-code-only: <reason>` at the end of the
+  `def` line or of its first decorator line, or on its own line directly above
+  either at the same indent, with `<reason>` at least 10 characters long. An
+  empty or shorter reason is reported as a finding.
 - **Modes and exit codes**: default mode reports all existing findings with an
   informational count and the top 5 files, and exits `0`. `--changed-against
   <ref>` resolves `git merge-base <ref> HEAD`, lists changed and untracked
@@ -359,15 +360,19 @@ python3 scripts/ci/check_exit_code_only_tests.py --changed-against origin/master
   its enclosing definition's extended span (file end at top level). Consequently,
   editing a comment between tests reports an upper test that is already weak.
   Added, type-changed, and
-  untracked files, and files renamed from outside `<pathspec>`, are checked in
-  full; a pure rename within the pathspec has no hunks and reports nothing.
+  untracked files, and files renamed from a path that is not a direct
+  `test_*.py` child of `scripts/ci/tests/`, are checked in full; a pure rename
+  from one such test file to another has no hunks and reports nothing.
   When `PRE_COMMIT_TO_REF` is set, it compares the merge base with that
   outgoing commit and reads its files, ignoring working-tree and untracked files.
   The check exits `1` on findings (`0` when clean). An
   unreadable file, a file above 1 MiB, an explicit path outside the repository
-  root, a changed or untracked Python path inside `<pathspec>` that is not one
-  of the discovered test files, an unsupported diff status letter, an exceeded
-  file or AST bound, a syntax error in a current test file, a bad ref, or a
+  root, a changed or untracked direct `test_*.py` child of `scripts/ci/tests/`
+  that is not one of the discovered test files, an unsupported diff status
+  letter, an exceeded file bound, an AST bound exceeded while walking a selected
+  test function (escaped functions, functions without a runner call and, in
+  changed mode, untouched functions are not walked), a syntax error in a
+  current test file, a bad ref, or a
   `git merge-base` / `git diff` / `git ls-files` failure exits `2`
   with the cause on `stderr`, never `0`.
 - **Scope limit**: the check verifies that another assertion is present; it

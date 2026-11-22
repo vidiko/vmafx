@@ -52,6 +52,14 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
                 "assertion call exceeds 1 keyword arguments",
             ),
             (
+                "MAX_CALL_ARGS",
+                1,
+                "def test_x(self) -> None:\n"
+                "    rc = run_helper()\n"
+                "    self.assertFalse(k0=0, expr=rc)\n",
+                "assertion call exceeds 1 keyword arguments",
+            ),
+            (
                 "MAX_DECORATORS",
                 1,
                 "@d1\n@d2\ndef test_x() -> None:\n    rc = run_helper()\n    assert rc == 0\n",
@@ -83,6 +91,30 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
         )
         self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
 
+    def test_augmented_assignment_invalidates_returncode(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    rc = proc.returncode\n    assert rc == 0\n"
+            "    rc += len(proc.stdout)\n    assert rc == 0\n"
+        )
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
+    def test_walrus_in_value_binds_before_target(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    rc = (rc := proc.returncode) + len(proc.stdout)\n    assert rc == 0\n"
+        )
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
+    def test_deferred_assignment_still_records_returncode(self) -> None:
+        for line in ("alias = (rc := proc.returncode)", "alias: int = proc.returncode"):
+            source = (
+                "def test_case():\n    proc = run_checker()\n"
+                f"    {line}\n    assert alias == 0\n"
+            )
+            with self.subTest(line=line):
+                self.assertEqual(len(checker.file_findings(source, REL_TEST_FILE)), 1)
+
     def test_nonassignment_rebindings_invalidate_returncode(self) -> None:
         prefix = (
             "async def test_case():\n    proc = run_checker()\n"
@@ -93,7 +125,10 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
             "async_for": "    async for value in items:\n        assert value == 0\n",
             "with": "    with context() as value:\n        assert value == 0\n",
             "async_with": "    async with context() as value:\n        assert value == 0\n",
-            "except": "    try:\n        pass\n    except Exception as value:\n        assert value == 0\n",
+            "except": (
+                "    try:\n        pass\n"
+                "    except Exception as value:\n        assert value == 0\n"
+            ),
             "capture": "    match x:\n        case value:\n            assert value == 0\n",
             "star": "    match x:\n        case [*value]:\n            assert value == 0\n",
             "mapping": "    match x:\n        case {**value}:\n            assert value == 0\n",

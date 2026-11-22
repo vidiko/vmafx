@@ -18,19 +18,22 @@ root-relative explicit paths) with
 and `git ls-files -z --others --exclude-standard -- <pathspec>`, and checks
 weak tests touched by a zero-context diff hunk, including their decorators and
 enclosing definition headers. Pure deletions touch the new-side start and next
-line. Findings exit 1. Added, type-changed, and untracked files are checked in
-full. Unreadable files, files above 1 MiB,
+line. Findings exit 1. Added, type-changed, and untracked files, and files
+renamed from a path that is not a direct `test_*.py` child of
+`scripts/ci/tests/`, are checked in full. Unreadable files, files above 1 MiB,
 paths outside the repository root, changed or untracked test candidates inside
 `<pathspec>` not in the discovered test files, unsupported diff status letters,
-exceeded AST or file bounds, syntax errors, bad refs, and git errors exit 2
-with the cause on stderr.
+exceeded file bounds, AST bounds exceeded while walking a selected test
+function, syntax errors, bad refs, and git errors exit 2 with the cause on
+stderr.
 
 When `PRE_COMMIT_TO_REF` is set in changed mode, compare the merge base with
 the outgoing commit and read its blobs; ignore untracked and working-tree files.
 
 Justified cases carry `# exit-code-only: <reason>` (reason >= 10 characters)
-on the `def` line or the line immediately above it (or its first decorator); an
-empty or shorter reason is itself a finding.
+at the end of the `def` line or of its first decorator line, or on its own
+line directly above either at the same indent; an empty or shorter reason is
+itself a finding.
 """
 
 from __future__ import annotations
@@ -116,6 +119,13 @@ class _LoopBinding(ast.AST):
     def __init__(self, target: ast.AST, iterable: ast.AST) -> None:
         self.target = target
         self.iterable = iterable
+
+
+class _AssignBinding(ast.AST):
+    """Bind an assignment's targets after its value has been walked."""
+
+    def __init__(self, node: ast.Assign | ast.AnnAssign | ast.AugAssign) -> None:
+        self.node = node
 
 
 def _invalidate_rebindings(node: _Rebinding, bindings: set[str]) -> None:
@@ -275,6 +285,20 @@ def _check_assignment_targets(targets: Sequence[ast.AST]) -> None:
             raise ScanError(f"assignment target unpack exceeds {MAX_ASSIGN_TARGETS} elements")
 
 
+def _assignment_parts(node: ast.AST) -> tuple[list[ast.expr], ast.expr | None]:
+    """Return the targets a node binds and their value; no value only invalidates."""
+    if isinstance(node, ast.NamedExpr):
+        return [node.target], node.value
+    if not isinstance(node, _AssignBinding):
+        return [], None
+    stmt = node.node
+    if isinstance(stmt, ast.Assign):
+        return list(stmt.targets), stmt.value
+    if isinstance(stmt, ast.AnnAssign):
+        return ([stmt.target], stmt.value) if stmt.value is not None else ([], None)
+    return [stmt.target], None
+
+
 def _update_rc_vars(node: ast.AST, rc_vars: set[str]) -> None:
     """Update bindings in source order, invalidating overwritten names."""
     if isinstance(node, _LoopBinding):
@@ -287,17 +311,12 @@ def _update_rc_vars(node: ast.AST, rc_vars: set[str]) -> None:
         rebound: list[ast.AST] = list(node.targets if isinstance(node, ast.Delete) else node.names)
         _invalidate_rebindings(_Rebinding(rebound), rc_vars)
         return
-    if isinstance(node, ast.Assign):
-        targets = node.targets
-        value = node.value
-    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
-        targets = [node.target]
-        value = node.value
-    else:
+    targets, value = _assignment_parts(node)
+    if not targets:
         return
     if len(targets) > MAX_ASSIGN_TARGETS:
         raise ScanError(f"assignment exceeds {MAX_ASSIGN_TARGETS} targets")
-    is_rc = _is_rc_expr(value, rc_vars)
+    is_rc = value is not None and _is_rc_expr(value, rc_vars)
     _check_assignment_targets(targets)
     _invalidate_rebindings(_Rebinding(list(targets)), rc_vars)
     if is_rc:
@@ -371,6 +390,8 @@ def _classify_assertion(node: ast.AST, rc_vars: set[str]) -> str | None:
     if name in ("assertEqual", "assertEquals"):
         pair = _equal_operands(node)
         return "rc_zero" if pair and _is_rc_zero_pair(pair[0], pair[1], rc_vars) else "other"
+    if name in ("assertTrue", "assertFalse") and len(node.keywords) > MAX_CALL_ARGS:
+        raise ScanError(f"assertion call exceeds {MAX_CALL_ARGS} keyword arguments")
     expr = (
         node.args[0]
         if node.args
@@ -587,6 +608,9 @@ def _assertion_kinds(func: FuncNode) -> list[str]:
             kinds.append(kind)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            # Python evaluates the value before it binds the targets.
+            stack.append((_AssignBinding(node), bindings))
         _push_children(node, bindings, stack)
     raise ScanError(f"{func.name}: function body exceeds {MAX_BODY_NODES} AST nodes")
 
@@ -930,7 +954,8 @@ def _changed_files_by_path(
         if others.returncode != 0:
             raise ScanError(f"{root}: git ls-files failed: {others.stderr.strip()}")
         _add_untracked_files(root, others.stdout, changes)
-    # len(changes) <= 2 * MAX_TEST_FILES is enforced by _parse_name_status_z and _add_untracked_files.
+    # len(changes) <= 2 * MAX_TEST_FILES is enforced by _parse_name_status_z
+    # and _add_untracked_files.
     for changed_path in list(changes)[: 2 * MAX_TEST_FILES]:
         if (
             _is_test_candidate(changed_path) or _is_test_candidate(changes[changed_path] or "")

@@ -216,7 +216,10 @@ class ExitCodeOnlyHunksTest(ExitCodeOnlyFixture):
         self.assertNotIn("test_a:", err)
 
     def test_weak_moved_between_helpers_is_reported(self) -> None:
-        base = "def helper_one():\n    def test_a():\n        rc = run_helper()\n        assert rc == 0\n"
+        base = (
+            "def helper_one():\n    def test_a():\n"
+            "        rc = run_helper()\n        assert rc == 0\n"
+        )
         target = self._commit_file(REL_TEST_FILE, base)
         target.write_text(base.replace("helper_one", "helper_two"), encoding="utf-8")
         rc, _out, err = self._run_checker("--changed-against", "HEAD")
@@ -242,7 +245,8 @@ class ExitCodeOnlyHunksTest(ExitCodeOnlyFixture):
         weak = "def test_a():\n    rc = run_helper()\n    assert rc == 0\n"
         target = self._commit_file(REL_TEST_FILE, weak)
         target.write_text(
-            "async def helper():\n    def test_a():\n        rc = run_helper()\n        assert rc == 0\n",
+            "async def helper():\n    def test_a():\n"
+            "        rc = run_helper()\n        assert rc == 0\n",
             encoding="utf-8",
         )
         rc, _out, err = self._run_checker("--changed-against", "HEAD")
@@ -322,7 +326,10 @@ class ExitCodeOnlyHunksTest(ExitCodeOnlyFixture):
         self.assertIn("test_a:", err)
 
     def test_duplicate_method_first_weakened_is_reported(self) -> None:
-        strong = '    def test_a(self):\n        rc = run_helper()\n        assert rc == 0\n        assert output == "ok"\n'
+        strong = (
+            "    def test_a(self):\n        rc = run_helper()\n"
+            '        assert rc == 0\n        assert output == "ok"\n'
+        )
         weak = "    def test_a(self):\n        rc = run_helper()\n        assert rc == 0\n"
         target = self._commit_file(REL_TEST_FILE, "class Suite:\n" + strong + "\n" + weak)
         target.write_text("class Suite:\n" + weak + "\n" + weak, encoding="utf-8")

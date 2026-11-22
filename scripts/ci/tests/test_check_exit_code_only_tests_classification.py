@@ -39,9 +39,12 @@ class ExitCodeOnlyClassificationTest(ExitCodeOnlyFixture):
 
     def test_r11_f2_keyword_boolean(self) -> None:
         source = (
-            "def test_false(self):\n    proc = run_checker()\n    self.assertFalse(expr=proc.returncode)\n"
-            "def test_true(self):\n    proc = run_checker()\n    self.assertTrue(expr=proc.returncode == 0)\n"
-            "def test_output(self):\n    proc = run_checker()\n    self.assertTrue(expr=proc.stdout == '')\n"
+            "def test_false(self):\n    proc = run_checker()\n"
+            "    self.assertFalse(expr=proc.returncode)\n"
+            "def test_true(self):\n    proc = run_checker()\n"
+            "    self.assertTrue(expr=proc.returncode == 0)\n"
+            "def test_output(self):\n    proc = run_checker()\n"
+            "    self.assertTrue(expr=proc.stdout == '')\n"
         )
         self._commit_file(REL_TEST_FILE, source)
         rc, out, err = self._run_checker()
@@ -90,7 +93,8 @@ class ExitCodeOnlyClassificationTest(ExitCodeOnlyFixture):
                 "import unittest\n\n"
                 "class SampleTest(unittest.TestCase):\n"
                 "    def test_checks_output_too(self) -> None:\n"
-                "        res = subprocess.run(['true'], check=False, capture_output=True, text=True)\n"
+                "        res = subprocess.run(['true'], check=False, "
+                "capture_output=True, text=True)\n"
                 "        self.assertEqual(res.returncode, 0)\n"
                 "        self.assertIn('tokens: 4', res.stdout)\n"
             ),
@@ -397,7 +401,10 @@ class ExitCodeOnlyClassificationTest(ExitCodeOnlyFixture):
         docs = (ROOT / "docs/development/test-suites.md").read_text(encoding="utf-8")
         self.assertIn("assertions inside helpers such", docs)
         self.assertIn('assert out.stdout == "expected"', docs)
-        weak = "def test_x():\n    out = run_checker()\n    assert out.returncode == 0\n    check_output(out)\n"
+        weak = (
+            "def test_x():\n    out = run_checker()\n"
+            "    assert out.returncode == 0\n    check_output(out)\n"
+        )
         self.assertEqual(len(checker.file_findings(weak, REL_TEST_FILE)), 1)
         self.assertEqual(
             checker.file_findings(weak + "    assert out.stdout == 'ok'\n", REL_TEST_FILE), []

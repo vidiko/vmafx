@@ -171,7 +171,10 @@ class ExitCodeOnlyMarkersTest(ExitCodeOnlyFixture):
                 self.assertIn("0 exit-code-only test findings", out)
 
     def test_changed_multiline_class_header_selects_method(self) -> None:
-        source = "class TestX(\n    Base,\n):\n    def test_weak(self):\n        rc = run_checker()\n        assert rc == 0\n"
+        source = (
+            "class TestX(\n    Base,\n):\n    def test_weak(self):\n"
+            "        rc = run_checker()\n        assert rc == 0\n"
+        )
         target = self._commit_file(REL_TEST_FILE, source)
         target.write_text(source.replace("Base,", "Other,"), encoding="utf-8")
         rc, _, err = self._run_checker("--changed-against", "HEAD")
