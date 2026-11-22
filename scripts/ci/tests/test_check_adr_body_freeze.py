@@ -437,6 +437,37 @@ class FreezeTests(unittest.TestCase):
             with self.subTest(heading=heading):
                 self.check_change(BASE + f"\n{heading}\nNew.\n", expected)
 
+    def test_link_title_is_kept(self) -> None:
+        original = BASE.replace("Old context.", 'See [source](old.md "Old title").')
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace('(old.md "Old title")', '(new.md "New title")'), 1)
+        self.check_change(original.replace('(old.md "Old title")', '(new.md "Old title")'), 0)
+
+    def test_fenced_indentation_is_content(self) -> None:
+        original = BASE.replace(
+            "Old context.", "```python\nif ready:\n    start()\ncleanup()\n```\nOld context."
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("\ncleanup()", "\n    cleanup()"), 1, "## Context")
+        self.check_change(original.replace("Old context.", "Old\ncontext."), 0)
+
+    def test_references_edit_then_dated_update(self) -> None:
+        for heading, expected in (
+            ("### Status update 2026-11-20", 0),
+            ("## Status update 2026-11-20", 0),
+            ("### Status update", 1),
+        ):
+            with self.subTest(heading=heading):
+                self.check_change(
+                    BASE.replace("[Source](old.md)", f"New references.\n\n{heading}\nUpdate."),
+                    expected,
+                )
+                self.check_change(BASE + f"More references.\n\n{heading}\nUpdate.\n", expected)
+
     def test_fences_in_references(self) -> None:
         cases = (
             ("unclosed fence runs to the end", "x\n\n```markdown\n## Example", 0),

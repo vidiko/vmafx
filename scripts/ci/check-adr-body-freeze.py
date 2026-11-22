@@ -45,7 +45,7 @@ DIRECTIVE = re.compile(
     r"^<!--\s*markdownlint-"
     r"(?:disable|enable|disable-line|disable-next-line|capture|restore)\b[^>]*-->\s*$"
 )
-LINK = re.compile(r"(\[[^\]\n]*\])\([^\n)]*\)")
+LINK = re.compile(r"(\[[^\]\n]*\]\()(?:<[^>\n]*>|[^\s)\n]*)([^\n)]*\))")
 REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(.*)$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MESSAGE = (
@@ -153,7 +153,7 @@ def link_repair(before: str, after: str) -> bool:
     """Permit only changes to Markdown link destinations."""
 
     def normalize(line: str) -> str:
-        return REFERENCE_LINK.sub(r"\1DEST\2", LINK.sub(r"\1()", line))
+        return REFERENCE_LINK.sub(r"\1DEST\2", LINK.sub(r"\1DEST\2", line))
 
     return before != after and normalize(before) == normalize(after)
 
@@ -171,17 +171,18 @@ def normalized_words(lines: list[str]) -> list[str]:
     return " ".join(normalized).split()
 
 
-def formatting_only(tag: str, before: list[str], after: list[str]) -> bool:
-    """Accept blank-only hunks and word-preserving replacements."""
+def formatting_only(tag: str, before: list[str], after: list[str], fenced: bool) -> bool:
+    """Accept blank-only hunks and word-preserving prose replacements outside fences."""
     return all(not line.strip() for line in before + after) or (
-        tag == "replace" and normalized_words(before) == normalized_words(after)
+        tag == "replace" and not fenced and normalized_words(before) == normalized_words(after)
     )
 
 
-def has_section_heading(lines: list[str], start: int, end: int) -> bool:
-    """Detect headings outside code fences, which start a section or subsection."""
+def references_tail(lines: list[str], start: int, end: int) -> bool:
+    """Accept References content, optionally followed by dated update sections."""
     fenced = fenced_lines(lines)
-    return any(not fenced[i] and HEADING.match(lines[i]) for i in range(start, end))
+    heading = next((i for i in range(start, end) if not fenced[i] and HEADING.match(lines[i])), end)
+    return heading == end or allowed_update(lines, heading, end)
 
 
 def references_edit(old: list[str], start: int, end: int) -> bool:
@@ -212,20 +213,22 @@ def allowed_replace(before: list[str], after: list[str], old: list[str], status:
 def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]]:
     """Return the location and section of each disallowed diff hunk."""
     failures: list[tuple[int, str]] = []
+    old_fenced, new_fenced = fenced_lines(old), fenced_lines(new)
     for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
         before = [line for line in old[a:b] if not DIRECTIVE.fullmatch(line)]
         after = [line for line in new[c:d] if not DIRECTIVE.fullmatch(line)]
-        if formatting_only(tag, before, after):
+        fenced = any(old_fenced[a:b]) or any(new_fenced[c:d])
+        if formatting_only(tag, before, after, fenced):
             continue
         if tag == "insert" and (
-            (in_references(old, max(0, a - 1)) and not has_section_heading(new, c, d))
+            (in_references(old, max(0, a - 1)) and references_tail(new, c, d))
             or allowed_update(new, c, d)
             or allowed_note(old, a, new[c:d], status)
         ):
             continue
-        if tag != "insert" and references_edit(old, a, b) and not has_section_heading(new, c, d):
+        if tag != "insert" and references_edit(old, a, b) and references_tail(new, c, d):
             continue
         if tag == "replace" and allowed_replace(before, after, old, status):
             continue
