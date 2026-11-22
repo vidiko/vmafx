@@ -847,8 +847,20 @@ A release published before the move to `vidiko` (v1.0.0-rc.3 or earlier)
 carries `288567244`.
 
 This checks the attestation certificate, not the separate cosign blob signature.
-For tiny-model bundles, libvmaf checks the cosign certificate itself before
-verification ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
+For a cosign bundle (`<artifact>.bundle`), read the owner ID from the bundle's
+signing certificate after `cosign verify-blob` passes. The command needs `jq`
+and OpenSSL and checks the Fulcio extension `1.3.6.1.4.1.57264.1.17` (source
+repository owner identifier):
+
+```bash
+jq -r '.verificationMaterial.certificate.rawBytes' vmaf.bundle | base64 -d \
+  | openssl x509 -inform DER -noout -text \
+  | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
+  && echo "owner ID OK" || echo "owner ID mismatch"
+```
+
+For tiny-model bundles, libvmaf runs this check itself before verification
+([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
 
 ### Build provenance on release assets
 

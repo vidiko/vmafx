@@ -172,7 +172,10 @@ The operator-facing fetch and verification recipe lives at
 
 !!! warning
     The verify-blob step is mandatory before the binary is loaded by any
-    production pipeline.
+    production pipeline. It does not check the signer's owner ID. Also run
+    the owner-ID check in
+    [step 5 of the mirror guide](../u2netp-mirror.md#5-how-to-verify-the-signature)
+    before loading the model.
 
 ## 9. Release / promotion follow-ups
 

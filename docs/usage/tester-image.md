@@ -716,16 +716,16 @@ to `vidiko` carries `288567244` instead.
 
 ```powershell
 # GitHub build provenance and owner-ID check (needs the GitHub CLI, gh):
-$att = @(gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip -R vidiko/vmafx `
-  --signer-workflow vidiko/vmafx/.github/workflows/windows-tester-bundle.yml --format json | ConvertFrom-Json)
+$att = @((gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip -R vidiko/vmafx `
+  --signer-workflow vidiko/vmafx/.github/workflows/windows-tester-bundle.yml --format json | ConvertFrom-Json))
 if ($LASTEXITCODE -ne 0 -or $att.Count -eq 0 -or ($att | Where-Object {
     $_.verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier -ne '340303765'
   })) { throw 'Attestation owner-ID verification failed.' }
 
 # Or verify against the attached in-toto provenance bundle (.intoto.jsonl):
-$att = @(gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip `
+$att = @((gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip `
   --bundle vmafx-tester-windows-provenance.intoto.jsonl --repo vidiko/vmafx `
-  --signer-workflow vidiko/vmafx/.github/workflows/windows-tester-bundle.yml --format json | ConvertFrom-Json)
+  --signer-workflow vidiko/vmafx/.github/workflows/windows-tester-bundle.yml --format json | ConvertFrom-Json))
 if ($LASTEXITCODE -ne 0 -or $att.Count -eq 0 -or ($att | Where-Object {
     $_.verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier -ne '340303765'
   })) { throw 'Attestation owner-ID verification failed.' }

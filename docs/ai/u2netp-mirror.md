@@ -116,14 +116,13 @@ certificate + Rekor entry) emitted by `cosign sign-blob` v3+.
 ## 5. How to verify the signature
 
 Verification is **mandatory** before the binary is loaded by any
-production pipeline. The manual `cosign verify-blob` command below
-checks the workflow identity and the OIDC issuer only; it does not
-check the signer's GitHub owner ID. Before loading the model, also run
-libvmaf's verification path (`vmaf_dnn_verify_signature()` /
-`--tiny-model-verify`, [ADR-2985](../adr/2985-signer-owner-id-binding.md)),
-which checks both the workflow identity and the numeric owner ID of
-`vidiko` (`340303765`) on the bundle's signing certificate before invoking
-`cosign`:
+production pipeline, and it takes two checks. The `cosign verify-blob`
+command below checks the signature, the workflow identity and the OIDC
+issuer. It does not check the signer's GitHub owner ID: the identity
+pattern matches the repository path, which a new account under the same
+name would also produce ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
+The second command reads the owner ID from the bundle's signing
+certificate.
 
 ```bash
 cosign verify-blob \
@@ -141,6 +140,25 @@ Verified OK
 
 Any other output (especially `Error: failed to verify`) means
 the binary is not the one this fork released. Do not load it.
+
+Then check the owner ID. The command needs `jq` and OpenSSL. It reads the
+Fulcio certificate extension `1.3.6.1.4.1.57264.1.17` (source repository
+owner identifier) and requires `340303765`, the numeric ID of `vidiko`:
+
+```bash
+jq -r '.verificationMaterial.certificate.rawBytes' u2netp_mirror_v1.onnx.bundle | base64 -d \
+  | openssl x509 -inform DER -noout -text \
+  | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
+  && echo "owner ID OK" || echo "owner ID mismatch: do not load"
+```
+
+Any output other than `owner ID OK` means the bundle was not signed from
+the `vidiko` account. Do not load the model. libvmaf's `--tiny-model-verify`
+runs both checks itself for a model listed with its `sigstore_bundle` in a
+`registry.json` next to the model; the download in step 4 has no such entry
+(see step 7). The
+[release guide](../development/release.md#check-the-signers-owner-id)
+describes the same owner-ID check for every release bundle.
 
 ## 6. How to verify the expected hash
 
