@@ -554,7 +554,7 @@ class Train:
         head = _verified_head(pr)
         if head != reviewed_head:
             raise Refused("live PR head does not match reviewed head")
-        merge_state = pr.get("mergeStateStatus")
+        merge_state: str | None = pr.get("mergeStateStatus")
         if merge_state != "CLEAN":
             raise Refused(f"PR merge state is {merge_state!r}, expected CLEAN")
         if pr.get("autoMergeRequest") is not None:
@@ -570,7 +570,7 @@ class Train:
                 "hardware probes and the aggregator blocks on the missing context; "
                 "disable the switch or keep the PR out of the queue (ADR-3610)"
             )
-        return merge_state
+        return "CLEAN"
 
     def admit_fork(self, number: int, reviewed_head: str) -> dict[str, Any]:
         """Verify read-only fork PR queue-admission gates at the exact reviewed head."""

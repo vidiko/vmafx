@@ -855,7 +855,7 @@ class TrainContract(unittest.TestCase):
             return org if "/actions/organization-variables?" in argv[2] else repo
 
         with patch.object(guard, "execute", side_effect=fake_execute):
-            enabled = guard.Train(self.root, self.state).hardware_switches()
+            enabled: set[str] = guard.Train(self.root, self.state).hardware_switches()
         self.assertEqual(
             sorted(argv[2].split("/actions/")[1] for argv in seen_argv),
             ["organization-variables?per_page=100", "variables?per_page=100"],
@@ -898,7 +898,7 @@ class TrainContract(unittest.TestCase):
         self.configure_fork_pr(("alice",))
         self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
         original_metadata = self.train.metadata.copy()
-        cases = (
+        cases: tuple[tuple[dict[str, Any], str | None, str], ...] = (
             ({"autoMergeRequest": {}}, None, "disarm it before retrying"),
             ({"state": "CLOSED"}, None, "only open PRs targeting master"),
             ({"baseRefName": "other"}, None, "only open PRs targeting master"),
