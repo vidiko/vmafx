@@ -45,7 +45,9 @@ DIRECTIVE = re.compile(
     r"^<!--\s*markdownlint-"
     r"(?:disable|enable|disable-line|disable-next-line|capture|restore)\b[^>]*-->\s*$"
 )
-LINK = re.compile(r"(\[[^\]\n]*\]\()(?:<[^>\n]*>|[^\s)\n]*)([^\n)]*\))")
+# CommonMark allows spaces or tabs between '(' and the destination; they stay in
+# the preserved prefix so only the destination token is normalized.
+LINK = re.compile(r"(\[[^\]\n]*\]\([ \t]*)(?:<[^>\n]*>|[^\s)\n]*)([^\n)]*\))")
 REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(.*)$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MESSAGE = (

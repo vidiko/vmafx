@@ -445,6 +445,19 @@ class FreezeTests(unittest.TestCase):
         self.check_change(original.replace('(old.md "Old title")', '(new.md "New title")'), 1)
         self.check_change(original.replace('(old.md "Old title")', '(new.md "Old title")'), 0)
 
+    def test_link_destination_after_whitespace_is_repairable(self) -> None:
+        original = BASE.replace(
+            "Old context.",
+            'See [source]( old.md ) and [tab](\told.md "Kept").',
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("( old.md )", "( new.md )"), 0)
+        self.check_change(original.replace('(\told.md "Kept")', '(\tnew.md "Kept")'), 0)
+        self.check_change(original.replace('(\told.md "Kept")', '(\tnew.md "Changed")'), 1)
+        self.check_change(original.replace("( old.md )", "(old.md)"), 1)
+
     def test_fenced_indentation_is_content(self) -> None:
         original = BASE.replace(
             "Old context.", "```python\nif ready:\n    start()\ncleanup()\n```\nOld context."
