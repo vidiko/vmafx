@@ -80,6 +80,10 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   --repo-root /home/kilian/dev/vmafx/vmafx --state-dir /home/kilian/dev/vmafx/vmafx/.claude/mergetrain
 ```
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e76c5722fe964174577c706e9c4f4bf72f163b501b6be67ac693210ad332210b -->
+
 - `admit-fork NUMBER --reviewed-head SHA` is read-only, runs outside `mutation.lock`,
   and refuses `--apply` (exit `1`). It verifies that `SHA` is a 40-character lowercase
   hex OID, the train is neither paused nor holding `NUMBER` (including release PR #1213),
@@ -93,8 +97,9 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   one login in `fork_reviewers` has its latest decisive review
   (`APPROVED`, `CHANGES_REQUESTED`, `DISMISSED`; `COMMENTED` and `PENDING` ignored) as
   `APPROVED` on `commit.oid == SHA` while none has `CHANGES_REQUESTED`, required checks
-  pass, and the squash commit message check passes with unchanged head, title, and body;
-  pause and holds are checked again after the squash message check.
+  pass, and the squash commit message check passes with unchanged head, title, and body.
+  A final read after the squash message check repeats the open-against-`master`, pause,
+  hold, and auto-merge checks.
   It prints a JSON receipt (`number`, `head`, `reviewer`, `submitted_at`, `merge_state`,
   `checks`) and exits `0` when eligible, or prints `merge-train: refused: ...` and exits
   `1`. Enqueue separately with `gh pr merge NUMBER --squash --match-head-commit SHA`
@@ -103,11 +108,13 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   `mergeQueue(branch: "master")` on `vidiko/vmafx` via `gh api graphql`. In-repository
   queue entries are skipped. Each cross-repository entry must satisfy the same
   `fork_reviewers` approval rule on its live `headRefOid`; the entry `headCommit` is the
-  squash commit GitHub builds, never the pull request head, so it is not compared; a null
-  `headCommit` is still audited on the pull request head. When
+  squash commit GitHub builds, never the pull request head, so the audit does not request
+  it. When
   clean, it prints `queue audit: 0 problems` and exits `0`; when any cross-repository
   entry fails, it prints one problem per line and exits `1`, and the operator removes the
   failing entry from the merge queue immediately.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Ownership and promotion
 

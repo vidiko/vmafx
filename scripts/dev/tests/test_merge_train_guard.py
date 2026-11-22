@@ -815,7 +815,7 @@ class TrainContract(unittest.TestCase):
         self.train.metadata["autoMergeRequest"] = {"enabledAt": "2026-11-22T01:00:00Z"}
         with (
             patch.object(guard, "load_squash_composer", return_value=self.stub_composer()),
-            self.assertRaisesRegex(guard.Refused, "auto-merge"),
+            self.assertRaisesRegex(guard.Refused, "owner must disable it"),
         ):
             self.train.admit_fork(1421, self.head)
         self.train.metadata["autoMergeRequest"] = None
@@ -841,36 +841,6 @@ class TrainContract(unittest.TestCase):
         with patch.object(guard, "load_squash_composer", return_value=self.stub_composer()):
             receipt = self.train.admit_fork(1421, self.head)
         self.assertEqual(receipt["head"], self.head)
-
-    def test_admit_fork_rechecks_hold_and_pause_after_squash_check(self) -> None:
-        self.configure_fork_pr(("alice",))
-        self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
-        state = self.state
-
-        class HoldComposer:
-            @staticmethod
-            def check_message(*args: Any, **kwargs: Any) -> tuple[int, str]:
-                (state / "hold.txt").write_text("1421 held\n")
-                return 0, ""
-
-        with (
-            patch.object(guard, "load_squash_composer", return_value=HoldComposer()),
-            self.assertRaisesRegex(guard.Refused, "held"),
-        ):
-            self.train.admit_fork(1421, self.head)
-        (state / "hold.txt").write_text("")
-
-        class PauseComposer:
-            @staticmethod
-            def check_message(*args: Any, **kwargs: Any) -> tuple[int, str]:
-                (state / "PAUSED").touch()
-                return 0, ""
-
-        with (
-            patch.object(guard, "load_squash_composer", return_value=PauseComposer()),
-            self.assertRaisesRegex(guard.Refused, "paused"),
-        ):
-            self.train.admit_fork(1421, self.head)
 
     @staticmethod
     def _variables_answer(**values: str) -> str:
@@ -923,6 +893,38 @@ class TrainContract(unittest.TestCase):
         workflow = (repo_root / ".github/workflows/required-aggregator.yml").read_text()
         found = set(re.findall(r"switchName: '([A-Z_]+)'", workflow))
         self.assertEqual(found, set(guard.HARDWARE_SWITCHES))
+
+    def test_admit_fork_rechecks_eligibility_after_squash_message(self) -> None:
+        self.configure_fork_pr(("alice",))
+        self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
+        original_metadata = self.train.metadata.copy()
+        cases = (
+            ({"autoMergeRequest": {}}, None, "disarm it before retrying"),
+            ({"state": "CLOSED"}, None, "only open PRs targeting master"),
+            ({"baseRefName": "other"}, None, "only open PRs targeting master"),
+            ({"headRefOid": "d" * 40}, None, "head changed during squash message check"),
+            ({}, "hold.txt", "PR #1421 is held"),
+            ({}, "PAUSED", "train is paused"),
+        )
+        for changes, state_file, reason in cases:
+            self.train.metadata = original_metadata.copy()
+            (self.state / "hold.txt").write_text("")
+
+            def check_message(
+                *_args: Any,
+                changes: dict[str, Any] = changes,
+                state_file: str | None = state_file,
+            ) -> None:
+                self.train.metadata.update(changes)
+                if state_file:
+                    (self.state / state_file).write_text("1421 newly held\n")
+
+            with (
+                self.subTest(reason=reason, changes=changes),
+                patch.object(self.train, "_check_squash_message", side_effect=check_message),
+                self.assertRaisesRegex(guard.Refused, reason),
+            ):
+                self.train.admit_fork(1421, self.head)
 
     def test_admit_fork_positive_receipt_never_merges_or_locks(self) -> None:
         self.configure_fork_pr(("alice",))
@@ -1009,6 +1011,13 @@ class TrainContract(unittest.TestCase):
         }
         self.train.queue = [same_repo_entry, valid_fork_entry]
         self.assertEqual(self.train.audit_queue(), [])
+        for head_commit in (None, "unavailable"):
+            with self.subTest(head_commit=head_commit):
+                self.train.queue = [dict(valid_fork_entry, headCommit=head_commit)]
+                self.assertEqual(self.train.audit_queue(), [])
+                self.train.queue = [dict(moved_fork_entry, headCommit=head_commit)]
+                self.assertIn(f"on head {moved}", self.train.audit_queue()[0])
+        self.train.queue = [same_repo_entry, valid_fork_entry]
         with patch.object(guard, "Train", return_value=self.train):
             clean_out = io.StringIO()
             with redirect_stdout(clean_out):
@@ -1063,6 +1072,7 @@ class TrainContract(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         self.assertEqual(seen_argv[0][:3], ["gh", "api", "graphql"])
         self.assertNotIn("--repo", seen_argv[0])
+        self.assertNotIn("headCommit", seen_argv[0][-1])
         with patch.object(guard, "execute", return_value=self._queue_graphql(node)):
             self.assertEqual(len(real_train.queue_entries()), 1)
 
@@ -1070,7 +1080,6 @@ class TrainContract(unittest.TestCase):
         real_train = guard.Train(self.root, self.state)
         node = self._queue_node()
         bad_payloads = (
-            self._queue_graphql({**node, "headCommit": "bad"}),
             self._queue_graphql({**node, "pullRequest": None}),
             "{}",
             '{"errors":[{"message":"denied"}]}',
