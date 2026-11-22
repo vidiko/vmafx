@@ -106,6 +106,19 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
         )
         self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
 
+    def test_nested_walrus_binds_inner_target_first(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    (rc := (rc := proc.returncode) + len(proc.stdout))\n    assert rc == 0\n"
+        )
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
+    def test_unchanged_file_functions_are_not_walked(self) -> None:
+        self._commit_file(REL_TEST_FILE, "def test_x():\n    a = 1\n    b = 2\n    c = 3\n")
+        with mock.patch.object(checker, "MAX_BODY_NODES", 2):
+            rc, _out, err = self._run_checker("--changed-against", "HEAD")
+        self.assertEqual(rc, 0, err)
+
     def test_deferred_assignment_still_records_returncode(self) -> None:
         for line in ("alias = (rc := proc.returncode)", "alias: int = proc.returncode"):
             source = (

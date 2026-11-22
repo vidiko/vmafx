@@ -23,9 +23,12 @@ renamed from a path that is not a direct `test_*.py` child of
 `scripts/ci/tests/`, are checked in full. Unreadable files, files above 1 MiB,
 paths outside the repository root, changed or untracked test candidates inside
 `<pathspec>` not in the discovered test files, unsupported diff status letters,
-exceeded file bounds, AST bounds exceeded while walking a selected test
-function, syntax errors, bad refs, and git errors exit 2 with the cause on
-stderr.
+exceeded file bounds (`MAX_AST_NODES` nodes per file, `MAX_DECORATORS` decorators
+on any test function or enclosing definition), a selected unescaped test function
+whose body exceeds `MAX_BODY_NODES` nodes, an assertion-walk bound exceeded in a
+selected function that calls a runner, syntax errors, bad refs, and git errors
+exit 2 with the cause on stderr. In changed mode, unchanged files are parsed and
+checked against the file bounds only.
 
 When `PRE_COMMIT_TO_REF` is set in changed mode, compare the merge base with
 the outgoing commit and read its blobs; ignore untracked and working-tree files.
@@ -124,7 +127,7 @@ class _LoopBinding(ast.AST):
 class _AssignBinding(ast.AST):
     """Bind an assignment's targets after its value has been walked."""
 
-    def __init__(self, node: ast.Assign | ast.AnnAssign | ast.AugAssign) -> None:
+    def __init__(self, node: ast.Assign | ast.AnnAssign | ast.AugAssign | ast.NamedExpr) -> None:
         self.node = node
 
 
@@ -287,11 +290,11 @@ def _check_assignment_targets(targets: Sequence[ast.AST]) -> None:
 
 def _assignment_parts(node: ast.AST) -> tuple[list[ast.expr], ast.expr | None]:
     """Return the targets a node binds and their value; no value only invalidates."""
-    if isinstance(node, ast.NamedExpr):
-        return [node.target], node.value
     if not isinstance(node, _AssignBinding):
         return [], None
     stmt = node.node
+    if isinstance(stmt, ast.NamedExpr):
+        return [stmt.target], stmt.value
     if isinstance(stmt, ast.Assign):
         return list(stmt.targets), stmt.value
     if isinstance(stmt, ast.AnnAssign):
@@ -608,7 +611,7 @@ def _assertion_kinds(func: FuncNode) -> list[str]:
             kinds.append(kind)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
             # Python evaluates the value before it binds the targets.
             stack.append((_AssignBinding(node), bindings))
         _push_children(node, bindings, stack)
@@ -1146,7 +1149,7 @@ def scan_repository(
         if changes is None:
             current = file_findings(source, rel_path)
         elif rel_path not in changes:
-            file_findings(source, rel_path)
+            file_findings(source, rel_path, [])
             continue
         else:
             old_rel = changes[rel_path]

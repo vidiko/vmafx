@@ -369,9 +369,13 @@ python3 scripts/ci/check_exit_code_only_tests.py --changed-against origin/master
   unreadable file, a file above 1 MiB, an explicit path outside the repository
   root, a changed or untracked direct `test_*.py` child of `scripts/ci/tests/`
   that is not one of the discovered test files, an unsupported diff status
-  letter, an exceeded file bound, an AST bound exceeded while walking a selected
-  test function (escaped functions, functions without a runner call and, in
-  changed mode, untouched functions are not walked), a syntax error in a
+  letter, an exceeded file bound (`MAX_AST_NODES` nodes per file, or
+  `MAX_DECORATORS` decorators on any test function or enclosing definition), a
+  selected unescaped test function whose body exceeds `MAX_BODY_NODES` nodes,
+  an assertion-walk bound exceeded in a selected function that calls a runner
+  (escaped functions and functions without a runner call are never walked for
+  assertions; in changed mode, untouched functions and unchanged files are
+  checked against the file bounds only), a syntax error in a
   current test file, a bad ref, or a
   `git merge-base` / `git diff` / `git ls-files` failure exits `2`
   with the cause on `stderr`, never `0`.

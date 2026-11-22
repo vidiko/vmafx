@@ -356,7 +356,10 @@ class ExitCodeOnlyClassificationTest(ExitCodeOnlyFixture):
         rc, out, err = self._run_checker("--changed-against", "HEAD")
         self.assertEqual(rc, 0, err)
         self.assertIn("0 exit-code-only", out)
-        (self.repo / "scripts/ci/tests/test_bad.py").symlink_to("missing")
+        try:
+            (self.repo / "scripts/ci/tests/test_bad.py").symlink_to("missing")
+        except OSError as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
         rc, _, err = self._run_checker("--changed-against", "HEAD")
         self.assertEqual(rc, 2, err)
         self.assertIn("test_bad.py", err)
