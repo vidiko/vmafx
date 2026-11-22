@@ -363,6 +363,16 @@ class ExitCodeOnlyClassificationTest(ExitCodeOnlyFixture):
         self.assertEqual(rc, 2, err)
         self.assertIn("test_bad.py", err)
 
+    def test_changed_candidate_with_invalid_utf8_is_a_scan_error(self) -> None:
+        # Portable twin of the dangling-symlink case: a regular file runs on every OS.
+        self._commit_file(REL_TEST_FILE, "# test\n")
+        (self.repo / "scripts/ci/tests/test_bad.py").write_bytes(b"\xff")
+        rc, out, err = self._run_checker("--changed-against", "HEAD")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("test_bad.py", err)
+        self.assertIn("invalid UTF-8", err)
+        self.assertNotIn("0 exit-code-only", out)
+
     def test_outgoing_runner_failures_are_scan_errors(self) -> None:
         self._commit_file(REL_TEST_FILE, "# base\n")
         for attr in ("revision_modes", "revision_bytes"):
