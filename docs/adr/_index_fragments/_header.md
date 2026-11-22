@@ -49,7 +49,8 @@ and follows the structure in [0000-template.md](0000-template.md):
 - **Immutable once Accepted**: the body is frozen. To change a decision, write
   a new ADR with `Status: Supersedes ADR-NNNN` and flip the old one to
   `Superseded by ADR-MMMM`. The status line and References section may be
-  edited; dated `## Status update YYYY-MM-DD` or `### Status update YYYY-MM-DD`
+  edited, keeping the `## References` heading and adding no undated heading;
+  dated `## Status update YYYY-MM-DD` or `### Status update YYYY-MM-DD`
   sections and a supersession note below the status may be added. Markdown link
   targets may be repaired. Whole-line markdownlint directives may be edited
   anywhere. Headings inside code fences are content, not sections. Prose may be

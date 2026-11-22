@@ -40,14 +40,15 @@ ADR = re.compile(r"^docs/adr/[0-9]{4}-[^/]*\.md$")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 UPDATE = re.compile(r"^#{2,3} Status update \d{4}-\d{2}-\d{2}(?:\b|$)")
 DIRECTIVE = re.compile(
-    r"^<!--\s*markdownlint-(?:disable|enable|disable-line|disable-next-line|capture|restore)\b[^>]*-->\s*$"
+    r"^<!--\s*markdownlint-"
+    r"(?:disable|enable|disable-line|disable-next-line|capture|restore)\b[^>]*-->\s*$"
 )
 LINK = re.compile(r"(\[[^\]\n]*\])\([^\n)]*\)")
 REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(.*)$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MESSAGE = (
-    "body of an Accepted ADR is frozen (docs/adr/README.md); add a dated "
-    '"### Status update YYYY-MM-DD" section or supersede it with a new ADR'
+    "body of an Accepted, Superseded or Deprecated ADR is frozen (docs/adr/README.md); "
+    'add a dated "### Status update YYYY-MM-DD" section or supersede it with a new ADR'
 )
 
 
@@ -72,9 +73,14 @@ def status_index(lines: list[str]) -> int | None:
 
 
 def section(lines: list[str], index: int) -> str:
-    """Find the nearest section heading at a line or insertion point."""
+    """Find the nearest section heading outside code fences at a line or insertion point."""
+    fenced = fenced_lines(lines)
     return next(
-        (lines[i] for i in range(min(index, len(lines) - 1), -1, -1) if HEADING.match(lines[i])),
+        (
+            lines[i]
+            for i in range(min(index, len(lines) - 1), -1, -1)
+            if not fenced[i] and HEADING.match(lines[i])
+        ),
         "(preamble)",
     )
 
@@ -171,12 +177,16 @@ def formatting_only(tag: str, before: list[str], after: list[str]) -> bool:
 
 
 def has_section_heading(lines: list[str], start: int, end: int) -> bool:
-    """Detect headings that leave a References section."""
+    """Detect headings outside code fences, which start a section or subsection."""
     fenced = fenced_lines(lines)
-    return any(
-        not fenced[i]
-        and (match := HEADING.match(lines[i])) is not None
-        and len(match.group(1)) <= SECTION_LEVEL
+    return any(not fenced[i] and HEADING.match(lines[i]) for i in range(start, end))
+
+
+def references_edit(old: list[str], start: int, end: int) -> bool:
+    """Return whether a changed range lies inside References and keeps its heading."""
+    fenced = fenced_lines(old)
+    return all(
+        in_references(old, i) and (fenced[i] or old[i].strip() != "## References")
         for i in range(start, end)
     )
 
@@ -213,11 +223,7 @@ def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]
             or allowed_note(old, a, new[c:d], status)
         ):
             continue
-        if (
-            tag != "insert"
-            and all(in_references(old, i) for i in range(a, b))
-            and not has_section_heading(new, c, d)
-        ):
+        if tag != "insert" and references_edit(old, a, b) and not has_section_heading(new, c, d):
             continue
         if tag == "replace" and allowed_replace(before, after, old, status):
             continue
@@ -288,7 +294,8 @@ def check(base: str, head: str) -> int:
         print(f"note: {failure}" if waiver else failure)
     if failures and waiver:
         print(
-            f"ADR body freeze: {len(failures)} hunk(s) accepted under ADR-Body-Edit in {waiver[0]}: {waiver[1]}"
+            f"ADR body freeze: {len(failures)} hunk(s) accepted under ADR-Body-Edit in "
+            f"{waiver[0]}: {waiver[1]}"
         )
     return int(bool(failures) and not waiver)
 

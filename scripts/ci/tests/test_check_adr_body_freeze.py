@@ -24,7 +24,11 @@ if TYPE_CHECKING:
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check-adr-body-freeze.py"
 ADR = "docs/adr/1234-example.md"
-BASE = "# ADR-1234: Example\n\n- **Status**: Accepted\n\n## Context\nOld context.\n\n## Decision\nOld decision.\n\n## Consequences\nOld consequence.\n\n## References\n[Source](old.md)\n"
+BASE = (
+    "# ADR-1234: Example\n\n- **Status**: Accepted\n\n## Context\nOld context.\n\n"
+    "## Decision\nOld decision.\n\n## Consequences\nOld consequence.\n\n"
+    "## References\n[Source](old.md)\n"
+)
 
 
 class FreezeTests(unittest.TestCase):
@@ -110,7 +114,8 @@ class FreezeTests(unittest.TestCase):
         self.check_change(
             BASE.replace(
                 "Accepted\n",
-                "Superseded\n- **Date**: 2026-01-01\n\n> [!NOTE]\n> **Superseded by [ADR-9999](x.md)**\n",
+                "Superseded\n- **Date**: 2026-01-01\n\n"
+                "> [!NOTE]\n> **Superseded by [ADR-9999](x.md)**\n",
             ),
             0,
         )
@@ -387,6 +392,38 @@ class FreezeTests(unittest.TestCase):
             BASE.replace("[Source](old.md)", "New reference.\n\n## Decision\nNew decision."), 1
         )
         self.check_change(BASE.replace("[Source](old.md)", "New reference."), 0)
+
+    def test_references_heading_is_kept(self) -> None:
+        self.check_change(BASE.replace("## References", "## Sources"), 1)
+        self.check_change(BASE.replace("## References\n", ""), 1)
+        self.check_change(BASE.replace("[Source](old.md)", "New reference."), 0)
+
+    def test_references_subheading_needs_date(self) -> None:
+        for heading, expected in (
+            ("### Status update", 1),
+            ("### Notes", 1),
+            ("### Status update 2026-11-21", 0),
+        ):
+            with self.subTest(heading=heading):
+                self.check_change(BASE + f"\n{heading}\nNew.\n", expected)
+
+    def test_fences_in_references(self) -> None:
+        cases = (
+            ("unclosed fence runs to the end", "x\n\n```markdown\n## Example", 0),
+            ("longer closing fence closes", "x\n\n```\na\n`````\n## Decision\nNew.", 1),
+            ("other fence character does not close", "x\n\n```\na\n~~~\n## Example\n```", 0),
+            ("info text on a closer keeps it open", "x\n\n```\na\n```text\n## Example\n```", 0),
+        )
+        for name, replacement, expected in cases:
+            with self.subTest(name=name):
+                self.check_change(BASE.replace("[Source](old.md)", replacement), expected)
+
+    def test_fenced_heading_is_not_a_section_name(self) -> None:
+        original = BASE.replace("Old context.", "```markdown\n## Fake\n```\nOld context.")
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("Old context.", "Changed context."), 1, "## Context")
 
     def test_renamed_status_and_link_repairs(self) -> None:
         target = "docs/adr/1234-renamed.md"
