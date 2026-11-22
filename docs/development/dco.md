@@ -229,6 +229,15 @@ non-empty changed path list includes at least one live exception in
 Co-authored-by: vmafx-release-bot[bot] <340976456+vmafx-release-bot[bot]@users.noreply.github.com>
 ```
 
+A second landed-mode case strips that same single line when the commit author is
+the release bot itself (name `vmafx-release-bot[bot]`, lowercased email
+`340976456+vmafx-release-bot[bot]@users.noreply.github.com`), with no path
+condition, because the generated-docs render commit is authored by the release
+bot and the squash names it again as co-author
+([ADR-3624](../adr/3624-landed-release-bot-self-coauthor.md)). A foreign
+co-author, a second self line, or the line on a commit by another author is
+still refused.
+
 The Python lock refresh class ([ADR-3560](../adr/3560-python-lock-refresh.md))
 permits a signed release-bot commit with the exact refresh subject when every
 changed path has a live entry among the 30 exact paths in

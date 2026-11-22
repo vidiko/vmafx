@@ -87,6 +87,65 @@ class DcoLandedGateTest(unittest.TestCase):
                 self.assertEqual(res.returncode, expected_rc, res.stdout + res.stderr)
                 self.assertIn(expected_text, res.stdout)
 
+    def test_release_bot_self_coauthor_passes(self) -> None:
+        """Assert landed mode accepts a release-bot render commit with one self co-author."""
+        msg = (
+            "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+            "Signed-off-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            "Co-authored-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>"
+        )
+        self.repo.commit(msg, fx.RELEASE_BOT_IDENT)
+        res = self.repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("PASS", res.stdout)
+
+    def test_release_bot_foreign_coauthor_refused(self) -> None:
+        """Assert landed mode refuses a release-bot commit with a foreign co-author."""
+        msg = (
+            "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+            "Signed-off-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            "Co-authored-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            "Co-authored-by: renovate[bot] "
+            "<29139614+renovate[bot]@users.noreply.github.com>"
+        )
+        self.repo.commit(msg, fx.RELEASE_BOT_IDENT)
+        res = self.repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("Co-authored-by", res.stdout)
+
+    def test_release_bot_second_self_line_refused(self) -> None:
+        """Assert landed mode refuses duplicate release-bot self co-author lines."""
+        msg = (
+            "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+            "Signed-off-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            "Co-authored-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            "Co-authored-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>"
+        )
+        self.repo.commit(msg, fx.RELEASE_BOT_IDENT)
+        res = self.repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("Co-authored-by", res.stdout)
+
+    def test_other_author_with_release_bot_line_refused(self) -> None:
+        """Assert landed mode refuses the release-bot co-author line on a human author."""
+        msg = (
+            "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+            f"Signed-off-by: {fx.HUMAN[0]} <{fx.HUMAN[1]}>\n"
+            "Co-authored-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>"
+        )
+        self.repo.commit(msg, fx.HUMAN)
+        res = self.repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("Co-authored-by", res.stdout)
+
     def test_model_author_identity_fails(self) -> None:
         """A landed coding tool author is refused with landing repair advice."""
         self.repo.commit("feat: model author", ("Claude", "claude@example.org"), True, fx.HUMAN)
