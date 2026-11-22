@@ -35,6 +35,10 @@ It requires a sign-off matching the author or committer and refuses model or
 coding tool attribution. Merge commits are exempt. For a new commit use
 `git commit -s`; to repair the last commit use `git commit --amend -s --no-edit`.
 
+The hook reads the message as Git stores it: comment lines are dropped, and
+with the verbose option (`-v`) everything from the scissors line down, the
+staged diff, is ignored.
+
 ## Check before you push
 
 The `dco-sign-off` pre-push hook in `.pre-commit-config.yaml` runs the check on

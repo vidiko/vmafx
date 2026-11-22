@@ -49,6 +49,8 @@ Usage::
 
     python3 scripts/ci/check-dco.py --merge-base origin/master [--head <rev>]
 
+    python3 scripts/ci/check-dco.py --message-file <path>
+
 ``--merge-base REF`` is the pre-push mode, named like the other pre-push hooks'
 option: it checks the commits the push adds on top of ``REF``, those reachable
 from the outgoing commit but not from ``REF``. The outgoing commit is
@@ -98,6 +100,8 @@ MAX_COMMITS = 5000
 # origin/master 20fa27ac625e, 6290 messages, measured 2026-11-11; 4x headroom.
 MAX_COMMIT_MESSAGE_BYTES = 70_469 * 4
 MAX_COMMIT_MESSAGE_LINES = 1_459 * 4
+# Git's scissors line; the verbose option puts the staged diff below it, outside the message.
+SCISSORS_TAIL = b" ------------------------ >8 ------------------------"
 # PRs 2906-3395, 300 bodies (corpus sha256 5a4d6f5c3cbf), measured 2026-11-11;
 # largest 58,966 bytes (PR 3045) and 544 lines (PR 3041); 4x headroom.
 MAX_PR_BODY_BYTES = 58_966 * 4
@@ -819,12 +823,37 @@ def report_message_failure(commit: Commit, reason: str) -> None:
         )
 
 
+def is_scissors_line(raw: bytes) -> bool:
+    """Match Git's scissors line under any comment string without whitespace."""
+    line = raw.rstrip(b"\r\n")
+    prefix = line[: -len(SCISSORS_TAIL)]
+    return line.endswith(SCISSORS_TAIL) and prefix.split() == [prefix]
+
+
+def read_message_before_scissors(path: Path) -> str:
+    """Read a pending message up to Git's scissors line, bounded like a stored message."""
+    data = bytearray()
+    try:
+        with path.open("rb") as stream:
+            # Each line read adds at least one byte, so the byte bound ends the loop first.
+            for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
+                raw = stream.readline(MAX_COMMIT_MESSAGE_BYTES + 1)
+                if not raw or is_scissors_line(raw):
+                    break
+                data += raw
+                if len(data) > MAX_COMMIT_MESSAGE_BYTES:
+                    raise InputBoundError(
+                        f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+                    )
+        return data.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise UsageError(f"{path}: {exc}") from exc
+
+
 def check_message_file(path: str) -> int:
     """Check a pending commit message with Git's effective identities."""
     try:
-        message = read_bounded_file(
-            Path(path), MAX_COMMIT_MESSAGE_BYTES, "MAX_COMMIT_MESSAGE_BYTES"
-        )
+        message = read_message_before_scissors(Path(path))
     except UsageError as exc:
         raise UsageError(f"commit message file {path}: {exc}") from exc
     message = run_git(["stripspace", "--strip-comments"], stdin=message)
@@ -872,9 +901,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--landed", action="store_true")
     parser.add_argument("--merge-base", default="", metavar="REF")
-    parser.add_argument("--message-file", default="", metavar="PATH")
+    parser.add_argument("--message-file", default=None, metavar="PATH")
     parser.add_argument("--landing-identity", default=env("LANDING_IDENTITY", ""))
     args = parser.parse_args(argv)
+    if args.message_file == "":
+        parser.error("--message-file needs a path")
     if args.head is None:
         # --merge-base names the pushed commit itself; HEAD_SHA must not replace it.
         args.head = "" if args.merge_base else env("HEAD_SHA", "")
