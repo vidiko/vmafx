@@ -11,13 +11,14 @@ from pathlib import Path
 
 TOKEN = re.compile(r"(?<![A-Za-z0-9.])\d[0-9A-Za-z]*(?:\.\d[0-9A-Za-z]*)*")
 THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
-# Strip Markdown link destinations that follow a link label in unescaped square
-# brackets with at most one nested bracket pair: either a bare destination with no
-# whitespace and up to three nested or backslash-escaped parenthesis pairs, or an
-# angle-bracket destination `<...>` with backslash escapes and no unescaped `<`,
-# `>`, or line breaks, each followed by an optional space-separated single-line
-# title in double quotes, single quotes, or parentheses and optional trailing
-# horizontal whitespace before `)`. Anything else stays checked.
+# Strip Markdown link destinations that follow a single-line link label in unescaped
+# square brackets with one level of nested bracket pairs, none directly followed by
+# `(`: either a bare destination with no whitespace and up to three nested or
+# backslash-escaped parenthesis pairs, or an angle-bracket destination `<...>` with
+# backslash escapes and no unescaped `<`, `>`, or line breaks, each followed by an
+# optional space-separated single-line title in double quotes, single quotes, or
+# parentheses and optional trailing horizontal whitespace before `)`. Anything else
+# stays checked.
 LINK_TEXT = r"(?:\\\S|[^()\s\\])*+"
 LINK_LEVEL_1 = rf"{LINK_TEXT}(?:\({LINK_TEXT}\){LINK_TEXT})*+"
 LINK_LEVEL_2 = rf"{LINK_TEXT}(?:\({LINK_LEVEL_1}\){LINK_TEXT})*+"
@@ -28,8 +29,8 @@ LINK_TITLE = (
     r"|'(?:\\[^\r\n]|[^'\\\r\n])*+'"
     r"|\((?:\\[^\r\n]|[^()\\\r\n])*+\))"
 )
-LINK_LABEL_TEXT = r"(?:\\[^\r\n]|[^\[\]\\])*+"
-LINK_LABEL = rf"(?<!\\)\[{LINK_LABEL_TEXT}(?:\[{LINK_LABEL_TEXT}\]{LINK_LABEL_TEXT})*+\]"
+LINK_LABEL_TEXT = r"(?:\\[^\r\n]|[^\[\]\\\r\n])*+"
+LINK_LABEL = rf"(?<!\\)\[{LINK_LABEL_TEXT}(?:\[{LINK_LABEL_TEXT}\](?!\(){LINK_LABEL_TEXT})*+\]"
 LINK = re.compile(rf"(?P<label>{LINK_LABEL})\({LINK_DEST}(?: ++{LINK_TITLE})?[ \t]*+\)")
 MAX_BYTES = 1024 * 1024
 MIN_ARGS = 3
