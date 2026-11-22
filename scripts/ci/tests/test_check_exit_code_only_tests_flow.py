@@ -186,6 +186,15 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
         )
         self.assertEqual(len(checker.file_findings(source, REL_TEST_FILE)), 1)
 
+    def test_loop_literal_walrus_evaluated_per_item(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    size = len(proc.stdout)\n"
+            "    for item in [size, ((size := proc.returncode), len(proc.stdout))[1]]:\n"
+            "        assert item == 0\n"
+        )
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -122,9 +122,10 @@ class _Rebinding(ast.AST):
 class _LoopBinding(ast.AST):
     """Bind a loop target from literal iterable values after header evaluation."""
 
-    def __init__(self, target: ast.AST, iterable: ast.AST) -> None:
+    def __init__(self, target: ast.AST, iterable: ast.AST, pre_iter_rc_vars: set[str]) -> None:
         self.target = target
         self.iterable = iterable
+        self.pre_iter_rc_vars = pre_iter_rc_vars
 
 
 class _AssignBinding(ast.AST):
@@ -272,15 +273,33 @@ def _record_target_vars(target: ast.AST, rc_vars: set[str]) -> None:
             rc_vars.add(elts[0].id)
 
 
+def _walrus_exprs_in_source_order(item: ast.AST) -> list[ast.NamedExpr]:
+    """Collect walrus nodes under one iterable element in evaluation order."""
+    nodes = [n for n in ast.walk(item) if isinstance(n, ast.NamedExpr)]
+    nodes.sort(key=lambda node: (node.lineno, node.col_offset))
+    return nodes[:MAX_BODY_NODES]
+
+
+def _literal_iter_binds_rc(iterable: ast.AST, rc_vars: set[str]) -> bool:
+    """True when a literal iterable would bind a return code to the loop target."""
+    if not isinstance(iterable, (ast.List, ast.Tuple, ast.Set)):
+        return False
+    local = set(rc_vars)
+    for item in iterable.elts[:MAX_BODY_NODES]:
+        if _is_rc_expr(item, local):
+            return True
+        for named in _walrus_exprs_in_source_order(item):
+            _update_rc_vars(_AssignBinding(named), local)
+    return False
+
+
 def _apply_loop_binding(node: _LoopBinding, rc_vars: set[str]) -> None:
     """Update a loop target after its iterable has been evaluated."""
-    is_rc = (
-        isinstance(node.target, ast.Name)
-        and isinstance(node.iterable, (ast.List, ast.Tuple, ast.Set))
-        and any(_is_rc_expr(item, rc_vars) for item in node.iterable.elts[:MAX_BODY_NODES])
+    is_rc = isinstance(node.target, ast.Name) and _literal_iter_binds_rc(
+        node.iterable, node.pre_iter_rc_vars
     )
     _invalidate_rebindings(_Rebinding([node.target]), rc_vars)
-    if is_rc and isinstance(node.target, ast.Name):
+    if is_rc:
         rc_vars.add(node.target.id)
 
 
@@ -411,25 +430,43 @@ def _classify_assertion(node: ast.AST, rc_vars: set[str]) -> str | None:
     return "other" if name.startswith("assert") or _is_pytest_raises(func) else None
 
 
-def _escape_candidates(func: FuncNode) -> list[tuple[int, bool, int]]:
+def _decorator_at_column(func: FuncNode, source_lines: Sequence[str]) -> int:
+    """Return the column of the leading `@` on the first decorator line."""
+    first = min(func.decorator_list[:MAX_DECORATORS], key=lambda dec: dec.lineno)
+    line = source_lines[first.lineno - 1]
+    return len(line) - len(line.lstrip())
+
+
+def _escape_candidates(
+    func: FuncNode, source_lines: Sequence[str] | None = None
+) -> list[tuple[int, bool, int]]:
     """Return the positions where an escape comment can apply to a function."""
     if len(func.decorator_list) > MAX_DECORATORS:
         raise ScanError(f"{func.name}: function exceeds {MAX_DECORATORS} decorators")
     candidates = [(func.lineno, False, func.col_offset), (func.lineno - 1, True, func.col_offset)]
     if func.decorator_list:
         first = min(func.decorator_list[:MAX_DECORATORS], key=lambda dec: dec.lineno)
+        at_column = (
+            _decorator_at_column(func, source_lines)
+            if source_lines is not None and first.lineno <= len(source_lines)
+            else first.col_offset - 1
+        )
         candidates.extend(
             [
                 (first.lineno, False, first.col_offset - 1),
-                (first.lineno - 1, True, first.col_offset - 1),
+                (first.lineno - 1, True, at_column),
             ]
         )
     return sorted(candidates)
 
 
-def _escape_status(func: FuncNode, comments: dict[int, tuple[str, int, bool]]) -> str:
+def _escape_status(
+    func: FuncNode,
+    comments: dict[int, tuple[str, int, bool]],
+    source_lines: Sequence[str] | None = None,
+) -> str:
     """Return 'valid', 'short', or 'none' for an `# exit-code-only:` comment."""
-    for line_no, standalone, column in _escape_candidates(func):
+    for line_no, standalone, column in _escape_candidates(func, source_lines):
         comment = comments.get(line_no)
         if comment is None:
             continue
@@ -465,7 +502,7 @@ def _loop_flow(node: ast.For | ast.AsyncFor | ast.While, bindings: set[str]) -> 
     return [
         ([bindings], body),
         *(
-            ((_LoopBinding(node.target, node.iter), body),)
+            ((_LoopBinding(node.target, node.iter, set(bindings)), body),)
             if isinstance(node, (ast.For, ast.AsyncFor))
             else ()
         ),
@@ -622,10 +659,13 @@ def _assertion_kinds(func: FuncNode) -> list[str]:
 
 
 def _check_test_function(
-    func: FuncNode, comments: dict[int, tuple[str, int, bool]], rel_path: str
+    func: FuncNode,
+    comments: dict[int, tuple[str, int, bool]],
+    rel_path: str,
+    source_lines: Sequence[str] | None = None,
 ) -> Finding | None:
     """Inspect one `def test_*` node and return a Finding when weak or unescaped."""
-    escape = _escape_status(func, comments)
+    escape = _escape_status(func, comments, source_lines)
     if escape == "short":
         return Finding(
             rel_path,
@@ -794,24 +834,29 @@ def _marker_touched(
     hunks: list[tuple[int, int]],
     removed: dict[tuple[int, int], str],
     added: set[tuple[int, int]],
+    source_lines: Sequence[str] | None = None,
 ) -> bool:
     """Select changed eligible standalone markers on either side of a diff."""
-    for line, standalone, _ in _escape_candidates(func):
+    for line, standalone, _ in _escape_candidates(func, source_lines):
         if not standalone:
             continue
         for start, end in hunks:
             if not start <= line <= end:
                 continue
-            if _escape_status(func, {line: comments[line]} if line in comments else {}) != "none":
+            subset = {line: comments[line]} if line in comments else {}
+            if _escape_status(func, subset, source_lines) != "none":
                 return True
             if (start, end) in added and start > 1:
                 previous = comments.get(start - 1)
-                if previous and _escape_status(func, {line: previous}) != "none":
+                if previous and _escape_status(func, {line: previous}, source_lines) != "none":
                     return True
             text = removed.get((start, end), "")
             if text.lstrip().startswith("#"):
                 column = len(text) - len(text.lstrip())
-                if _escape_status(func, {line: (text.lstrip(), column, True)}) != "none":
+                if (
+                    _escape_status(func, {line: (text.lstrip(), column, True)}, source_lines)
+                    != "none"
+                ):
                     return True
     return False
 
@@ -829,16 +874,17 @@ def file_findings(
     except SyntaxError as exc:
         raise ScanError(f"{rel_path}:{exc.lineno or 1}: syntax error: {exc.msg}") from exc
     comments, header_ends = _source_token_maps(source, rel_path)
-    funcs = _extract_test_functions(tree, rel_path, len(source.split("\n")))
+    source_lines = source.split("\n")
+    funcs = _extract_test_functions(tree, rel_path, len(source_lines))
     findings: list[Finding] = []
     # len(funcs) <= MAX_AST_NODES is enforced by _extract_test_functions.
     for func, parents, end in funcs[:MAX_AST_NODES]:
         if hunks is not None and not (
             _function_touched(func, parents, end, hunks, header_ends)
-            or _marker_touched(func, comments, hunks, removed or {}, added or set())
+            or _marker_touched(func, comments, hunks, removed or {}, added or set(), source_lines)
         ):
             continue
-        finding = _check_test_function(func, comments, rel_path)
+        finding = _check_test_function(func, comments, rel_path, source_lines)
         if finding is not None:
             findings.append(finding)
     return findings
@@ -928,10 +974,25 @@ def _parse_name_status_z(output: str) -> dict[str, str | None]:
 
 def _add_untracked_files(
     root: Path,
-    output: str,
+    diff_pathspecs: Sequence[str],
     changes: dict[str, str | None],
 ) -> None:
-    """Parse `git ls-files -z --others` output and record untracked paths in `changes`."""
+    """Run `git ls-files -z --others` on the pathspecs and record untracked paths in `changes`."""
+    others = _run_git(
+        root,
+        [
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *diff_pathspecs[:MAX_TEST_FILES],
+        ],
+    )
+    if others.returncode != 0:
+        raise ScanError(f"{root}: git ls-files failed: {others.stderr.strip()}")
+    output = others.stdout
     if not output:
         return
     if not output.endswith("\0"):
@@ -956,8 +1017,14 @@ def _changed_files_by_path(
     discovered_rels: frozenset[str],
     diff_pathspecs: Sequence[str],
     outgoing: str = "",
+    explicit: bool = False,
 ) -> tuple[str, dict[str, str | None]]:
-    """Return `(merge_base, {rel_path: old_rel_path | None})` for changed and untracked files."""
+    """Return `(merge_base, {rel_path: old_rel_path | None})` for changed and untracked files.
+
+    An explicit run diffs the whole test directory so a rename into a requested path is
+    detected, then keeps only the requested destinations; a full scan keeps every change and
+    refuses a changed test file that discovery missed.
+    """
     if len(diff_pathspecs) > MAX_TEST_FILES:
         raise ScanError(f"{root}: exceeds {MAX_TEST_FILES} test files")
     merge_base = _resolve_merge_base(root, ref, outgoing)
@@ -982,21 +1049,9 @@ def _changed_files_by_path(
         raise ScanError(f"{root}: git diff against {ref} failed: {diff_res.stderr.strip()}")
     changes = _parse_name_status_z(diff_res.stdout)
     if not outgoing:
-        others = _run_git(
-            root,
-            [
-                "--literal-pathspecs",
-                "ls-files",
-                "-z",
-                "--others",
-                "--exclude-standard",
-                "--",
-                *diff_pathspecs[:MAX_TEST_FILES],
-            ],
-        )
-        if others.returncode != 0:
-            raise ScanError(f"{root}: git ls-files failed: {others.stderr.strip()}")
-        _add_untracked_files(root, others.stdout, changes)
+        _add_untracked_files(root, diff_pathspecs, changes)
+    if explicit:
+        changes = {path: old for path, old in changes.items() if path in discovered_rels}
     # len(changes) <= 2 * MAX_TEST_FILES is enforced by _parse_name_status_z
     # and _add_untracked_files.
     for changed_path in list(changes)[: 2 * MAX_TEST_FILES]:
@@ -1165,7 +1220,9 @@ def scan_repository(
     else:
         files = discover_test_files(root, explicit_paths)
     rel_paths = [rel for _, rel in files]
-    diff_pathspecs: Sequence[str] = rel_paths if explicit_paths else (TESTS_REL_DIR.as_posix(),)
+    diff_pathspecs: Sequence[str] = (TESTS_REL_DIR.as_posix(),)
+    if explicit_paths and not all(Path(rel).parent == TESTS_REL_DIR for rel in rel_paths):
+        diff_pathspecs = rel_paths
     merge_base = ""
     changes: dict[str, str | None] | None = None
     if changed_against is not None:
@@ -1175,6 +1232,7 @@ def scan_repository(
             frozenset(rel_paths),
             diff_pathspecs,
             outgoing,
+            bool(explicit_paths),
         )
     findings: list[Finding] = []
     # len(files) <= MAX_TEST_FILES is enforced by discover_test_files.

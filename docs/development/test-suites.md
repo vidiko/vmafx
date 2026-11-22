@@ -360,10 +360,13 @@ python3 scripts/ci/check_exit_code_only_tests.py --changed-against origin/master
 - **Modes and exit codes**: default mode reports all existing findings with an
   informational count and the top 5 files, and exits `0`. `--changed-against
   <ref>` resolves `git merge-base <ref> HEAD`, lists changed and untracked
-  files under `<pathspec>` (`scripts/ci/tests` in default discovery and the
-  normalised root-relative explicit paths otherwise) via
+  files under `<pathspec>` (`scripts/ci/tests` in default discovery and when
+  every explicit path is a direct child of it, the normalised root-relative
+  explicit paths otherwise) via
   `git diff --name-status -z -M --no-color --no-ext-diff <merge-base> -- <pathspec>`
-  and `git ls-files -z --others --exclude-standard -- <pathspec>`, and checks
+  and `git ls-files -z --others --exclude-standard -- <pathspec>`, keeps only
+  the requested files in an explicit run (so an unchanged rename into a
+  requested path is still detected as a rename), and checks
   weak tests when a zero-context diff hunk touches their span (including
   decorators), or a header line (through its terminating colon) or decorator
   line of an enclosing function or class; a comment between a class header and

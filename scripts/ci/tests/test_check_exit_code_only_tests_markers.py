@@ -65,6 +65,11 @@ class ExitCodeOnlyMarkersTest(ExitCodeOnlyFixture):
                 self.assertEqual(rc, 1, err)
                 self.assertIn("test_x", err)
 
+    def test_standalone_marker_above_spaced_pytest_decorator(self) -> None:
+        weak = "def test_x():\n    rc = run_checker()\n    assert rc == 0\n"
+        source = "# exit-code-only: silent status probe\n@ pytest.mark.slow\n" + weak
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
     def test_changed_unrelated_comment_does_not_select_weak_test(self) -> None:
         weak = "def test_x():\n    rc = run_checker()\n    assert rc == 0\n"
         target = self._commit_file(REL_TEST_FILE, "# old\n# adjacent\n" + weak)

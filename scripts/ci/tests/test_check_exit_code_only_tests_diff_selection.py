@@ -225,6 +225,22 @@ class ExitCodeOnlyDiffSelectionTest(ExitCodeOnlyFixture):
         self.assertIn(f"{new_rel}:7: test_changed_in_rename: asserts only exit code 0", err_edit)
         self.assertNotIn("test_untouched_in_rename", err_edit)
 
+    def test_unchanged_rename_explicit_new_path_passes(self) -> None:
+        old_rel = "scripts/ci/tests/test_old_explicit.py"
+        new_rel = "scripts/ci/tests/test_new_explicit.py"
+        weak = (
+            "import subprocess\n\n"
+            "def test_weak_after_rename() -> None:\n"
+            "    res = subprocess.run(['true'], check=False)\n"
+            "    assert res.returncode == 0\n"
+        )
+        self._commit_file(old_rel, weak, "base before explicit-path rename")
+        self._git("mv", old_rel, new_rel)
+        self._git("commit", "-q", "-m", "pure rename for explicit path scan")
+        rc, out, err = self._run_checker("--changed-against", "HEAD~1", new_rel)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("0 exit-code-only test findings", out)
+
     def test_working_tree_git_diff_head_failure_exits_2(self) -> None:
         base = (
             "import subprocess\n\n"
