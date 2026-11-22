@@ -121,8 +121,9 @@ MAX_COMMITS = 5000
 # origin/master 20fa27ac625e, 6290 messages, measured 2026-11-11; 4x headroom.
 MAX_COMMIT_MESSAGE_BYTES = 70_469 * 4
 MAX_COMMIT_MESSAGE_LINES = 1_459 * 4
-# Git's scissors line; the verbose option puts the staged diff below it, outside the message.
+# Git's scissors line; a verbose diff follows below it only after editor cleanup.
 SCISSORS_TAIL = b" ------------------------ >8 ------------------------"
+VERBOSE_DIFF_HEAD = b"diff --git "
 # Characters Git's core.commentChar=auto may pick (builtin/commit.c, git v2.56.1).
 AUTO_COMMENT_CANDIDATES = tuple("#;@!$%^&|:")
 # PRs 2906-3395, 300 bodies (corpus sha256 5a4d6f5c3cbf), measured 2026-11-11;
@@ -1053,7 +1054,10 @@ def comment_prefixes() -> tuple[str, ...]:
         key, _, setting = entry.partition("\n")
         if key in ("core.commentchar", "core.commentstring"):
             value = setting
-    return AUTO_COMMENT_CANDIDATES if value == "auto" else (value,)
+    # Git matches core.commentChar/String "auto" without regard to case.
+    if value.isascii() and value.lower() == "auto":
+        return AUTO_COMMENT_CANDIDATES
+    return (value,)
 
 
 def is_scissors_line(raw: bytes, prefixes: tuple[str, ...]) -> bool:
@@ -1062,17 +1066,22 @@ def is_scissors_line(raw: bytes, prefixes: tuple[str, ...]) -> bool:
     return any(line == prefix.encode("utf-8") + SCISSORS_TAIL for prefix in prefixes)
 
 
-def read_message_before_scissors(path: Path, prefixes: tuple[str, ...]) -> str:
-    """Read a pending message up to Git's scissors line, bounded like a stored message."""
+def read_message_before_diff(path: Path, prefixes: tuple[str, ...]) -> str:
+    """Read a pending message up to Git's verbose diff, bounded like a stored message."""
     data = bytearray()
+    cut = False
     try:
         with path.open("rb") as stream:
             # Each line read adds at least one byte, so the byte bound ends the loop first.
             for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
                 raw = stream.readline(MAX_COMMIT_MESSAGE_BYTES + 1)
-                if not raw or is_scissors_line(raw, prefixes):
+                if not raw:
+                    break
+                if cut and raw.startswith(VERBOSE_DIFF_HEAD):
                     break
                 data += raw
+                if is_scissors_line(raw, prefixes):
+                    cut = True
                 if len(data) > MAX_COMMIT_MESSAGE_BYTES:
                     raise InputBoundError(
                         f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
@@ -1103,7 +1112,7 @@ def check_message_file(path: str) -> int:
     """Check a pending commit message with Git's effective identities."""
     prefixes = comment_prefixes()
     try:
-        raw = read_message_before_scissors(Path(path), prefixes)
+        raw = read_message_before_diff(Path(path), prefixes)
     except UsageError as exc:
         raise UsageError(f"commit message file {path}: {exc}") from exc
     merge_path = Path(run_git(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())

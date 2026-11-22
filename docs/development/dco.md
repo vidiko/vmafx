@@ -37,10 +37,15 @@ coding tool attribution. Merge commits are exempt. For a new commit use
 
 The hook checks attribution on every line, comment lines included, because
 Git keeps them when the message is not edited (`-m`, `-F`). The sign-off
-counts once comment lines are dropped; with `core.commentChar=auto` it is
-enough that one character Git may pick leaves a valid sign-off. With the
-verbose option (`-v`) everything from the scissors line down, the staged
-diff, is ignored; that line must start with the configured comment string.
+counts once comment lines are dropped; with `core.commentChar=auto` Git
+matches `auto` without regard to case, and it is enough that one character
+Git may pick leaves a valid sign-off. Below the scissors line the hook
+keeps checking every line, because Git stores them when the message is not
+edited (`-F`); only the staged diff that `-v` writes, from the first line
+below the scissors line that starts with `diff --git`, is skipped. The
+scissors line must start with the configured comment string; a crafted
+`diff --git` line under `-F` is caught by the range check (`check-dco.py`
+on pre-push and in CI), which reads the stored message.
 
 ## Check before you push
 
