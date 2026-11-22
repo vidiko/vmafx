@@ -22,10 +22,11 @@ Three properties this wrapper owes its callers, all learned from failures:
   pandas, and PyTorch is uneven, and how much of it a checkout sees depends on
   which packages happen to be installed. A blocking gate that reported every
   inherited finding would fail on files the branch never touched. The same
-  files are therefore checked at the selected merge base and only findings
-  absent there are reported. Line numbers are left out of the comparison,
-  because an edit above a finding shifts it without changing it. Required CI
-  invokes this same gate and propagates its result.
+  files are therefore checked at the selected merge base, and a finding is
+  reported only for the occurrences beyond its count there. Line numbers are
+  left out of the comparison, because an edit above a finding shifts it
+  without changing it. Required CI invokes this same gate and propagates its
+  result.
 * Installed third-party stubs are not a stable part of the repository's type
   contract. Their presence and supported Python syntax vary by checkout; for
   example, a newer NumPy stub can use syntax newer than this repository's
@@ -287,14 +288,16 @@ def verify_paths(selected: list[str], root: Path) -> None:
             raise RuntimeError(f"selected Python path is not a regular file: {filename}")
 
 
-def report(introduced: Counter[str], inherited: int) -> int:
+def report(introduced: Counter[str], inherited: Counter[str]) -> int:
     if not introduced:
-        print(f"mypy: no new findings ({inherited} inherited from the merge base, not reported)")
+        kept = sum(inherited.values())
+        print(f"mypy: no new findings ({kept} inherited from the merge base, not reported)")
         return 0
     print(f"mypy: {sum(introduced.values())} finding(s) this branch introduces:", file=sys.stderr)
     for finding in sorted(introduced):
         count = introduced[finding]
-        suffix = f" ({count} more than the merge base)" if count > 1 else ""
+        shown = count > 1 or inherited[finding] > 0
+        suffix = f" ({count} more than the merge base)" if shown else ""
         print(f"  {finding}{suffix}", file=sys.stderr)
     print(
         "\nFindings already present at the merge base are not listed. Fixing them is\n"
@@ -333,7 +336,7 @@ def main() -> int:
         if not current:
             return 0
         inherited = baseline_fingerprints(executable, selected, root, base)
-        return report(current - inherited, sum((current & inherited).values()))
+        return report(current - inherited, current & inherited)
     except (OSError, ValueError, RuntimeError, CommandFailed) as exc:
         print(f"mypy scope check failed: {exc}", file=sys.stderr)
         return 2

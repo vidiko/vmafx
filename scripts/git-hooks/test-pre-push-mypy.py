@@ -465,10 +465,18 @@ class MypyScope(unittest.TestCase):
         self.assertEqual(
             result.stderr,
             "mypy: 1 finding(s) this branch introduces:\n"
-            "  scripts/debt.py: [assignment] planted finding\n"
+            "  scripts/debt.py: [assignment] planted finding (1 more than the merge base)\n"
             "\nFindings already present at the merge base are not listed. Fixing them is\n"
             "welcome, but this gate only asks that the branch add none.\n",
         )
+
+    def test_new_finding_once_has_no_count(self) -> None:
+        self.write("scripts/owned.py", "planted: int = 1  # BAD\n")
+        self.commit("add one new finding in a new file")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("  scripts/owned.py: [assignment] planted finding\n", result.stderr)
+        self.assertNotIn("more than the merge base", result.stderr)
 
     def test_duplicate_finding_moved_without_count_change_is_inherited(self) -> None:
         self.write("scripts/debt.py", "first: int = 1  # BAD\nsecond: int = 2  # BAD\n")
