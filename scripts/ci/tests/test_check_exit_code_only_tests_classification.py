@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from scripts.ci import check_exit_code_only_tests as checker  # noqa: E402
+from scripts.ci.tests import symlink_test_support as links  # noqa: E402
 from scripts.ci.tests.test_check_exit_code_only_tests import (  # noqa: E402
     REL_TEST_FILE,
     ExitCodeOnlyFixture,
@@ -356,10 +357,8 @@ class ExitCodeOnlyClassificationTest(ExitCodeOnlyFixture):
         rc, out, err = self._run_checker("--changed-against", "HEAD")
         self.assertEqual(rc, 0, err)
         self.assertIn("0 exit-code-only", out)
-        try:
-            (self.repo / "scripts/ci/tests/test_bad.py").symlink_to("missing")
-        except OSError as exc:
-            self.skipTest(f"symlink unavailable: {exc}")
+        links.skip_without_symlinks(self.repo / "scripts/ci/tests")
+        (self.repo / "scripts/ci/tests/test_bad.py").symlink_to("missing")
         rc, _, err = self._run_checker("--changed-against", "HEAD")
         self.assertEqual(rc, 2, err)
         self.assertIn("test_bad.py", err)

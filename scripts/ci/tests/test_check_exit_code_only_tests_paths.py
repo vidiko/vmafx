@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from scripts.ci import check_exit_code_only_tests as checker  # noqa: E402
+from scripts.ci.tests import symlink_test_support as links  # noqa: E402
 from scripts.ci.tests.test_check_exit_code_only_tests import (  # noqa: E402
     REL_TEST_FILE,
     ExitCodeOnlyFixture,
@@ -26,10 +27,8 @@ class ExitCodeOnlyPathsTest(ExitCodeOnlyFixture):
             outside = Path(directory) / "outside.py"
             outside.write_text("def test_x():\n    assert True\n", encoding="utf-8")
             link = self.repo / "scripts/ci/tests/test_link.py"
-            try:
-                link.symlink_to(outside)
-            except OSError as exc:
-                self.skipTest(f"symlink unavailable: {exc}")
+            links.skip_without_symlinks(link.parent)
+            link.symlink_to(outside)
             rc, _, err = self._run_checker()
             self.assertEqual(rc, 2, err)
             self.assertIn("path is outside repository root", err)
