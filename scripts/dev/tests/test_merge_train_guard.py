@@ -879,6 +879,18 @@ class TrainContract(unittest.TestCase):
             "{}",
             json.dumps({"total_count": 3, "variables": []}),
             json.dumps({"total_count": 1, "variables": ["x"]}),
+            *(json.dumps({"total_count": count, "variables": []}) for count in (False, -1)),
+            json.dumps({"total_count": 0, "variables": [{"name": "X", "value": ""}]}),
+            *(
+                json.dumps({"total_count": 1, "variables": [record]})
+                for record in (
+                    {"value": "true"},
+                    {"name": "", "value": "true"},
+                    {"name": ["X"], "value": "true"},
+                    {"name": "GPU_COVERAGE_ENABLED"},
+                    {"name": "GPU_COVERAGE_ENABLED", "value": True},
+                )
+            ),
         )
         for payload in bad_payloads:
             for org_answer, repo_answer in ((payload, none), (none, payload)):
@@ -899,7 +911,9 @@ class TrainContract(unittest.TestCase):
         self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
         original_metadata = self.train.metadata.copy()
         cases: tuple[tuple[dict[str, Any], str | None, str], ...] = (
-            ({"autoMergeRequest": {}}, None, "disarm it before retrying"),
+            ({"autoMergeRequest": {}}, None, "owner must disable it"),
+            ({"isDraft": True}, None, "draft PRs cannot be admitted"),
+            ({"mergeStateStatus": "BLOCKED"}, None, "expected CLEAN"),
             ({"state": "CLOSED"}, None, "only open PRs targeting master"),
             ({"baseRefName": "other"}, None, "only open PRs targeting master"),
             ({"headRefOid": "d" * 40}, None, "head changed during squash message check"),
@@ -925,6 +939,37 @@ class TrainContract(unittest.TestCase):
                 self.assertRaisesRegex(guard.Refused, reason),
             ):
                 self.train.admit_fork(1421, self.head)
+
+    def test_admit_fork_uses_final_policy_and_reviews(self) -> None:
+        for reviewers in ((), ("bob",)):
+            with self.subTest(reviewers=reviewers):
+                self.configure_fork_pr(("alice",))
+                self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
+                with (
+                    patch.object(
+                        self.train,
+                        "_check_squash_message",
+                        side_effect=lambda *_args, chosen=reviewers: self.write_fork_policy(chosen),
+                    ),
+                    self.assertRaises(guard.Refused) as error,
+                ):
+                    self.train.admit_fork(1421, self.head)
+                if not reviewers:
+                    self.assertIn("fork_reviewers must be non-empty", str(error.exception))
+
+        self.configure_fork_pr(("alice",))
+        self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
+        final_time = "2026-11-22T02:00:00Z"
+
+        def check_message(*_args: Any) -> None:
+            self.write_fork_policy(("bob",))
+            self.train.review_items.append(
+                self.review_record("bob", "APPROVED", self.head, final_time)
+            )
+
+        with patch.object(self.train, "_check_squash_message", side_effect=check_message):
+            receipt = self.train.admit_fork(1421, self.head)
+        self.assertEqual((receipt["reviewer"], receipt["submitted_at"]), ("bob", final_time))
 
     def test_admit_fork_positive_receipt_never_merges_or_locks(self) -> None:
         self.configure_fork_pr(("alice",))

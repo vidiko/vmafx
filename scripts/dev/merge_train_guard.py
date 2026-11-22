@@ -289,7 +289,7 @@ class Train:
             raise Refused("GitHub returned incomplete or invalid PR reviews")
         return reviews
 
-    def _actions_variables(self, endpoint: str) -> dict[Any, Any]:
+    def _actions_variables(self, endpoint: str) -> dict[str, str]:
         """Return name -> value for one complete Actions variable listing."""
         raw = execute(["gh", "api", f"repos/{REPO}/actions/{endpoint}?per_page=100"], self.root)
         value = json.loads(raw)
@@ -297,11 +297,21 @@ class Train:
             raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
         variables = value.get("variables")
         total_count = value.get("total_count")
-        if not isinstance(variables, list) or not all(isinstance(item, dict) for item in variables):
+        if (
+            not isinstance(variables, list)
+            or type(total_count) is not int
+            or total_count != len(variables)
+        ):
             raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
-        if not isinstance(total_count, int) or total_count > len(variables):
-            raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
-        return {item.get("name"): item.get("value") for item in variables}
+        for item in variables:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not item["name"].strip()
+                or not isinstance(item.get("value"), str)
+            ):
+                raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
+        return {item["name"]: item["value"] for item in variables}
 
     def hardware_switches(self) -> set[str]:
         """Return hardware lane switches that the workflow `vars` context reads as true.
@@ -577,20 +587,20 @@ class Train:
         if not _is_sha(reviewed_head):
             raise Refused("reviewed head must be a 40-character lowercase hex SHA")
         policy, pr = self._open_master_pr(number)
-        merge_state = self._require_fork_queue_state(pr, reviewed_head)
-        reviewer_login, submitted_at = self._require_fork_approval(
-            number, reviewed_head, policy.get("fork_reviewers", [])
-        )
+        self._require_fork_queue_state(pr, reviewed_head)
+        self._require_fork_approval(number, reviewed_head, policy.get("fork_reviewers", []))
         self.require_checks(number)
         title = pr.get("title", "")
         body_text = pr.get("body", "") or ""
         self._check_squash_message(number, title, body_text)
-        _, fresh = self._open_master_pr(number)
+        fresh_policy, fresh = self._open_master_pr(number)
         if fresh.get("headRefOid") != reviewed_head:
             raise Refused("PR head changed during squash message check")
         _require_unchanged_text(fresh, title, body_text)
-        if fresh.get("autoMergeRequest") is not None:
-            raise Refused("PR has a pending auto-merge request; disarm it before retrying")
+        merge_state = self._require_fork_queue_state(fresh, reviewed_head)
+        reviewer_login, submitted_at = self._require_fork_approval(
+            number, reviewed_head, fresh_policy.get("fork_reviewers", [])
+        )
         return {
             "number": number,
             "head": reviewed_head,

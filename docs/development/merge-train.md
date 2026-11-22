@@ -80,10 +80,6 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   --repo-root /home/kilian/dev/vmafx/vmafx --state-dir /home/kilian/dev/vmafx/vmafx/.claude/mergetrain
 ```
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:e76c5722fe964174577c706e9c4f4bf72f163b501b6be67ac693210ad332210b -->
-
 - `admit-fork NUMBER --reviewed-head SHA` is read-only, runs outside `mutation.lock`,
   and refuses `--apply` (exit `1`). It verifies that `SHA` is a 40-character lowercase
   hex OID, the train is neither paused nor holding `NUMBER` (including release PR #1213),
@@ -99,11 +95,20 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   `APPROVED` on `commit.oid == SHA` while none has `CHANGES_REQUESTED`, required checks
   pass, and the squash commit message check passes with unchanged head, title, and body.
   A final read after the squash message check repeats the open-against-`master`, pause,
-  hold, and auto-merge checks.
+  hold, queue eligibility, and maintainer approval checks using the refreshed policy.
   It prints a JSON receipt (`number`, `head`, `reviewer`, `submitted_at`, `merge_state`,
   `checks`) and exits `0` when eligible, or prints `merge-train: refused: ...` and exits
-  `1`. Enqueue separately with `gh pr merge NUMBER --squash --match-head-commit SHA`
-  (never `--auto`).
+  `1`.
+- Immediately before enqueueing, confirm `gh pr view NUMBER --json headRefOid`
+  reports the reviewed `SHA`, then run `gh pr checks NUMBER --required --json name,bucket`.
+  Require a nonempty list that includes `Required Checks Aggregator`, with every bucket
+  equal to `pass`. Check the head again after reading the results. Stop if the head
+  differs from `SHA` or any required result is missing or does not pass.
+- Enqueue with `gh pr merge NUMBER --squash --match-head-commit SHA`, without `--auto`.
+  [GitHub CLI can still enable auto-merge if required checks have not passed](https://cli.github.com/manual/gh_pr_merge).
+  Immediately after the enqueue attempt, run `gh pr view NUMBER --json autoMergeRequest`.
+  Continue to `queue-audit` only after confirming `autoMergeRequest` is null. If there is
+  a pending request, stop and have its owner disable auto-merge before retrying admission.
 - `queue-audit` takes no PR number, refuses `--apply` (exit `1`), and queries
   `mergeQueue(branch: "master")` on `vidiko/vmafx` via `gh api graphql`. In-repository
   queue entries are skipped. Each cross-repository entry must satisfy the same
@@ -113,8 +118,6 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   clean, it prints `queue audit: 0 problems` and exits `0`; when any cross-repository
   entry fails, it prints one problem per line and exits `1`, and the operator removes the
   failing entry from the merge queue immediately.
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 ## Ownership and promotion
 
