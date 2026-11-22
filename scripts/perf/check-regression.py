@@ -26,7 +26,7 @@ import math
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 DEFAULT_BASELINE = Path("testdata/perf_multi_resolution.json")
 DEFAULT_TOLERANCE_PCT = 5.0
@@ -69,7 +69,7 @@ def _hardware(payload: dict[str, Any]) -> dict[str, Any]:
     return hw if isinstance(hw, dict) else {}
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(value: Any) -> TypeGuard[int | float]:
     """True for a finite int or float; bool and NaN do not count."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
