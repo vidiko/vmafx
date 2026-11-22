@@ -205,6 +205,17 @@ class ExitCodeOnlyMarkersTest(ExitCodeOnlyFixture):
         self.assertEqual(rc_header, 1, err_header)
         self.assertIn("test_weak", err_header)
 
+    def test_changed_header_line_after_bracketed_colon_selects_method(self) -> None:
+        source = (
+            "class TestX(\n    Base,\n    key=lambda v: v,\n    flag=1,\n):\n"
+            "    def test_weak(self):\n        rc = run_checker()\n        assert rc == 0\n"
+        )
+        target = self._commit_file(REL_TEST_FILE, source)
+        target.write_text(source.replace("flag=1", "flag=2"), encoding="utf-8")
+        rc, _, err = self._run_checker("--changed-against", "HEAD")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("test_weak", err)
+
 
 if __name__ == "__main__":
     unittest.main()
