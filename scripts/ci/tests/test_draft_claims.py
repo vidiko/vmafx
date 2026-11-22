@@ -219,6 +219,8 @@ class DraftClaimsTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, f"{text}: {result.stdout}{result.stderr}")
 
     def test_backslash_parity_before_label(self) -> None:
+        self.assertEqual(MODULE.strip_link_destinations(r"\\[suite](29)"), r"\\[suite]")
+        self.assertEqual(MODULE.strip_link_destinations(r"\\\[suite](29)"), r"\\\[suite](29)")
         evidence = self.file("evidence", "28")
         for text, expected in (
             (r"\\[suite](29)", 0),
