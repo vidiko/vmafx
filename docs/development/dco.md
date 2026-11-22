@@ -232,8 +232,9 @@ Co-authored-by: vmafx-release-bot[bot] <340976456+vmafx-release-bot[bot]@users.n
 A second landed-mode case strips that same single line when the commit author is
 the release bot itself (name `vmafx-release-bot[bot]`, lowercased email
 `340976456+vmafx-release-bot[bot]@users.noreply.github.com`), with no path
-condition, because the generated-docs render commit is authored by the release
-bot and the squash names it again as co-author
+condition, because the generated-docs render commit 800122efd8 (#3613), the first
+that landed through the merge queue, is authored by the release bot and its
+squash commit names it again as co-author
 ([ADR-3624](../adr/3624-landed-release-bot-self-coauthor.md)). A foreign
 co-author, a second self line, or the line on a commit by another author is
 still refused.

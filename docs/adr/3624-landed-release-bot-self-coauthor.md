@@ -11,7 +11,9 @@ Master commit `800122efd8` (PR #3613, the docs render commit) is authored by
 `vmafx-release-bot[bot]` and carries exactly one `Co-authored-by:` trailer naming
 that same bot. `scripts/ci/check-dco.py --landed` refuses it, so the workflow
 `.github/workflows/landed-commit-messages.yml` is red on master (run 45030816200).
-Every render commit has this shape:
+GitHub wrote that squash commit when #3613 landed through the merge queue, the
+first render pull request to do so; the render commits before it on master
+(#3528 to #3611) carry no `Co-authored-by:` line. The message of `800122efd8`:
 
 ```text
 chore(docs): render generated changelog and ADR index (#3613)
@@ -33,8 +35,8 @@ self line, and the release-bot line on a commit by any other author stay refused
 
 | Alternative | Benefit | Cost |
 | --- | --- | --- |
-| Strip the self line for the release-bot author only (chosen) | Matches forge squash behaviour without widening other identities | One more trailer shape in `landed_exempt_message` |
-| Change squash landing so it never adds the self line | No DCO change | The forge adds the trailer when squashing a PR whose commits the bot authored, outside this repository's control |
+| Strip the self line for the release-bot author only (chosen) | Accepts the landed render commit without widening other identities | One more trailer shape in `landed_exempt_message` |
+| Change squash landing so it never adds the self line | No DCO change | Which landing step adds the line is not established; only `800122efd8` shows it, and its committer is GitHub |
 | Add render paths to the `dco-landed-release-bot-coauthor` exception file | Reuses path grants | Path grants expire and the render commit touches many generated paths |
 
 ## Consequences
