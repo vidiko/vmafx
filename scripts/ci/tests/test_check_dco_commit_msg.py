@@ -65,7 +65,7 @@ class CommitMessageTest(unittest.TestCase):
         )
 
     def run_gate(self, text: str, *args: str) -> Any:
-        self.message.write_text(text, encoding="utf-8")
+        self.message.write_text(text, encoding="utf-8", newline="")
         return run(
             [sys.executable, str(GATE), "--message-file", str(self.message), *args],
             allowed_executables=(sys.executable,),
