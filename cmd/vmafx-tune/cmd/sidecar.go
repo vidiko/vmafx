@@ -8,17 +8,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golusoris/golusoris/core/clikit"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/VMAFx/vmafx/pkg/tune/codec"
-	"github.com/VMAFx/vmafx/pkg/tune/predictor"
-	"github.com/VMAFx/vmafx/pkg/tune/pyjson"
+	"github.com/VMAFx/vmafx/pkg/codecadapter"
+	"github.com/VMAFx/vmafx/pkg/predictor"
+	"github.com/VMAFx/vmafx/pkg/pyjson"
 	"github.com/VMAFx/vmafx/pkg/tune/sidecar"
 )
 
@@ -122,18 +124,30 @@ func addSidecarCommonFlags(cmd *cobra.Command, flags *sidecarCommonFlags) {
 	useUsageExitCode(cmd)
 }
 
+// sidecarModelLoadTimeout is the upper bound on resolving and opening --model.
+const sidecarModelLoadTimeout = 30 * time.Second
+
 // buildSidecarPredictor constructs the configured sidecar for a CLI handler.
 //
 // Exit-status mapping mirrors _run_sidecar in the Python CLI: argparse rejects
 // an unknown --codec and Predictor() raises on an unresolvable --model, both
 // exit 2, so those errors carry the usage status. A cache-directory I/O
 // failure while creating the host UUID is an uncaught OSError in Python — a
-// plain exit 1 — so ForCodec's error is returned untagged.
-func buildSidecarPredictor(flags *sidecarCommonFlags, d deps) (*sidecar.Predictor, error) {
-	if _, err := codec.Get(flags.codec); err != nil {
+// plain exit 1 — so ForCodec's error is returned untagged. Model load is
+// bounded by sidecarModelLoadTimeout.
+func buildSidecarPredictor(
+	ctx context.Context, flags *sidecarCommonFlags, d deps,
+) (*sidecar.Predictor, error) {
+	if _, err := codecadapter.Get(flags.codec); err != nil {
 		return nil, asUsageError(fmt.Errorf("--codec: %w", err))
 	}
-	base, err := predictor.New(flags.model, d.Log)
+	log := d.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, sidecarModelLoadTimeout)
+	defer cancel()
+	base, err := predictor.NewWithModel(loadCtx, flags.model, log)
 	if err != nil {
 		return nil, asUsageError(err)
 	}
@@ -159,8 +173,8 @@ func newSidecarStatusCmd() *cobra.Command {
 	return cmd
 }
 
-func runSidecarStatus(_ context.Context, d deps, flags *sidecarCommonFlags) error {
-	sp, err := buildSidecarPredictor(flags, d)
+func runSidecarStatus(ctx context.Context, d deps, flags *sidecarCommonFlags) error {
+	sp, err := buildSidecarPredictor(ctx, flags, d)
 	if err != nil {
 		return err
 	}
@@ -194,11 +208,11 @@ func emitSidecarStatus(payload map[string]any, asJSON bool) error {
 }
 
 func emitJSONPayload(payload map[string]any) error {
-	rendered, err := pyjson.Marshal(payload, 2)
+	rendered, err := pyjson.MarshalIndent(payload, true)
 	if err != nil {
 		return fmt.Errorf("render sidecar payload: %w", err)
 	}
-	_, err = fmt.Println(rendered)
+	_, err = fmt.Println(string(rendered))
 	return err
 }
 
@@ -227,11 +241,11 @@ func newSidecarPredictCmd() *cobra.Command {
 	return cmd
 }
 
-func runSidecarPredict(_ context.Context, d deps, flags *sidecarPredictFlags) error {
+func runSidecarPredict(ctx context.Context, d deps, flags *sidecarPredictFlags) error {
 	if err := flags.requireFlags("features-json", "crf"); err != nil {
 		return err
 	}
-	sp, err := buildSidecarPredictor(&flags.sidecarCommonFlags, d)
+	sp, err := buildSidecarPredictor(ctx, &flags.sidecarCommonFlags, d)
 	if err != nil {
 		return err
 	}
@@ -291,11 +305,11 @@ func newSidecarRecordCmd() *cobra.Command {
 	return cmd
 }
 
-func runSidecarRecord(_ context.Context, d deps, flags *sidecarRecordFlags) error {
+func runSidecarRecord(ctx context.Context, d deps, flags *sidecarRecordFlags) error {
 	if err := flags.requireFlags("features-json", "crf", "observed-vmaf"); err != nil {
 		return err
 	}
-	sp, err := buildSidecarPredictor(&flags.sidecarCommonFlags, d)
+	sp, err := buildSidecarPredictor(ctx, &flags.sidecarCommonFlags, d)
 	if err != nil {
 		return err
 	}
@@ -361,11 +375,11 @@ func newSidecarBatchRecordCmd() *cobra.Command {
 // The file is read whole and split with CPython's universal-newline rule, so
 // line numbers in the skip diagnostics match the Python CLI's and there is no
 // line-length ceiling (Python has none either).
-func runSidecarBatchRecord(_ context.Context, d deps, flags *sidecarBatchFlags) error {
+func runSidecarBatchRecord(ctx context.Context, d deps, flags *sidecarBatchFlags) error {
 	if err := flags.requireFlags("captures-jsonl"); err != nil {
 		return err
 	}
-	sp, err := buildSidecarPredictor(&flags.sidecarCommonFlags, d)
+	sp, err := buildSidecarPredictor(ctx, &flags.sidecarCommonFlags, d)
 	if err != nil {
 		return err
 	}

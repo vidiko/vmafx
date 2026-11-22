@@ -16,7 +16,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VMAFx/vmafx/pkg/tune/predictor"
+	"github.com/VMAFx/vmafx/pkg/predictor"
 )
 
 const featuresJSON = `{

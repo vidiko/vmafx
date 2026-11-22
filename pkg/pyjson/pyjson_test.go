@@ -144,6 +144,7 @@ func TestFormatFloatMatchesCPythonRepr(t *testing.T) {
 		{"integral value gains a .0", 1, "1.0"},
 		{"integral negative", -42, "-42.0"},
 		{"typical VMAF score", 93.5, "93.5"},
+		{"two decimal places", 3.14, "3.14"},
 		{"shortest round-trip digits", 0.1, "0.1"},
 		{"long mantissa", 1828.686011867366, "1828.686011867366"},
 		{"seventeen-digit mantissa", 1828.6860118673662, "1828.6860118673662"},

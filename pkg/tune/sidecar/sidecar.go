@@ -54,8 +54,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/VMAFx/vmafx/pkg/tune/predictor"
-	"github.com/VMAFx/vmafx/pkg/tune/pyjson"
+	"github.com/VMAFx/vmafx/pkg/predictor"
+	"github.com/VMAFx/vmafx/pkg/pyjson"
 )
 
 // SchemaVersion is the on-disk state schema. Bump on every

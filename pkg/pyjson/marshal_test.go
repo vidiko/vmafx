@@ -112,6 +112,12 @@ func TestMarshalMatchesPythonJSONDumps(t *testing.T) {
 			want: `{"a": 1, "b": [2, 3]}`,
 		},
 		{
+			name: "compact string map sorts keys",
+			in:   map[string]any{"b": 2, "a": 1},
+			opts: Options{SortKeys: true},
+			want: `{"a": 1, "b": 2}`,
+		},
+		{
 			name: "float slices keep repr spelling and the NaN token",
 			in:   map[string]any{"xs": []any{1.0, 0.5, math.NaN()}},
 			opts: Options{SortKeys: true},
@@ -544,6 +550,11 @@ func TestMarshalSorted(t *testing.T) {
 		row  map[string]any
 		want string
 	}{
+		{
+			name: "single string member",
+			row:  map[string]any{"key": "val"},
+			want: `{"key": "val"}`,
+		},
 		{
 			name: "keys are sorted and floats use repr",
 			row:  map[string]any{"zebra": 1, "alpha": "a", "framerate": 24.0},
