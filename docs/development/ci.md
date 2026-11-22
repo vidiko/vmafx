@@ -513,9 +513,10 @@ commit ever gets a complete verdict ([ADR-1673](../adr/1673-master-runs-not-canc
   ([ADR-3557](../adr/3557-aggregator-same-head-queue.md)). Re-running the
   aggregator of an old master head no longer cancels the newest one. On a PR
   ref, re-running an older head's `synchronize` run still cancels the current
-  head's run, while re-running an `edited` twin waits as pending; re-run a
-  cancelled aggregator only when no aggregator run of the same head is in
-  progress.
+  head's run, while re-running an `edited` twin waits as pending. Every head of
+  a pull request shares that ref group, so re-run a cancelled aggregator only
+  when no aggregator run of the same pull request, on any head, is running or
+  pending.
 - Blocks that must serialise keep their group and are listed with a reason in
   `scripts/ci/tests/test_master_concurrency_contract.py`: `dev-container-publish.yml`
   (registry publish), `release-please.yml` (one release PR per push),
@@ -625,9 +626,11 @@ look, the content guard in `.github/actions/edit-supersede-guard/action.yml` and
 `scripts/ci/edit_supersede_guard.py` fails an earlier `Rules` job when its event
 title, body or base differs from the live pull request. The earlier failed job
 then fails the aggregator instead of allowing a stale pass. The guard waits
-until five seconds after the event stamp, capped at 30 seconds; a pull-request
-read that lags the edit by more than the five-second settle can still return
-stale text. `test_late_registering_same_second_edit_fails_on_superseded_rules_run`
+until five seconds after the event stamp, capped at 30 seconds, and reads the
+pull request once. A later edit made shortly before that read can be missed
+even when the API lags by less than five seconds, and an edit made after the
+read is not seen by that run; the `Rules` run of that later edit judges the
+current text. `test_late_registering_same_second_edit_fails_on_superseded_rules_run`
 in `scripts/ci/tests/test_aggregator_edited_window.py` covers delayed
 registration, and `test_superseded_fails` in
 `scripts/ci/tests/test_edit_supersede_guard.py` covers the guard decision.
