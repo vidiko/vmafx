@@ -159,7 +159,7 @@ class DraftClaimsTests(unittest.TestCase):
             r"[x](<a\>b29>)",
             r"[x](<29\\>)",
         ):
-            self.assertEqual(MODULE.LINK.sub("]", text), "[x]")
+            self.assertEqual(MODULE.strip_link_destinations(text), "[x]")
             result = self.run_checker(self.file("draft", text), evidence)
             self.assertEqual(result.returncode, 0, f"{text}: {result.stdout}{result.stderr}")
 
@@ -197,6 +197,19 @@ class DraftClaimsTests(unittest.TestCase):
         result = self.run_checker(draft, self.file("evidence", "nothing"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing in evidence: 29", result.stdout)
+
+    def test_destination_without_matched_label_is_checked(self) -> None:
+        evidence = self.file("evidence", "28")
+        for text in (r"\[suite\](29)", "suite](29)", r"\[suite](29)"):
+            result = self.run_checker(self.file("draft", text), evidence)
+            self.assertEqual(result.returncode, 1, f"{text}: {result.stdout}{result.stderr}")
+            self.assertIn("missing in evidence: 29", result.stdout)
+
+    def test_destination_after_matched_label_is_ignored(self) -> None:
+        evidence = self.file("evidence", "28")
+        for text in ("[suite](29)", "[a [b] c](29)", "![chart](29.png)"):
+            result = self.run_checker(self.file("draft", text), evidence)
+            self.assertEqual(result.returncode, 0, f"{text}: {result.stdout}{result.stderr}")
 
     def test_link_with_two_and_three_nested_levels_is_ignored(self) -> None:
         draft = self.file("draft", "[x](a(b(12345))) [y](a(b(c(67890))))")

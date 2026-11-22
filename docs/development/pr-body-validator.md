@@ -25,10 +25,12 @@ python3 scripts/ci/draft_claims.py draft.md evidence.md [more-evidence.md ...]
 The check reports tokens missing from the evidence and exits 1; unreadable or
 over-1-MiB files and invalid usage exit 2. It ignores Markdown link destinations
 (bare targets without whitespace up to three nested or escaped parenthesis
-pairs, or `<...>` targets, plus optional single-line titles) and single digits,
-and normalizes thousands separators; malformed or more deeply nested targets
-remain checked. Evidence files are checked separately. A match confirms token
-presence only; verify that the evidence supports each claim in context.
+pairs, or `<...>` targets, plus optional single-line titles) that directly
+follow a link label in unescaped square brackets, and single digits, and
+normalizes thousands separators; malformed or more deeply nested targets, and
+parentheses after an escaped or unmatched `]`, remain checked. Evidence files
+are checked separately. A match confirms token presence only; verify that the
+evidence supports each claim in context.
 
 ## What it checks
 

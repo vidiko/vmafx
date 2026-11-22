@@ -11,7 +11,8 @@ from pathlib import Path
 
 TOKEN = re.compile(r"(?<![A-Za-z0-9.])\d[0-9A-Za-z]*(?:\.\d[0-9A-Za-z]*)*")
 THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
-# Strip Markdown link destinations after `](`: either a bare destination with no
+# Strip Markdown link destinations that follow a link label in unescaped square
+# brackets with at most one nested bracket pair: either a bare destination with no
 # whitespace and up to three nested or backslash-escaped parenthesis pairs, or an
 # angle-bracket destination `<...>` with backslash escapes and no unescaped `<`,
 # `>`, or line breaks, each followed by an optional space-separated single-line
@@ -27,14 +28,21 @@ LINK_TITLE = (
     r"|'(?:\\[^\r\n]|[^'\\\r\n])*+'"
     r"|\((?:\\[^\r\n]|[^()\\\r\n])*+\))"
 )
-LINK = re.compile(rf"\]\({LINK_DEST}(?: ++{LINK_TITLE})?[ \t]*+\)")
+LINK_LABEL_TEXT = r"(?:\\[^\r\n]|[^\[\]\\])*+"
+LINK_LABEL = rf"(?<!\\)\[{LINK_LABEL_TEXT}(?:\[{LINK_LABEL_TEXT}\]{LINK_LABEL_TEXT})*+\]"
+LINK = re.compile(rf"(?P<label>{LINK_LABEL})\({LINK_DEST}(?: ++{LINK_TITLE})?[ \t]*+\)")
 MAX_BYTES = 1024 * 1024
 MIN_ARGS = 3
 
 
+def strip_link_destinations(text: str) -> str:
+    """Drop the destination of each inline link and keep its label."""
+    return LINK.sub(lambda match: match.group("label"), text)
+
+
 def tokens(text: str) -> list[str]:
     """Return distinct numeric tokens in their first-seen order."""
-    normalized = THOUSANDS.sub("", LINK.sub("]", text))
+    normalized = THOUSANDS.sub("", strip_link_destinations(text))
     return list(dict.fromkeys(token for token in TOKEN.findall(normalized) if len(token) > 1))
 
 
