@@ -1298,6 +1298,8 @@ static int is_executable_file(const char *path)
     return stat(path, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & exec_bits) != 0u;
 }
 
+static void copy_n_terminated(char *dst, const char *src, size_t len);
+
 /* Locate `cosign` on PATH. Returns 0 on success and writes the resolved
  * absolute path into `out`; returns -EACCES otherwise. Implemented by
  * walking PATH manually and stat-checking each candidate so we never need
@@ -1317,7 +1319,7 @@ static int locate_cosign(const char *path_env, char *out, size_t out_sz)
         const size_t seg_len = colon ? (size_t)(colon - p) : strlen(p);
         if (seg_len > 0u && seg_len + sizeof("/cosign") <= out_sz) {
             assert(seg_len < out_sz);
-            memcpy(out, p, seg_len);
+            copy_n_terminated(out, p, seg_len);
             // SAFETY: seg_len + sizeof("/cosign") <= out_sz bounds out + seg_len.
             (void)snprintf(out + seg_len, out_sz - seg_len, "/cosign");
             if (is_executable_file(out))

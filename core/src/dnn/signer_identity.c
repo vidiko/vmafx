@@ -354,7 +354,8 @@ static int json_read_key(const char *doc, size_t len, size_t *off, struct json_s
 
 static int json_skip_string(const char *doc, size_t len, size_t *off)
 {
-    for (size_t i = *off + 1u; i < len; i++) {
+    size_t i = *off + 1u;
+    while (i < len) {
         const unsigned char c = (unsigned char)doc[i];
         if (c == '"') {
             *off = i + 1u;
@@ -363,9 +364,12 @@ static int json_skip_string(const char *doc, size_t len, size_t *off)
         if (c < 0x20u)
             return 0;
         if (c == '\\') {
-            i++;
-            if (i >= len || doc[i] == 'u' || (unsigned char)doc[i] < 0x20u)
+            const size_t esc = i + 1u;
+            if (esc >= len || doc[esc] == 'u' || (unsigned char)doc[esc] < 0x20u)
                 return 0;
+            i = esc + 1u;
+        } else {
+            i++;
         }
     }
     return 0;
