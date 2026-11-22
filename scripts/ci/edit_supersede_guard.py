@@ -91,7 +91,8 @@ def run(
         changed = decide(pr, live)
         if changed:
             print(
-                f"::error::superseded by a later edit: {', '.join(changed)} changed since the event at {stamp}; the Rules run of the later edit judges the current text"
+                f"::error::superseded by a later edit: {', '.join(changed)} changed since the "
+                f"event at {stamp}; the Rules run of the later edit judges the current text"
             )
             return 1
         return 0

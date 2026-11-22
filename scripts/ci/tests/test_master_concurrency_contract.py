@@ -441,7 +441,10 @@ def serial_second_look_findings(workflows: dict[str, dict[Any, Any]]) -> list[st
     raw = workflow.get("concurrency")
     if not raw:
         return [
-            "required-aggregator.yml [workflow] missing concurrency block for serialised second look"
+            (
+                "required-aggregator.yml [workflow] "
+                "missing concurrency block for serialised second look"
+            )
         ]
     block = normalise(raw)
     edit_one = pr_event("a" * 40, "edited", STAMP_T1, run_id="run-edit-1")
@@ -695,7 +698,10 @@ class Contract(unittest.TestCase):
         self.assertEqual(
             third_edit_replacement_findings(gate_pair(aggregator=agg)),
             [
-                "required-aggregator.yml [workflow] missing concurrency block for three-edit known gap"
+                (
+                    "required-aggregator.yml [workflow] "
+                    "missing concurrency block for three-edit known gap"
+                )
             ],
         )
 
@@ -741,7 +747,10 @@ class Contract(unittest.TestCase):
         self.assertEqual(
             serial_second_look_findings({}),
             [
-                "required-aggregator.yml [workflow] missing concurrency block for serialised second look"
+                (
+                    "required-aggregator.yml [workflow] "
+                    "missing concurrency block for serialised second look"
+                )
             ],
         )
 
@@ -750,7 +759,10 @@ class Contract(unittest.TestCase):
         self.assertEqual(
             serial_second_look_findings(gate_pair(aggregator=agg)),
             [
-                "required-aggregator.yml [workflow] missing concurrency block for serialised second look"
+                (
+                    "required-aggregator.yml [workflow] "
+                    "missing concurrency block for serialised second look"
+                )
             ],
         )
 
@@ -957,7 +969,10 @@ class Contract(unittest.TestCase):
             AGGREGATOR_ON,
             AGGREGATOR_NEW,
             aggregator_jobs(
-                step_if="github.event_name == 'pull_request' && github.event.pull_request.draft == true"
+                step_if=(
+                    "github.event_name == 'pull_request' && "
+                    "github.event.pull_request.draft == true"
+                )
             ),
         )
         pair = {

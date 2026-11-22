@@ -55,7 +55,8 @@ def findings(workflow_text: str, action_text: str) -> list[str]:
     return errors
 
 
-@pytest.mark.parametrize(  # type: ignore[untyped-decorator]  # pytest is untyped for the mypy gate (--no-site-packages)
+# pytest is untyped for the mypy gate (--no-site-packages)
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
     ("change", "expected"),
     [
         ({}, []),
@@ -119,7 +120,8 @@ def test_fetch_error_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
 def test_superseded_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert call(event_env(tmp_path), lambda *args: {**PR, "body": "new"}) == 1
     assert (
-        f"::error::superseded by a later edit: body changed since the event at {STAMP}; the Rules run of the later edit judges the current text"
+        "::error::superseded by a later edit: body changed since the "
+        f"event at {STAMP}; the Rules run of the later edit judges the current text"
         in capsys.readouterr().out
     )
 
@@ -133,12 +135,25 @@ def test_workflow_contract() -> None:
 
 
 def test_contract_missing_guard() -> None:
-    workflow = "jobs:\n  example:\n    # required-aggregator\n    steps:\n      - uses: actions/checkout@sha\n"
+    workflow = (
+        "jobs:\n"
+        "  example:\n"
+        "    # required-aggregator\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@sha\n"
+    )
     assert "example" in findings(workflow, ACTION.read_text())[0]
 
 
 def test_contract_guard_before_checkout() -> None:
-    workflow = f"jobs:\n  example:\n    # required-aggregator\n    steps:\n      - uses: {USE}\n      - uses: actions/checkout@sha\n"
+    workflow = (
+        "jobs:\n"
+        "  example:\n"
+        "    # required-aggregator\n"
+        "    steps:\n"
+        f"      - uses: {USE}\n"
+        "      - uses: actions/checkout@sha\n"
+    )
     assert "example" in findings(workflow, ACTION.read_text())[0]
 
 
@@ -149,7 +164,10 @@ def test_contract_action_missing_if() -> None:
     assert "action" in findings(WORKFLOW.read_text(), action)[0]
 
 
-@pytest.mark.parametrize("missing", ["number", "stamp", "token", "repository"])  # type: ignore[untyped-decorator]  # pytest is untyped for the mypy gate (--no-site-packages)
+# pytest is untyped for the mypy gate (--no-site-packages)
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    "missing", ["number", "stamp", "token", "repository"]
+)
 def test_missing_event_data_fails_closed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], missing: str
 ) -> None:
