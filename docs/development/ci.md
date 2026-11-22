@@ -476,14 +476,16 @@ does not start rebase waves outside its schedule
   [required-checks aggregator section](#required-checks-aggregator) details the
   residual bounds. Every other `rule-enforcement.yml` event shares one `-head`
   group per pull request: a later run there replaces a pending one, which
-  creates no check runs, and a run started by a new event judges the same head
-  or a newer one. Enforced by `same_head_findings`,
+  creates no check runs. Enforced by `same_head_findings`,
   `pending_replacement_findings` and `skip_findings` in
-  `scripts/ci/tests/test_master_concurrency_contract.py`. A re-run keeps the
-  event and the head of the run it repeats, so re-running an older `reopened`
-  or `ready_for_review` run can replace the pending run of the current head and
-  leave that head without a `Rules` result until the next event or push:
-  re-run only the newest `Rules` run of a pull request.
+  `scripts/ci/tests/test_master_concurrency_contract.py`. GitHub orders the
+  runs of a group by the time each starts waiting, not by the time its event
+  was dispatched (GitHub's concurrency documentation), so a delayed run of an
+  older head, or a re-run of an older `reopened` or `ready_for_review` run,
+  can replace the pending run of the current head and leave that head without
+  a `Rules` result until the next event or push. When the current head shows
+  no `Rules` result, re-run the cancelled `Rules` run of that head; never
+  re-run a `Rules` run of an older head.
 - `renovate.json` sets `updateNotScheduled: false`: Renovate opens and rebases
   its branches only in its Monday schedule, at most two pull requests and three
   branches at once. Ticking a pull request's rebase box on the dependency
