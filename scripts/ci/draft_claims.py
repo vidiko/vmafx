@@ -18,7 +18,7 @@ THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 # backslash escapes and no unescaped `<`, `>`, or line breaks, each followed by an
 # optional space-separated single-line title in double quotes, single quotes, or
 # parentheses and optional trailing horizontal whitespace before `)`. Anything else
-# stays checked.
+# stays checked. An opening bracket is escaped only after an odd number of backslashes.
 LINK_TEXT = r"(?:\\\S|[^()\s\\])*+"
 LINK_LEVEL_1 = rf"{LINK_TEXT}(?:\({LINK_TEXT}\){LINK_TEXT})*+"
 LINK_LEVEL_2 = rf"{LINK_TEXT}(?:\({LINK_LEVEL_1}\){LINK_TEXT})*+"
@@ -30,15 +30,18 @@ LINK_TITLE = (
     r"|\((?:\\[^\r\n]|[^()\\\r\n])*+\))"
 )
 LINK_LABEL_TEXT = r"(?:\\[^\r\n]|[^\[\]\\\r\n])*+"
-LINK_LABEL = rf"(?<!\\)\[{LINK_LABEL_TEXT}(?:\[{LINK_LABEL_TEXT}\](?!\(){LINK_LABEL_TEXT})*+\]"
-LINK = re.compile(rf"(?P<label>{LINK_LABEL})\({LINK_DEST}(?: ++{LINK_TITLE})?[ \t]*+\)")
+LINK_LABEL = rf"\[{LINK_LABEL_TEXT}(?:\[{LINK_LABEL_TEXT}\](?!\(){LINK_LABEL_TEXT})*+\]"
+LINK = re.compile(
+    rf"(?<!\\)(?P<escapes>(?:\\\\)*+)(?P<label>{LINK_LABEL})"
+    rf"\({LINK_DEST}(?: ++{LINK_TITLE})?[ \t]*+\)"
+)
 MAX_BYTES = 1024 * 1024
 MIN_ARGS = 3
 
 
 def strip_link_destinations(text: str) -> str:
     """Drop the destination of each inline link and keep its label."""
-    return LINK.sub(lambda match: match.group("label"), text)
+    return LINK.sub(lambda match: match.group("escapes") + match.group("label"), text)
 
 
 def tokens(text: str) -> list[str]:

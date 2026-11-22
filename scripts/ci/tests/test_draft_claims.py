@@ -218,6 +218,17 @@ class DraftClaimsTests(unittest.TestCase):
             result = self.run_checker(self.file("draft", text), evidence)
             self.assertEqual(result.returncode, 0, f"{text}: {result.stdout}{result.stderr}")
 
+    def test_backslash_parity_before_label(self) -> None:
+        evidence = self.file("evidence", "28")
+        for text, expected in (
+            (r"\\[suite](29)", 0),
+            (r"\\\\[suite](29)", 0),
+            (r"x \\[suite](29) y", 0),
+            (r"\\\[suite](29)", 1),
+        ):
+            result = self.run_checker(self.file("draft", text), evidence)
+            self.assertEqual(result.returncode, expected, f"{text}: {result.stdout}{result.stderr}")
+
     def test_link_with_two_and_three_nested_levels_is_ignored(self) -> None:
         draft = self.file("draft", "[x](a(b(12345))) [y](a(b(c(67890))))")
         result = self.run_checker(draft, self.file("evidence", "nothing"))
