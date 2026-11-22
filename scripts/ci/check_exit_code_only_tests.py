@@ -299,7 +299,7 @@ def _apply_loop_binding(node: _LoopBinding, rc_vars: set[str]) -> None:
         node.iterable, node.pre_iter_rc_vars
     )
     _invalidate_rebindings(_Rebinding([node.target]), rc_vars)
-    if is_rc:
+    if is_rc and isinstance(node.target, ast.Name):
         rc_vars.add(node.target.id)
 
 
@@ -555,6 +555,37 @@ def _try_flow(node: ast.Try | ast.TryStar, bindings: set[str]) -> list[Traversal
     return steps
 
 
+def _case_cannot_match(subject: ast.AST, pattern: ast.AST) -> bool:
+    """True when a match case pattern provably cannot match a constant subject."""
+    if not isinstance(subject, ast.Constant):
+        return False
+    if isinstance(pattern, ast.MatchSingleton):
+        return subject.value is not pattern.value
+    if isinstance(pattern, ast.MatchValue) and isinstance(pattern.value, ast.Constant):
+        return subject.value != pattern.value.value
+    return False
+
+
+def _match_flow(node: ast.Match, bindings: set[str]) -> list[TraversalStep]:
+    """Schedule match cases with pattern rebinding and reachable guards."""
+    steps: list[TraversalStep] = []
+    entries: list[set[str]] = [bindings]
+    outcomes: list[set[str]] = []
+    for case in node.cases:
+        entry: set[str] = set()
+        body: set[str] = set()
+        steps.append((list(entries), entry))
+        steps.append((_Rebinding([case.pattern]), entry))
+        if case.guard and not _case_cannot_match(node.subject, case.pattern):
+            steps.append((case.guard, entry))
+        entries.append(entry)
+        steps.append(([entry], body))
+        steps.extend((stmt, body) for stmt in case.body)
+        outcomes.append(body)
+    steps.append(([*entries, *outcomes], bindings))
+    return steps
+
+
 def _push_children(node: ast.AST, bindings: set[str], stack: list[TraversalStep]) -> None:
     """Schedule header expressions and control-flow operations in execution order."""
     if isinstance(node, ast.If):
@@ -571,21 +602,7 @@ def _push_children(node: ast.AST, bindings: set[str], stack: list[TraversalStep]
         steps = _alternative_flow(bodies, bindings)
     elif isinstance(node, ast.Match):
         bodies = [*(case.body for case in node.cases), []]
-        steps = []
-        entries: list[set[str]] = [bindings]
-        outcomes: list[set[str]] = []
-        for case in node.cases:
-            entry: set[str] = set()
-            body: set[str] = set()
-            steps.append((list(entries), entry))
-            steps.append((_Rebinding([case.pattern]), entry))
-            if case.guard:
-                steps.append((case.guard, entry))
-            entries.append(entry)
-            steps.append(([entry], body))
-            steps.extend((stmt, body) for stmt in case.body)
-            outcomes.append(body)
-        steps.append(([*entries, *outcomes], bindings))
+        steps = _match_flow(node, bindings)
     elif isinstance(node, ast.withitem):
         steps = [(node.context_expr, bindings)]
         if node.optional_vars is not None:

@@ -173,7 +173,36 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
     def test_match_guard_bindings_reach_later_cases(self) -> None:
         source = (
             "def test_case():\n    proc = run_checker()\n"
+            "    value = len(proc.stdout)\n"
             "    match True:\n"
+            "        case False if (value := proc.returncode) == 0:\n            pass\n"
+            "        case _:\n            assert value == 0\n"
+        )
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
+    def test_match_guard_skipped_when_match_value_cannot_match(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    value = len(proc.stdout)\n"
+            "    match 1:\n"
+            "        case 2 if (value := proc.returncode) == 0:\n            pass\n"
+            "        case _:\n            assert value == 0\n"
+        )
+        self.assertEqual(checker.file_findings(source, REL_TEST_FILE), [])
+
+    def test_match_guard_kept_when_match_value_can_match(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    match True:\n"
+            "        case 1 if (value := proc.returncode) == 0:\n            pass\n"
+            "        case _:\n            assert value == 0\n"
+        )
+        self.assertEqual(len(checker.file_findings(source, REL_TEST_FILE)), 1)
+
+    def test_match_guard_kept_when_subject_not_literal(self) -> None:
+        source = (
+            "def test_case():\n    proc = run_checker()\n"
+            "    match proc.stdout:\n"
             "        case False if (value := proc.returncode) == 0:\n            pass\n"
             "        case _:\n            assert value == 0\n"
         )
