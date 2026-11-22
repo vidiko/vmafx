@@ -95,7 +95,8 @@ python3 scripts/dev/merge_train_guard.py queue-audit \
   `APPROVED` on `commit.oid == SHA` while none has `CHANGES_REQUESTED`, required checks
   pass, and the squash commit message check passes with unchanged head, title, and body.
   A final read after the squash message check repeats the open-against-`master`, pause,
-  hold, queue eligibility, and maintainer approval checks using the refreshed policy.
+  hold, queue eligibility, maintainer approval, and required check gates using the
+  refreshed policy.
   It prints a JSON receipt (`number`, `head`, `reviewer`, `submitted_at`, `merge_state`,
   `checks`) and exits `0` when eligible, or prints `merge-train: refused: ...` and exits
   `1`.

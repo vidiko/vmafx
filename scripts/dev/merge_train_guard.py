@@ -601,6 +601,7 @@ class Train:
         reviewer_login, submitted_at = self._require_fork_approval(
             number, reviewed_head, fresh_policy.get("fork_reviewers", [])
         )
+        self.require_checks(number)
         return {
             "number": number,
             "head": reviewed_head,

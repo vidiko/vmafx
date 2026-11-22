@@ -940,6 +940,29 @@ class TrainContract(unittest.TestCase):
             ):
                 self.train.admit_fork(1421, self.head)
 
+    def test_admit_fork_rechecks_required_checks_after_squash_message(self) -> None:
+        cases: tuple[tuple[list[dict[str, Any]], str], ...] = (
+            ([{"name": "Required Checks Aggregator", "bucket": "fail"}], "not eligible"),
+            ([{"name": "Required Checks Aggregator", "bucket": "pending"}], "not eligible"),
+            ([], "required checks are absent"),
+        )
+        for checks, reason in cases:
+            self.train.checks = [
+                {"name": "Required Checks Aggregator", "bucket": "pass", "state": "SUCCESS"}
+            ]
+            self.configure_fork_pr(("alice",))
+            self.train.review_items = [self.review_record("alice", "APPROVED", self.head)]
+
+            def check_message(*_args: Any, checks: list[dict[str, Any]] = checks) -> None:
+                self.train.checks = checks
+
+            with (
+                self.subTest(reason=reason, checks=checks),
+                patch.object(self.train, "_check_squash_message", side_effect=check_message),
+                self.assertRaisesRegex(guard.Refused, reason),
+            ):
+                self.train.admit_fork(1421, self.head)
+
     def test_admit_fork_uses_final_policy_and_reviews(self) -> None:
         for reviewers in ((), ("bob",)):
             with self.subTest(reviewers=reviewers):
