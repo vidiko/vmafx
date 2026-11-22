@@ -116,8 +116,9 @@ class ExitCodeOnlyFlowTest(ExitCodeOnlyFixture):
     def test_unchanged_file_functions_are_not_walked(self) -> None:
         self._commit_file(REL_TEST_FILE, "def test_x():\n    a = 1\n    b = 2\n    c = 3\n")
         with mock.patch.object(checker, "MAX_BODY_NODES", 2):
-            rc, _out, err = self._run_checker("--changed-against", "HEAD")
+            rc, out, err = self._run_checker("--changed-against", "HEAD")
         self.assertEqual(rc, 0, err)
+        self.assertIn("0 exit-code-only test findings in changed functions", out)
 
     def test_deferred_assignment_still_records_returncode(self) -> None:
         for line in ("alias = (rc := proc.returncode)", "alias: int = proc.returncode"):
