@@ -481,6 +481,44 @@ class FreezeTests(unittest.TestCase):
         self.check_change(original.replace("[bad]: old prose", "[bad]: new prose"), 1)
         self.check_change(original.replace("[ref]: old.md (Kept)", "[ref]: new.md (Kept)"), 0)
 
+    def test_link_title_escaped_delimiter_is_kept(self) -> None:
+        original = BASE.replace(
+            "Old context.",
+            r'See [source](old.md "Say \"hello\"").',
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(
+            original.replace('(old.md "Say \\"hello\\"")', '(new.md "Say \\"hello\\"")'),
+            0,
+        )
+        self.check_change(
+            original.replace(
+                '(old.md "Say \\"hello\\"")',
+                '(new.md "Say \\"bye\\"")',
+            ),
+            1,
+        )
+
+    def test_reference_title_escaped_delimiter_is_kept(self) -> None:
+        original = BASE.replace(
+            "Old context.",
+            r"[ref]: old.md 'It\'s kept'" + "\n" + r"[par]: old.md (a \) b)",
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("[ref]: old.md", "[ref]: new.md"), 0)
+        self.check_change(original.replace("[par]: old.md", "[par]: new.md"), 0)
+        self.check_change(
+            original.replace(
+                "[ref]: old.md 'It\\'s kept'",
+                "[ref]: new.md 'It\\'s changed'",
+            ),
+            1,
+        )
+
     def test_fenced_indentation_is_content(self) -> None:
         original = BASE.replace(
             "Old context.", "```python\nif ready:\n    start()\ncleanup()\n```\nOld context."

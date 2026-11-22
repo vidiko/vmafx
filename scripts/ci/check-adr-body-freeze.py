@@ -49,7 +49,10 @@ DIRECTIVE = re.compile(
 # the preserved prefix so only the destination token is normalized.
 # After the destination only an optional title and the closing parenthesis (or the
 # line end of a definition) may follow, so link-like prose stays unnormalized.
-LINK_TITLE = r"""(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*"""
+# A title may contain its closing delimiter when backslash-escaped (CommonMark 0.31.2).
+LINK_TITLE = (
+    r"""(?:[ \t]+(?:"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|\((?:[^()\\\n]|\\.)*\)))?[ \t]*"""
+)
 LINK = re.compile(r"(\[[^\]\n]*\]\([ \t]*)(?:<[^>\n]*>|[^\s)\n]*)(" + LINK_TITLE + r"\))")
 REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(" + LINK_TITLE + r")$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
