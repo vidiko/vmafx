@@ -41,6 +41,8 @@ sys.path.insert(
 from scripts.lib.safe_subprocess import run as run_command
 
 REPO = "vidiko/vmafx"
+# Twin of hardwareLanes switchName entries in .github/workflows/required-aggregator.yml.
+HARDWARE_SWITCHES = ("GPU_COVERAGE_ENABLED", "SYCL_ARC_RUNNER_ENABLED")
 RELEASE_PR = 1213
 LANDING_IDENTITY = "lusoris <lusoris@proton.me>"
 KEY_BYTES = 32
@@ -176,15 +178,24 @@ def _queue_nodes(payload: Any) -> list[dict[str, Any]]:
 def _parse_queue_entry(entry: Any) -> tuple[int, bool, str, str]:
     if not isinstance(entry, dict):
         raise Refused("malformed merge queue entry")
+    # GitHub declares headCommit nullable; queue-audit decides from the pull request head.
     head_commit = entry.get("headCommit")
     pr = entry.get("pullRequest")
-    if not isinstance(head_commit, dict) or not isinstance(pr, dict):
+    if not isinstance(pr, dict):
         raise Refused("malformed merge queue entry")
-    queued_oid, pr_head = head_commit.get("oid"), pr.get("headRefOid")
+    if head_commit is None:
+        queued_oid = ""
+    elif not isinstance(head_commit, dict):
+        raise Refused("malformed merge queue entry")
+    else:
+        queued_oid = head_commit.get("oid")
+        if not _is_sha(queued_oid):
+            raise Refused("malformed merge queue entry")
+    pr_head = pr.get("headRefOid")
     number, cross = pr.get("number"), pr.get("isCrossRepository")
     if not (_is_positive_int(number) and isinstance(cross, bool)):
         raise Refused("malformed merge queue entry")
-    if not (_is_sha(queued_oid) and _is_sha(pr_head)):
+    if not _is_sha(pr_head):
         raise Refused("malformed merge queue entry")
     return number, cross, queued_oid, pr_head
 
@@ -287,6 +298,37 @@ class Train:
         if not isinstance(reviews, list) or not all(isinstance(item, dict) for item in reviews):
             raise Refused("GitHub returned incomplete or invalid PR reviews")
         return reviews
+
+    def _actions_variables(self, endpoint: str) -> dict[Any, Any]:
+        """Return name -> value for one complete Actions variable listing."""
+        raw = execute(["gh", "api", f"repos/{REPO}/actions/{endpoint}?per_page=100"], self.root)
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
+        variables = value.get("variables")
+        total_count = value.get("total_count")
+        if not isinstance(variables, list) or not all(isinstance(item, dict) for item in variables):
+            raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
+        if not isinstance(total_count, int) or total_count > len(variables):
+            raise Refused(f"GitHub returned incomplete or invalid {endpoint}")
+        return {item.get("name"): item.get("value") for item in variables}
+
+    def hardware_switches(self) -> set[str]:
+        """Return hardware lane switches that the workflow `vars` context reads as true.
+
+        Organisation variables shared with the repository apply unless a repository
+        variable of the same name overrides them, as in the `vars` context.
+        """
+        by_name = {
+            **self._actions_variables("organization-variables"),
+            **self._actions_variables("variables"),
+        }
+        enabled: set[str] = set()
+        for name in HARDWARE_SWITCHES:
+            switch_value = by_name.get(name)
+            if isinstance(switch_value, str) and switch_value.strip() == "true":
+                enabled.add(name)
+        return enabled
 
     def policy(self) -> dict[str, Any]:
         value = json.loads((self.state / "policy.json").read_text())
@@ -511,11 +553,7 @@ class Train:
             raise Refused(reason)
         return approved
 
-    def admit_fork(self, number: int, reviewed_head: str) -> dict[str, Any]:
-        """Verify read-only fork PR queue-admission gates at the exact reviewed head."""
-        if not _is_sha(reviewed_head):
-            raise Refused("reviewed head must be a 40-character lowercase hex SHA")
-        policy, pr = self._open_master_pr(number)
+    def _require_fork_queue_state(self, pr: dict[str, Any], reviewed_head: str) -> str:
         if pr.get("isDraft") is not False:
             raise Refused("draft PRs cannot be admitted to the merge queue")
         if pr.get("isCrossRepository") is not True:
@@ -529,6 +567,27 @@ class Train:
         merge_state = pr.get("mergeStateStatus")
         if merge_state != "CLEAN":
             raise Refused(f"PR merge state is {merge_state!r}, expected CLEAN")
+        if pr.get("autoMergeRequest") is not None:
+            raise Refused(
+                "fork PR has GitHub auto-merge enabled; "
+                "its owner must disable it before admission"
+            )
+        enabled = self.hardware_switches()
+        if enabled:
+            names = ", ".join(sorted(enabled))
+            raise Refused(
+                f"hardware lane switch enabled ({names}): a fork merge group skips "
+                "hardware probes and the aggregator blocks on the missing context; "
+                "disable the switch or keep the PR out of the queue (ADR-3610)"
+            )
+        return merge_state
+
+    def admit_fork(self, number: int, reviewed_head: str) -> dict[str, Any]:
+        """Verify read-only fork PR queue-admission gates at the exact reviewed head."""
+        if not _is_sha(reviewed_head):
+            raise Refused("reviewed head must be a 40-character lowercase hex SHA")
+        policy, pr = self._open_master_pr(number)
+        merge_state = self._require_fork_queue_state(pr, reviewed_head)
         reviewer_login, submitted_at = self._require_fork_approval(
             number, reviewed_head, policy.get("fork_reviewers", [])
         )
@@ -536,7 +595,7 @@ class Train:
         title = pr.get("title", "")
         body_text = pr.get("body", "") or ""
         self._check_squash_message(number, title, body_text)
-        fresh = self.pr(number)
+        _, fresh = self._open_master_pr(number)
         if fresh.get("headRefOid") != reviewed_head:
             raise Refused("PR head changed during squash message check")
         _require_unchanged_text(fresh, title, body_text)
