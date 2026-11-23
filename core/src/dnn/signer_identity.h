@@ -54,8 +54,9 @@ extern "C" {
  * Check the signing certificate of the Sigstore bundle in @p bundle
  * (@p len bytes, JSON). Returns 0 when the bundle holds exactly one
  * certificate, its subject alternative name is allowed and its owner ID is
- * VMAF_DNN_SIGNER_OWNER_ID; -EBADMSG when the bundle or the certificate cannot
- * be read; -EPERM when the certificate names another identity or owner.
+ * VMAF_DNN_SIGNER_OWNER_ID; -EBADMSG when the bundle does not match the
+ * Sigstore bundle v0.3 schema, nested values included, or the certificate
+ * cannot be read; -EPERM when the certificate names another identity or owner.
  * Does not verify any signature: cosign does.
  */
 int vmaf_dnn_signer_check_bundle(const char *bundle, size_t len);

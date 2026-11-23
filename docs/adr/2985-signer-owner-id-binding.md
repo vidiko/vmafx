@@ -44,9 +44,16 @@ path (`vmaf_fullpath_utf8()`) that resolves outside the registry directory
   `verificationMaterial`, and at most one of `messageSignature` or
   `dsseEnvelope`), `verificationMaterial` keys belong to its allow-list
   (`certificate`, `tlogEntries`, `timestampVerificationData`), and
-  `verificationMaterial.certificate` holds only `rawBytes` (any unknown key,
-  case-variant key, duplicate key at any checked level, or `\u` escape is
-  rejected);
+  `verificationMaterial.certificate` holds only `rawBytes`, and every value
+  nested under `messageSignature`, `dsseEnvelope`, `tlogEntries` and
+  `timestampVerificationData` matches the v0.3 schema: its keys, its value
+  kinds, padded standard base64 for bytes fields, `int64` fields as a JSON
+  number or decimal string of at most 18 digits without a leading zero,
+  `HashAlgorithm` names, and well-formed UTF-8 in strings. Any unknown key,
+  case-variant key, duplicate key, `\u` escape or other value is rejected
+  (`-EBADMSG`). The walk keeps an explicit stack of at most three objects
+  (`SIGNER_MAX_SCHEMA_DEPTH`) and takes at most 4096 steps per value
+  (`SIGNER_MAX_SCHEMA_STEPS`), without recursion;
 - `mediaType` equals `application/vnd.dev.sigstore.bundle.v0.3+json` or
   `application/vnd.dev.sigstore.bundle+json;version=0.3` in full;
 - the leaf certificate at `verificationMaterial.certificate.rawBytes` is a DER
@@ -91,6 +98,8 @@ Other cosign recipes still rely on the workflow identity alone.
 | Trust the old name only for signatures logged before the rename (Rekor time) | No certificate parsing | Needs the rename date in the binary; new signatures under the new name still need a check; time handling in the verifier | More moving parts than an ID that never changes |
 | Verify with `gh attestation verify` from libvmaf | gh reports the owner ID | Models are signed with `cosign sign-blob`, not attested; adds a second external tool | Wrong artefact type and a new dependency |
 | Let cosign read the bundle file itself | No temporary file | The bundle can change between libvmaf's read and cosign's | The owner check must apply to the bytes cosign verifies |
+| Skip nested values, as before | Less code | A malformed or unknown field under a checked key reached cosign unread | Every nested field stayed unchecked |
+| Validate with the vendored parser `core/src/pdjson.c` | Existing code | Decodes `\u` escapes and allocates on the heap; still needs the schema tables | The check must refuse what a ProtoJSON decoder reads differently |
 
 ## Consequences
 

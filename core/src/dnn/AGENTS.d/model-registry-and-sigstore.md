@@ -56,7 +56,9 @@ invariant: Model registry entries must validate against schema and verify Sigsto
   `messageSignature` or `dsseEnvelope`; `verificationMaterial` keys
   `certificate`, `tlogEntries`, `timestampVerificationData`; leaf at
   `verificationMaterial.certificate.rawBytes` only; no unknown, duplicate
-  or case-variant keys, no `\u` escape), full X.509 outer sequence
+  or case-variant keys, no `\u` escape; nested values of `messageSignature`,
+  `dsseEnvelope`, `tlogEntries`, `timestampVerificationData` checked against
+  the `k_schema` tables), full X.509 outer sequence
   (`TBSCertificate`, `signatureAlgorithm`, `signatureValue`), subject
   alternative name `supply-chain.yml` on `refs/tags/v<digit>...` or
   `refs/heads/master`, and Fulcio extension `.1.17` =

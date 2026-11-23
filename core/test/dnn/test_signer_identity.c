@@ -517,6 +517,182 @@ static char *test_bundle_full_shape_accepted(void)
     return NULL;
 }
 
+/* Nested values of a v0.3 bundle: each is checked against the bundle schema
+ * (key set, value kinds, base64, int64, UTF-8), not skipped. */
+#define T_DIGEST "\"messageDigest\":{\"algorithm\":\"SHA2_256\",\"digest\":\"AA==\"}"
+#define T_MSG "\"messageSignature\":{"
+#define T_MSG_DIGEST T_MSG T_DIGEST
+#define T_DSSE_HEAD "\"dsseEnvelope\":{\"payload\":\"AA==\",\"payloadType\":\""
+#define T_DSSE_TAIL "\",\"signatures\":[{\"sig\":\"AA==\",\"keyid\":\"\"}]}"
+#define T_TLOG "\"tlogEntries\":["
+#define T_PROOF "\"tlogEntries\":[{\"inclusionProof\":{"
+#define T_TSV "\"timestampVerificationData\":{\"rfc3161Timestamps\":"
+
+/* One schema case: @p fields spliced into a bundle must give @p expected. */
+struct schema_case {
+    char *name;
+    const char *fields;
+    int expected;
+};
+
+#define SCHEMA_CASES(cases) (cases), (sizeof(cases) / sizeof((cases)[0]))
+
+/* k_bundle_full_shape with its messageSignature replaced by @p content. */
+static int content_status_with_buffer(const char *content, char *doc)
+{
+    const char *cut = strstr(k_bundle_full_shape, ",\"messageSignature\"");
+    if (!cut)
+        return -ENOENT;
+    // SAFETY: cut points into k_bundle_full_shape, so the difference is its
+    // offset there.
+    const int keep = (int)(cut - k_bundle_full_shape);
+    const int n = snprintf(doc, TEST_MAX_BUNDLE, "%.*s,%s}", keep, k_bundle_full_shape, content);
+    if (n < 0 || (size_t)n >= TEST_MAX_BUNDLE)
+        return -ENOSPC;
+    return bundle_status(doc);
+}
+
+static int content_status(const char *content)
+{
+    char *doc = calloc(TEST_MAX_BUNDLE, 1u);
+    if (!doc)
+        return -ENOMEM;
+    const int result = content_status_with_buffer(content, doc);
+    free(doc);
+    return result;
+}
+
+/* k_bundle_tag with @p fields added to its verificationMaterial. */
+static int material_status_with_buffer(const char *fields, char *doc)
+{
+    /* k_bundle_tag ends in "}}}": keep the certificate's brace, drop the other
+   * two. */
+    const int keep = (int)(sizeof(k_bundle_tag) - 3u);
+    const int n = snprintf(doc, TEST_MAX_BUNDLE, "%.*s,%s}}", keep, k_bundle_tag, fields);
+    if (n < 0 || (size_t)n >= TEST_MAX_BUNDLE)
+        return -ENOSPC;
+    return bundle_status(doc);
+}
+
+static int material_status(const char *fields)
+{
+    char *doc = calloc(TEST_MAX_BUNDLE, 1u);
+    if (!doc)
+        return -ENOMEM;
+    const int result = material_status_with_buffer(fields, doc);
+    free(doc);
+    return result;
+}
+
+/* Run every case through @p status; the first mismatch returns its name. */
+static char *run_schema_cases(int (*status)(const char *), const struct schema_case *cases,
+                              size_t n)
+{
+    for (size_t i = 0u; i < n; i++)
+        mu_assert(cases[i].name, status(cases[i].fields) == cases[i].expected);
+    return NULL;
+}
+
+static const struct schema_case k_message_signature_cases[] = {
+    {"number", "\"messageSignature\":123", -EBADMSG},
+    {"empty object", "\"messageSignature\":{}", -EBADMSG},
+    {"unknown key", T_MSG "\"foo\":\"AA==\"}", -EBADMSG},
+    {"duplicate digest", T_MSG_DIGEST "," T_DIGEST "}", -EBADMSG},
+    {"signature alphabet", T_MSG_DIGEST ",\"signature\":\"!!!!\"}", -EBADMSG},
+    {"signature length", T_MSG_DIGEST ",\"signature\":\"AAA\"}", -EBADMSG},
+    {"hash name", T_MSG "\"messageDigest\":{\"algorithm\":\"MD5\",\"digest\":\"AA==\"}}", -EBADMSG},
+    {"digest object", T_MSG "\"messageDigest\":{\"algorithm\":\"SHA2_256\",\"digest\":{}}}",
+     -EBADMSG},
+    {"SHA2_384",
+     T_MSG "\"signature\":\"AA==\",\"messageDigest\":{\"algorithm\":\"SHA2_"
+           "384\",\"digest\":\"AA==\"}}",
+     0},
+};
+
+static const struct schema_case k_dsse_envelope_cases[] = {
+    {"dsse", T_DSSE_HEAD "application/vnd.in-toto+json" T_DSSE_TAIL, 0},
+    {"signatures object",
+     "\"dsseEnvelope\":{\"payloadType\":\"x\",\"signatures\":{\"sig\":\"AA==\"}"
+     "}",
+     -EBADMSG},
+    {"empty signature", "\"dsseEnvelope\":{\"payloadType\":\"x\",\"signatures\":[{}]}", -EBADMSG},
+    {"no signatures", "\"dsseEnvelope\":{\"payloadType\":\"x\",\"signatures\":[]}", 0},
+    {"u escape", T_DSSE_HEAD "\\u0041" T_DSSE_TAIL, -EBADMSG},
+    {"overlong", T_DSSE_HEAD "\xC0\xAF" T_DSSE_TAIL, -EBADMSG},
+    {"overlong three", T_DSSE_HEAD "\xE0\x80\xAF" T_DSSE_TAIL, -EBADMSG},
+    {"above U+10FFFF", T_DSSE_HEAD "\xF4\x90\x80\x80" T_DSSE_TAIL, -EBADMSG},
+    {"surrogate", T_DSSE_HEAD "\xED\xA0\x80" T_DSSE_TAIL, -EBADMSG},
+    {"truncated", T_DSSE_HEAD "\xE2\x80" T_DSSE_TAIL, -EBADMSG},
+    {"control byte", T_DSSE_HEAD "\x01" T_DSSE_TAIL, -EBADMSG},
+    {"em dash", T_DSSE_HEAD "\xE2\x80\x94" T_DSSE_TAIL, 0},
+    {"four bytes", T_DSSE_HEAD "\xF0\x9F\x98\x80" T_DSSE_TAIL, 0},
+    {"escapes", T_DSSE_HEAD "a\\nb\\/c" T_DSSE_TAIL, 0},
+    {"both contents", T_MSG_DIGEST ",\"signature\":\"AA==\"}," T_DSSE_HEAD "x" T_DSSE_TAIL,
+     -EBADMSG},
+};
+
+static const struct schema_case k_tlog_entries_cases[] = {
+    {"object", "\"tlogEntries\":{\"logIndex\":\"1\"}", -EBADMSG},
+    {"empty", "\"tlogEntries\":[]", 0},
+    {"empty entry", T_TLOG "{}]", -EBADMSG},
+    {"number", T_TLOG "{\"logIndex\":1}]", 0},
+    {"leading zero", T_TLOG "{\"logIndex\":\"01\"}]", -EBADMSG},
+    {"19 digits", T_TLOG "{\"logIndex\":\"1234567890123456789\"}]", -EBADMSG},
+    {"18 digits", T_TLOG "{\"logIndex\":\"123456789012345678\"}]", 0},
+    {"fraction", T_TLOG "{\"logIndex\":1.5}]", -EBADMSG},
+    {"space in string", T_TLOG "{\"logIndex\":\"1 \"}]", -EBADMSG},
+    {"trailing comma", T_TLOG "{\"logIndex\":\"1\"},]", -EBADMSG},
+    {"brace closes array", T_TLOG "{\"logIndex\":\"1\"}}", -EBADMSG},
+    {"missing comma", T_TLOG "{\"logIndex\":\"1\"}{\"logIndex\":\"2\"}]", -EBADMSG},
+    {"two entries", T_TLOG "{\"logIndex\":\"1\"},{\"logIndex\":\"2\"}]", 0},
+    {"duplicate key", T_TLOG "{\"logIndex\":\"1\",\"logIndex\":\"2\"}]", -EBADMSG},
+};
+
+static const struct schema_case k_inclusion_proof_cases[] = {
+    {"short hash", T_PROOF "\"hashes\":[\"AA==\",\"AA\"]}}]", -EBADMSG},
+    {"no hashes", T_PROOF "\"hashes\":[]}}]", 0},
+    {"two hashes", T_PROOF "\"hashes\":[\"AA==\",\"AA==\"]}}]", 0},
+    {"hash comma", T_PROOF "\"hashes\":[\"AA==\",]}}]", -EBADMSG},
+    {"checkpoint utf8", T_PROOF "\"checkpoint\":{\"envelope\":\"\xC0\xAF\"}}}]", -EBADMSG},
+    {"checkpoint lines", T_PROOF "\"checkpoint\":{\"envelope\":\"a\\nb\"}}}]", 0},
+    {"key id object", T_TLOG "{\"logId\":{\"keyId\":{}}}]", -EBADMSG},
+    {"kind version key", T_TLOG "{\"kindVersion\":{\"kind\":\"x\",\"extra\":\"y\"}}]", -EBADMSG},
+    {"unclosed", T_PROOF "\"hashes\":[\"AA==\"]", -EBADMSG},
+};
+
+static const struct schema_case k_timestamp_data_cases[] = {
+    {"timestamp", T_TSV "[{\"signedTimestamp\":\"AA==\"}]}", 0},
+    {"extra key", T_TSV "[],\"x\":1}", -EBADMSG},
+    {"string", T_TSV "\"AA==\"}", -EBADMSG},
+    {"padding", T_TSV "[{\"signedTimestamp\":\"A===\"}]}", -EBADMSG},
+    {"with tlog", T_TLOG "{\"logIndex\":\"1\"}]," T_TSV "[]}", 0},
+};
+
+static char *test_bundle_message_signature_schema(void)
+{
+    return run_schema_cases(content_status, SCHEMA_CASES(k_message_signature_cases));
+}
+
+static char *test_bundle_dsse_envelope_schema(void)
+{
+    return run_schema_cases(content_status, SCHEMA_CASES(k_dsse_envelope_cases));
+}
+
+static char *test_bundle_tlog_entries_schema(void)
+{
+    return run_schema_cases(material_status, SCHEMA_CASES(k_tlog_entries_cases));
+}
+
+static char *test_bundle_inclusion_proof_schema(void)
+{
+    return run_schema_cases(material_status, SCHEMA_CASES(k_inclusion_proof_cases));
+}
+
+static char *test_bundle_timestamp_data_schema(void)
+{
+    return run_schema_cases(material_status, SCHEMA_CASES(k_timestamp_data_cases));
+}
+
 static char *test_certificate_rejects_duplicate_owner(void)
 {
     mu_assert("duplicate_owner", bundle_status(k_bundle_duplicate_owner) != 0);
@@ -812,6 +988,11 @@ static const MuTest tests[] = {
     MU_TEST(test_bundle_requires_top_level_media_type),
     MU_TEST(test_bundle_requires_one_media_type),
     MU_TEST(test_bundle_full_shape_accepted),
+    MU_TEST(test_bundle_message_signature_schema),
+    MU_TEST(test_bundle_dsse_envelope_schema),
+    MU_TEST(test_bundle_tlog_entries_schema),
+    MU_TEST(test_bundle_inclusion_proof_schema),
+    MU_TEST(test_bundle_timestamp_data_schema),
     MU_TEST(test_bundle_rejects_case_variant_key),
     MU_TEST(test_bundle_rejects_duplicate_key),
     MU_TEST(test_bundle_rejects_top_level_certificate_without_material),
