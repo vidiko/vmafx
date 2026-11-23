@@ -1776,11 +1776,31 @@ an ONNX Go binding.
 
 An earlier revision of the roadmap listed `pkg/conformal` as merged under
 Stage 3. It was not: no such package existed on `master`. The package landed
-with Stage 6, and the roadmap row was corrected. The `pkg/tune/{predictor,codec,
-pyjson}` aliases were first kept for the in-flight sidecar parity fix
-([#1187](https://github.com/vidiko/vmafx/pull/1187)); once that fix landed the
-sidecar moved to `pkg/predictor`, `pkg/codecadapter` and `pkg/pyjson`, and the
-aliases were deleted.
+with Stage 6, and the roadmap row was corrected.
+
+### Migrating from the transitional Go aliases
+
+The transitional alias packages (ADR-1137) stayed in place until the sidecar
+parity fix landed in [#1187](https://github.com/vidiko/vmafx/pull/1187). Import `pkg/predictor`, `pkg/codecadapter` and
+`pkg/pyjson` directly and update these calls.
+
+- Replace the old two-argument `New(path, log)` with
+  `predictor.NewWithModel(ctx, path, log)`. Pass a context that lives as long as
+  the predictor is in use. Pass `slog.Default()` where you previously passed
+  `nil`.
+- Replace the package-level `PickCRF(p, features, target, codec)` with
+  `p.PickCRF(features, target, codec)`.
+- Replace `Marshal(v, indent)` with
+  `pyjson.Marshal(v, pyjson.Options{SortKeys: true, Indent: strings.Repeat(" ", indent)})`
+  for positive indents. The old indent helper used `indent` spaces per nesting
+  level for positive values and selected compact output for `indent <= 0`.
+  Pass `Indent: ""` for zero and negative values. The new function returns
+  `([]byte, error)`. Use `string(out)` if you need the previous string result.
+- Replace `MustMarshal(v, indent)` with a call to `pyjson.Marshal` and handle
+  the returned error.
+- The names `predictor.ResolutionClass`, `pyjson.MarshalStrict`,
+  `pyjson.FormatFloat`, `pyjson.EncodeString`, `codecadapter.Get`,
+  `codecadapter.Known` and `codecadapter.Adapter` stay the same.
 
 ## See also
 

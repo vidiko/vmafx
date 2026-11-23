@@ -45,7 +45,7 @@ func TestNewWithModelEmptyPathIsAnalytical(t *testing.T) {
 // TestNewWithModelMissingModelIsAnError pins the Python constructor's
 // FileNotFoundError: a --model that resolves to nothing fails the command
 // instead of silently running the analytical curve under a model's name.
-// (Carried over from the deleted pkg/tune/predictor's TestNewWithMissingModel.)
+// Carried over from TestNewWithMissingModel in the tuning predictor.
 func TestNewWithModelMissingModelIsAnError(t *testing.T) {
 	t.Parallel()
 	missing := filepath.Join(t.TempDir(), "predictor_libx264.onnx")

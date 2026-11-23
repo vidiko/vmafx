@@ -7,8 +7,8 @@
 // testdata/python_predictor.json was dumped from the Python module: ~1700
 // (features, codec, CRF) triples with the predicted VMAF as raw IEEE-754
 // bits, the PickCRF inversion across every registered codec, and the
-// resolution-class table. It came across from the pkg/tune/predictor port
-// when that duplicate was folded into this package (ADR-1137).
+// resolution-class table. The fixture moved here when ADR-1137 consolidated
+// the two Go predictors.
 
 package predictor
 
@@ -250,8 +250,8 @@ func TestPredictVMAFBitrateFloor(t *testing.T) {
 // its fallback, which is Python's `coefficients.get(codec,
 // _DEFAULT_COEFFS["libx264"])`: a codec absent from a caller-supplied table
 // lands on the shipped libx264 curve, not on that codec's own default. The
-// pkg/tune/predictor implementation deleted in ADR-1137 had invented a
-// per-codec fallback here; this pins the Python one.
+// tuning predictor used a per-codec fallback before ADR-1137 consolidated
+// the Go predictors. This test pins the Python fallback.
 func TestCustomCoefficientsOverrideDefaults(t *testing.T) {
 	t.Parallel()
 

@@ -6,6 +6,10 @@ Go port of vmaf-tune rate-quality tuning CLI. Installed as `vmafx-tune-go`
 during migration; see Stage roadmap in
 [ADR-0705](../../docs/adr/0705-vmafx-tune-go-stage1.md).
 
+See the [transitional Go alias removal
+notice](../../changelog.d/removed/1249-tune-alias-packages.md) for migration
+steps.
+
 ## Rebase-sensitive invariants
 
 1. **JSON schema compatibility** (`pkg/report/report.go`): JSON output of

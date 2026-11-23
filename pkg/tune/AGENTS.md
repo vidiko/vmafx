@@ -18,9 +18,13 @@ Shared layers live **outside** `pkg/tune/` (ADR-1137): `pkg/predictor`
 `pkg/hdr` (`vmaftune/hdr.py`), `pkg/ffencode` (`vmaftune/encode.py`),
 `pkg/pyjson` (CPython `json.dumps` and `vmaftune/jsonio.py`), `pkg/pymath`
 (CPython `2.0 ** x`, `math.log10` on libm). `pkg/tune/{hdr,pymath}` shadows
-deleted (moved to `pkg/hdr` / `pkg/pymath`). `pkg/tune/{predictor,codec,pyjson}`
-aliases deleted after #1187; `sidecar/` and `cmd/vmafx-tune/cmd/sidecar.go`
-import canonical packages. Never add aliases; never re-grow shadows on rebase.
+deleted (moved to `pkg/hdr` / `pkg/pymath`). `sidecar/` and
+`cmd/vmafx-tune/cmd/sidecar.go` import canonical packages.
+Never add aliases; never re-grow shadows on rebase.
+
+See the [transitional Go alias removal
+notice](../../changelog.d/removed/1249-tune-alias-packages.md) for migration
+steps.
 
 ## Rebase-sensitive invariants
 

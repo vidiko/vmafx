@@ -8,11 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/golusoris/golusoris/core/clikit"
 	"github.com/spf13/cobra"
@@ -124,17 +124,13 @@ func addSidecarCommonFlags(cmd *cobra.Command, flags *sidecarCommonFlags) {
 	useUsageExitCode(cmd)
 }
 
-// sidecarModelLoadTimeout is the upper bound on resolving and opening --model.
-const sidecarModelLoadTimeout = 30 * time.Second
-
 // buildSidecarPredictor constructs the configured sidecar for a CLI handler.
 //
 // Exit-status mapping mirrors _run_sidecar in the Python CLI: argparse rejects
 // an unknown --codec and Predictor() raises on an unresolvable --model, both
 // exit 2, so those errors carry the usage status. A cache-directory I/O
 // failure while creating the host UUID is an uncaught OSError in Python — a
-// plain exit 1 — so ForCodec's error is returned untagged. Model load is
-// bounded by sidecarModelLoadTimeout.
+// plain exit 1 — so ForCodec's error is returned untagged.
 func buildSidecarPredictor(
 	ctx context.Context, flags *sidecarCommonFlags, d deps,
 ) (*sidecar.Predictor, error) {
@@ -145,9 +141,7 @@ func buildSidecarPredictor(
 	if log == nil {
 		log = slog.Default()
 	}
-	loadCtx, cancel := context.WithTimeout(ctx, sidecarModelLoadTimeout)
-	defer cancel()
-	base, err := predictor.NewWithModel(loadCtx, flags.model, log)
+	base, err := predictor.NewWithModel(ctx, flags.model, log)
 	if err != nil {
 		return nil, asUsageError(err)
 	}
@@ -379,37 +373,28 @@ func runSidecarBatchRecord(ctx context.Context, d deps, flags *sidecarBatchFlags
 	if err := flags.requireFlags("captures-jsonl"); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sp, err := buildSidecarPredictor(ctx, &flags.sidecarCommonFlags, d)
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(flags.capturesJSONL) // #nosec G304 -- operator-supplied CLI flag
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	if err != nil {
 		// Python: `except OSError` around the read → exit 2.
 		return asUsageError(fmt.Errorf("cannot read input: %w", err))
 	}
 
-	rows, skipped := 0, 0
-	for index, raw := range splitLinesUniversal(string(data)) {
-		lineNo := index + 1
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		features, crf, observed, err := parseCaptureRow(line)
-		if err != nil {
-			skipped++
-			fmt.Fprintf(os.Stderr,
-				"vmafx-tune sidecar batch-record: skip line %d: %v\n", lineNo, err)
-			continue
-		}
-		if err := sp.RecordCapture(features, crf, observed, flags.codec, false); err != nil {
-			skipped++
-			fmt.Fprintf(os.Stderr,
-				"vmafx-tune sidecar batch-record: skip line %d: %v\n", lineNo, err)
-			continue
-		}
-		rows++
+	rows, skipped, err := recordSidecarBatchRows(ctx, sp, splitLinesUniversal(string(data)), os.Stderr)
+	if err != nil {
+		return err
 	}
 	if rows > 0 {
 		// Python: sp.save() outside the try block → an uncaught OSError, exit 1.
@@ -417,16 +402,53 @@ func runSidecarBatchRecord(ctx context.Context, d deps, flags *sidecarBatchFlags
 			return err
 		}
 	}
+	return emitSidecarBatchResult(ctx, sp, rows, skipped, flags.jsonOut)
+}
 
+func recordSidecarBatchRows(
+	ctx context.Context, sp *sidecar.Predictor, lines []string, stderr io.Writer,
+) (int, int, error) {
+	rows, skipped := 0, 0
+	for index, raw := range lines {
+		if err := ctx.Err(); err != nil {
+			return rows, skipped, err
+		}
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		features, crf, observed, err := parseCaptureRow(line)
+		if err == nil {
+			err = sp.RecordCapture(features, crf, observed, sp.Codec, false)
+		}
+		if err != nil {
+			skipped++
+			if _, writeErr := fmt.Fprintf(stderr,
+				"vmafx-tune sidecar batch-record: skip line %d: %v\n", index+1, err); writeErr != nil {
+				return rows, skipped, fmt.Errorf("write sidecar batch diagnostic for line %d: %w", index+1, writeErr)
+			}
+			continue
+		}
+		rows++
+	}
+	return rows, skipped, ctx.Err()
+}
+
+func emitSidecarBatchResult(
+	ctx context.Context, sp *sidecar.Predictor, rows, skipped int, asJSON bool,
+) error {
 	payload := sidecarStatusPayload(sp)
 	payload["schema"] = "vmaf-tune-sidecar-batch-record/v1"
 	payload["rows_recorded"] = rows
 	payload["rows_skipped"] = skipped
 
-	if flags.jsonOut {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if asJSON {
 		return emitJSONPayload(payload)
 	}
-	_, err = fmt.Printf("recorded=%d skipped=%d updates=%d state=%s\n",
+	_, err := fmt.Printf("recorded=%d skipped=%d updates=%d state=%s\n",
 		payload["rows_recorded"], payload["rows_skipped"],
 		payload["n_updates"], payload["state_path"])
 	return err

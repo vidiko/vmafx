@@ -16,9 +16,9 @@ import (
 //
 // Go implements Log10 as Log2*Ln2/Ln10 and lands one ULP off CPython on roughly
 // 27% of realistic probe bitrates. predicted_vmaf is a user-discoverable JSON
-// field, and before ADR-1137 folded the two predictors the pkg/tune/predictor
-// copy already made this distinction, so `predict` and `auto` disagreed on
-// the same input.
+// field. Before ADR-1137 consolidated the two predictors, the tuning predictor
+// already made this distinction, so `predict` and `auto` disagreed on the same
+// input.
 func TestAnalyticalCurveUsesPythonLog10(t *testing.T) {
 	t.Parallel()
 

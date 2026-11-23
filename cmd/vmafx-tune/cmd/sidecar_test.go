@@ -7,16 +7,22 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/VMAFx/vmafx/internal/execstub"
 	"github.com/VMAFx/vmafx/pkg/predictor"
+	"github.com/VMAFx/vmafx/pkg/tune/sidecar"
 )
 
 const featuresJSON = `{
@@ -42,6 +48,37 @@ func writeFixture(t *testing.T, dir, name, content string) string {
 		t.Fatalf("write %s: %v", name, err)
 	}
 	return path
+}
+
+func TestBuildSidecarPredictorKeepsCommandContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake ONNX runner is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	t.Setenv("VMAFX_MODEL_DIR", dir)
+	t.Setenv("PATH", dir)
+	writeFixture(t, dir, "custom.onnx", "")
+	execstub.Write(t, filepath.Join(dir, "vmafx-ort-runner"), []byte("#!/bin/sh\necho '[81.5]'\n"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sp, err := buildSidecarPredictor(ctx, &sidecarCommonFlags{
+		codec: "libx264", model: "custom", cacheDir: t.TempDir(),
+	}, deps{})
+	if err != nil {
+		t.Fatalf("build predictor: %v", err)
+	}
+	session, ok := sp.Base.Session.(*predictor.ORTSession)
+	if !ok {
+		t.Fatalf("session = %T, want *predictor.ORTSession", sp.Base.Session)
+	}
+	if got, err := session.Infer([]float64{1}); err != nil || got != 81.5 {
+		t.Errorf("inference after setup = (%v, %v), want (81.5, nil)", got, err)
+	}
+	cancel()
+	if _, err := session.Infer([]float64{1}); !errors.Is(err, context.Canceled) {
+		t.Errorf("inference after command cancellation = %v, want context.Canceled", err)
+	}
 }
 
 // TestSidecarSubcommandTree pins the nested command names against the Python
@@ -307,6 +344,56 @@ func TestSidecarBatchRecordAllRowsBad(t *testing.T) {
 	statePath, _ := payload["state_path"].(string)
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Errorf("no good rows means nothing to persist; %s should not exist", statePath)
+	}
+}
+
+func TestSidecarBatchRecordReportsDiagnosticWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	captures := writeFixture(t, dir, "captures.jsonl", "not json\n")
+	stderr, err := os.Open(captures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStderr := os.Stderr
+	os.Stderr = stderr
+	t.Cleanup(func() { os.Stderr = originalStderr })
+
+	root := newRoot("dev")
+	root.Cobra().SetArgs([]string{
+		"sidecar", "batch-record", "--cache-dir", dir, "--captures-jsonl", captures,
+	})
+	root.Cobra().SetErr(io.Discard)
+	if err := root.Execute(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("batch-record = %v, want closed stderr error", err)
+	}
+}
+
+type cancelAfterSidecarDiagnostic struct {
+	cancel context.CancelFunc
+}
+
+func (w cancelAfterSidecarDiagnostic) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
+}
+
+func TestSidecarBatchRecordStopsBetweenRows(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sp := &sidecar.Predictor{
+		Base: predictor.New(), Model: sidecar.NewModel(sidecar.Config{}), Codec: "libx264",
+	}
+	goodRow := `{"crf": 24, "observed_vmaf": 94.25, "features": ` +
+		strings.ReplaceAll(featuresJSON, "\n", "") + "}"
+	rows, skipped, err := recordSidecarBatchRows(ctx, sp, []string{"not json", goodRow},
+		cancelAfterSidecarDiagnostic{cancel: cancel})
+	if !errors.Is(err, context.Canceled) || rows != 0 || skipped != 1 || sp.Model.NUpdates != 0 {
+		t.Errorf("batch recorded %d, skipped %d, updated %d, err %v, want 0, 1, 0, context.Canceled",
+			rows, skipped, sp.Model.NUpdates, err)
 	}
 }
 
