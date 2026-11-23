@@ -122,9 +122,11 @@ issuer. It does not check the signer's GitHub owner ID: the identity
 pattern matches the repository path, which a new account under the same
 name would also produce ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
 The second command reads the owner ID from the bundle's signing
-certificate.
+certificate. Run the commands in steps 5 and 6 from the download
+directory of step 4.
 
 ```bash
+cd ~/Downloads/u2netp-mirror
 cosign verify-blob \
   --bundle u2netp_mirror_v1.onnx.bundle \
   --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
