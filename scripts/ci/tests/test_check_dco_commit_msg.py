@@ -389,12 +389,19 @@ class CommitMessageTest(unittest.TestCase):
 
     def test_auto_unedited_signoff_matches_range_check(self) -> None:
         self.git("config", "core.commentChar", "auto")
-        signoff_body = "Signed-off-by: Ada <ada@example.org>\n; ordinary text"
-        args = ["-q", "-m", "feat: sample", "-m", signoff_body]
-        hook_rc, range_rc, stored = self.commit_both_ways(args, self.env)
-        self.assertEqual(hook_rc == 0, range_rc == 0, stored)
-        self.assertEqual(hook_rc, 0, stored)
-        self.assertEqual(range_rc, 0, stored)
+        signoff = "Signed-off-by: Ada <ada@example.org>"
+        # Same paragraph: the sign-off trailer parses. Own last paragraph: Git keeps the
+        # "; ordinary text" line under -m, so no trailer parses and both checks refuse.
+        cases = (
+            ("same paragraph", ["-m", f"{signoff}\n; ordinary text"], 0),
+            ("own paragraph", ["-m", signoff, "-m", "; ordinary text"], 1),
+        )
+        for name, tail, expected in cases:
+            with self.subTest(case=name):
+                args = ["-q", "-m", "feat: sample", *tail]
+                hook_rc, range_rc, stored = self.commit_both_ways(args, self.env)
+                self.assertIn("; ordinary text", stored)
+                self.assertEqual((hook_rc, range_rc), (expected, expected), stored)
 
     def test_auto_editor_scissors_candidate_is_text(self) -> None:
         self.git("config", "core.commentChar", "auto")
