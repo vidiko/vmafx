@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# Copyright 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+"""Regression tests for heavy CI link target selection."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import runpy
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from scripts.lib.safe_subprocess import TextCommandResult, run
+
+ROOT = Path(__file__).resolve().parents[3]
+SCRIPT = ROOT / "scripts/ci/heavy_link_targets.py"
+MODULE = runpy.run_path(str(SCRIPT))
+PROFILES = MODULE["PROFILES"]
+select_targets = MODULE["select_targets"]
+equivalent_rows = MODULE["equivalent_rows"]
+option_map_from_tokens = MODULE["option_map_from_tokens"]
+
+
+class HeavyLinkTargetsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.build = Path(tempfile.mkdtemp())
+
+    def sample_fixtures(self) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        targets = [
+            {
+                "id": "vmaf@exe",
+                "name": "vmaf",
+                "type": "executable",
+                "filename": str(self.build / "tools/vmaf"),
+                "build_by_default": True,
+            },
+            {
+                "id": "dnn_test@exe",
+                "name": "dnn_test",
+                "type": "executable",
+                "filename": str(self.build / "test/dnn_test"),
+                "build_by_default": True,
+            },
+            {
+                "id": "other@exe",
+                "name": "other",
+                "type": "executable",
+                "filename": str(self.build / "test/other"),
+                "build_by_default": True,
+            },
+            {
+                "id": "optout@exe",
+                "name": "optout",
+                "type": "executable",
+                "filename": str(self.build / "test/optout"),
+                "build_by_default": False,
+            },
+            {
+                "id": "libvmaf@sha",
+                "name": "libvmaf",
+                "type": "shared library",
+                "filename": str(self.build / "src/libvmaf.so.1"),
+                "build_by_default": True,
+            },
+        ]
+        tests = [
+            {
+                "name": "dnn_case",
+                "suite": ["dnn"],
+                "cmd": [],
+                "depends": ["dnn_test@exe"],
+            },
+            {
+                "name": "other_case",
+                "suite": ["fast"],
+                "cmd": [],
+                "depends": ["other@exe"],
+            },
+        ]
+        return targets, tests
+
+    def test_dnn_twin_active_skips_unconsumed_tests(self) -> None:
+        targets, tests = self.sample_fixtures()
+        paths, summary = select_targets(
+            "dnn",
+            targets,
+            tests,
+            ["obj/a.o", "obj/b.o"],
+            tier_full=False,
+            c_core=True,
+            build_dir=self.build,
+        )
+        self.assertIn("tools/vmaf", paths)
+        self.assertIn("test/dnn_test", paths)
+        self.assertNotIn("test/other", paths)
+        self.assertEqual(summary["twin"], "Ubuntu gcc+DNN,Ubuntu clang+DNN")
+        self.assertEqual((summary["tests_linked"], summary["tests_left"]), (1, 1))
+
+    def test_netflix_twin_active_when_tier_full(self) -> None:
+        targets, tests = self.sample_fixtures()
+        paths, _ = select_targets(
+            "netflix-golden",
+            targets,
+            tests,
+            ["obj/a.o"],
+            tier_full=True,
+            c_core=True,
+            build_dir=self.build,
+        )
+        self.assertNotIn("test/other", paths)
+        self.assertNotIn("test/dnn_test", paths)
+
+    def test_netflix_tier_full_false_keeps_tests(self) -> None:
+        targets, tests = self.sample_fixtures()
+        paths, _ = select_targets(
+            "netflix-golden",
+            targets,
+            tests,
+            ["obj/a.o"],
+            tier_full=False,
+            c_core=True,
+            build_dir=self.build,
+        )
+        self.assertIn("test/other", paths)
+
+    def test_dnn_c_core_false_keeps_all_tests(self) -> None:
+        targets, tests = self.sample_fixtures()
+        paths, summary = select_targets(
+            "dnn",
+            targets,
+            tests,
+            ["obj/a.o"],
+            tier_full=False,
+            c_core=False,
+            build_dir=self.build,
+        )
+        self.assertIn("test/other", paths)
+        self.assertIn("test/dnn_test", paths)
+        self.assertEqual((summary["tests_linked"], summary["tests_left"]), (2, 0))
+
+    def test_mcp_keeps_all_default_tests(self) -> None:
+        targets, tests = self.sample_fixtures()
+        # bound: four consumed MCP tests
+        for name in (
+            "test_mcp_smoke",
+            "test_compat_conformance",
+            "check_exported_symbols",
+            "check_exported_symbols_libvmaf",
+        ):
+            ident = f"{name}@exe"
+            targets.append(
+                {
+                    "id": ident,
+                    "name": name,
+                    "type": "executable",
+                    "filename": str(self.build / f"test/{name}"),
+                    "build_by_default": True,
+                }
+            )
+            tests.append({"name": name, "suite": ["mcp"], "cmd": [], "depends": [ident]})
+        paths, _ = select_targets(
+            "mcp-smoke",
+            targets,
+            tests,
+            ["obj/a.o"],
+            tier_full=False,
+            c_core=True,
+            build_dir=self.build,
+        )
+        self.assertIn("test/other", paths)
+        self.assertIn("src/libvmaf.so.1", paths)
+
+    def test_negative_cases_raise(self) -> None:
+        targets, tests = self.sample_fixtures()
+        with self.assertRaises(ValueError):
+            select_targets(
+                "nope",
+                targets,
+                tests,
+                ["obj/a.o"],
+                False,
+                False,
+                self.build,
+            )
+        with self.assertRaises(ValueError):
+            select_targets(
+                "dnn",
+                targets,
+                tests,
+                [],
+                False,
+                False,
+                self.build,
+            )
+        # bound: target fixture count
+        without_vmaf = [target for target in targets if target.get("id") != "vmaf@exe"]
+        with self.assertRaises(ValueError):
+            select_targets("dnn", without_vmaf, tests, ["obj/a.o"], False, True, self.build)
+        tests_no_dnn = [tests[1]]
+        with self.assertRaises(ValueError):
+            select_targets("dnn", targets, tests_no_dnn, ["obj/a.o"], False, True, self.build)
+
+    def test_boundary_cases(self) -> None:
+        targets, tests = self.sample_fixtures()
+        paths, _ = select_targets(
+            "dnn",
+            targets,
+            tests,
+            ["obj/a.o", "obj/a.o"],
+            False,
+            True,
+            self.build,
+        )
+        self.assertEqual(paths, sorted(set(paths)))
+        paths2, _ = select_targets(
+            "netflix-golden", targets, [], ["obj/a.o"], True, True, self.build
+        )
+        self.assertIn("tools/vmaf", paths2)
+
+
+class EquivalentRowsTest(unittest.TestCase):
+    def test_option_map_expands_matrix_arguments_in_order(self) -> None:
+        computed = option_map_from_tokens(
+            ["-Dfoo=before", "${{ matrix.meson_extra }}", "-Dfoo=after"],
+            None,
+            {"meson_extra": "--prefix /x --buildtype release -Dwerror=true -Dfoo=bar --prefix"},
+        )
+        self.assertEqual(computed, {"buildtype": "release", "werror": "true", "foo": "after"})
+
+    def test_option_map_rejects_shell_expansion_in_matrix_argument(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported shell expansion"):
+            option_map_from_tokens(
+                ["${{ matrix.meson_extra }}"], None, {"meson_extra": "-Dfoo=${nested}"}
+            )
+
+    def test_drift_matches_profiles(self) -> None:
+        tests = (ROOT / ".github/workflows/tests-and-quality-gates.yml").read_text(encoding="utf-8")
+        matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
+        options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options)
+        # bound: three heavy job profiles
+        self.assertEqual(computed, {job: profile["twins"] for job, profile in PROFILES.items()})
+
+    def test_os_drift_breaks_match(self) -> None:
+        tests = (ROOT / ".github/workflows/tests-and-quality-gates.yml").read_text(encoding="utf-8")
+        tests = re.sub(
+            r"(  dnn:\n(?:.*\n)*?    runs-on: )ubuntu-26\.04",
+            r"\1ubuntu-24.04",
+            tests,
+            count=1,
+        )
+        matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
+        options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options)
+        self.assertEqual(computed["dnn"], ())
+
+    def test_on_block_drift_breaks_match(self) -> None:
+        tests = (
+            (ROOT / ".github/workflows/tests-and-quality-gates.yml")
+            .read_text(encoding="utf-8")
+            .replace("  workflow_dispatch:\n", "  workflow_dispatch:\n  workflow_call:\n", 1)
+        )
+        matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
+        options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options)
+        self.assertEqual(computed, dict.fromkeys(PROFILES, ()))
+
+    def test_option_drift_breaks_match(self) -> None:
+        tests = (ROOT / ".github/workflows/tests-and-quality-gates.yml").read_text(encoding="utf-8")
+        matrix = (
+            (ROOT / ".github/workflows/libvmaf-build-matrix.yml")
+            .read_text(encoding="utf-8")
+            .replace(
+                "-Denable_dnn=enabled -Denable_zimg=true",
+                "-Denable_dnn=enabled -Denable_zimg=true -Denable_float=false",
+                1,
+            )
+        )
+        options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options)
+        self.assertEqual(computed["dnn"], (("Ubuntu clang+DNN", "light"),))
+
+    def test_shell_token_drift_breaks_match(self) -> None:
+        tests = (
+            (ROOT / ".github/workflows/tests-and-quality-gates.yml")
+            .read_text(encoding="utf-8")
+            .replace(
+                "$(../scripts/ci/werror-args.sh true)",
+                "$(other)",
+                1,
+            )
+        )
+        matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
+        options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options)
+        self.assertEqual(computed["netflix-golden"], ())
+
+
+@unittest.skipUnless(
+    os.name == "posix",
+    "HISS-21: the fixture executes a POSIX Ninja stub, covered by the Linux CI tests",
+)
+class CliHeavyLinkTargetsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        tmp = Path(temporary.name).resolve()
+        self.build = tmp / "build"
+        self.info = self.build / "meson-info"
+        self.info.mkdir(parents=True)
+        self.ninja = tmp / "ninja"
+        self.write_ninja()
+
+    def write_introspection(
+        self,
+        targets: list[dict[str, object]],
+        tests: list[dict[str, object]],
+    ) -> None:
+        (self.info / "intro-targets.json").write_text(json.dumps(targets), encoding="utf-8")
+        (self.info / "intro-tests.json").write_text(json.dumps(tests), encoding="utf-8")
+
+    def write_ninja(self) -> None:
+        # bound: two compile entries, in reverse target order
+        entries = [
+            {
+                "directory": str(self.build),
+                "command": f"cc -c {name}.c -o obj/{name}.o",
+                "file": f"{name}.c",
+                "output": f"obj/{name}.o",
+            }
+            for name in ("b", "a")
+        ]
+        source = (
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            f"if sys.argv[1:3] != ['-C', {str(self.build)!r}]:\n"
+            "    raise SystemExit('unexpected build directory')\n"
+            "args = sys.argv[3:]\n"
+            "if args == ['-t', 'rules']:\n"
+            "    print('c_COMPILER\\ncpp_COMPILER')\n"
+            "elif args == ['-t', 'compdb', 'c_COMPILER', 'cpp_COMPILER']:\n"
+            f"    print({json.dumps(entries)!r})\n"
+            "else:\n"
+            "    raise SystemExit(f'unexpected Ninja arguments: {args!r}')\n"
+        )
+        self.ninja.write_text(source, encoding="utf-8")
+        self.ninja.chmod(0o755)
+
+    def run_cli(self, job: str = "netflix-golden", *, c_core: bool = True) -> TextCommandResult:
+        return run(
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPT),
+                "--job",
+                job,
+                "--build-dir",
+                str(self.build),
+                "--tier-full",
+                "true",
+                "--c-core",
+                "true" if c_core else "false",
+                "--ninja",
+                str(self.ninja),
+            ],
+            allowed_executables=(sys.executable,),
+            capture_output=True,
+            text=True,
+        )
+
+    def write_netflix_introspection(self) -> None:
+        self.write_introspection(
+            [
+                {"id": "vmaf", "type": "executable", "filename": "tools/vmaf"},
+                {
+                    "id": "one",
+                    "type": "executable",
+                    "filename": "test/one",
+                    "build_by_default": True,
+                },
+            ],
+            [{"name": "one", "suite": ["fast"], "depends": ["one"]}],
+        )
+
+    def assert_netflix_summary(self, result: TextCommandResult, twin: str) -> None:
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertTrue(result.stderr.startswith("heavy-link-targets: job=netflix-golden "))
+        self.assertIn(f" twin={twin} ", result.stderr)
+
+    def test_cli_reports_twin_and_skips_its_test_executable(self) -> None:
+        self.write_netflix_introspection()
+        result = self.run_cli()
+        self.assert_netflix_summary(result, "Ubuntu gcc,Ubuntu clang")
+        self.assertEqual(result.stdout.splitlines(), ["obj/a.o", "obj/b.o", "tools/vmaf"])
+
+    def test_cli_without_c_core_keeps_test_executable(self) -> None:
+        self.write_netflix_introspection()
+        result = self.run_cli(c_core=False)
+        self.assert_netflix_summary(result, "none")
+        self.assertEqual(
+            result.stdout.splitlines(), ["obj/a.o", "obj/b.o", "test/one", "tools/vmaf"]
+        )
+
+    def test_cli_reports_missing_link_path(self) -> None:
+        self.write_introspection([], [])
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("link path missing from introspection: tools/vmaf", result.stderr)
+
+    def test_cli_reports_missing_dnn_suite(self) -> None:
+        self.write_netflix_introspection()
+        result = self.run_cli("dnn")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("consumed test suite absent from introspection: dnn", result.stderr)
+
+    def test_cli_reports_missing_intro_file(self) -> None:
+        result = self.run_cli("dnn")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("intro-targets.json", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
