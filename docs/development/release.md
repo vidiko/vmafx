@@ -822,6 +822,10 @@ gh attestation verify oci://ghcr.io/vidiko/vmafx@sha256:DIGEST --repo vidiko/vma
   --signer-workflow vidiko/vmafx/.github/workflows/docker-publish-production.yml \
   --source-ref "refs/tags/${tag}"
 
+# A recovery dispatch (ADR-1347) signs from the default branch: for an image it
+# rebuilt, use refs/heads/master in place of refs/tags/${tag} in both container
+# commands above.
+
 # Go server/operator/node images use their own workflow identity.
 cosign verify ghcr.io/vidiko/vmafx-node@sha256:DIGEST \
   --certificate-identity \
