@@ -18,7 +18,7 @@ dependencies = []
 # tests/ with no failure and no skip for a missing package.
 dev = [
   "pytest>=9.2.0",
-  "ruff>=0.17.3",
+  "ruff>=0.17.6",
   "optuna>=5.0.0",
   "matplotlib>=3.10.9",
   "onnxruntime>=1.31.1",
@@ -29,13 +29,13 @@ fingerprint = ["pdqhash>=0.2.8", "numpy"]
 # Phase A.5 fast-path (ADR-0276): proxy + Bayesian + GPU-verify
 # recommend. Optuna is the TPE sampler driver; gated behind an extra
 # so the core install path stays zero-dep.
-fast = ["optuna>=5.0.0"]
+fast = ["optuna>=5.1.0"]
 # Charts in `vmaf-tune report` (ADR-0498); without matplotlib the report
 # renders its tables and a placeholder instead of each chart.
 report = ["matplotlib>=3.11.2"]
 # ONNX inference: the fast-path proxy, the predictor and the saliency
 # models (vmaftune.proxy / predictor / saliency).
-onnx = ["onnxruntime>=1.31.1"]
+onnx = ["onnxruntime>=1.32.0"]
 # Predictor training moved to the ai/ training package
 # (vmaf_train.predictor_train, ADR-1886): no dependency group of this runtime
 # package may name torch (scripts/ci/check-torch-scope.py).
