@@ -241,7 +241,13 @@ jobs:
           ninja -C build-rust tools/vmaf
 
       - name: Fetch the Netflix and checkerboard fixtures
-        run: bash scripts/test/fetch-test-yuvs.sh
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Save Netflix vmaf_resource fixtures
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
 
       - name: Rust Netflix bit-exactness contract test (#2434)
         # Verify bit-exact scoring parity between the Rust safe binding and the

@@ -564,20 +564,11 @@ jobs:
       # The src01 8-bit pair is one input of the bit-exact tests' all-or-none
       # set (core/test/vmafx_fixture_util.h), so the whole set comes with it.
       - name: Fetch gate test YUV fixtures (Metal leg)
+        id: metal_fixtures
         if: ${{ (contains(matrix.meson_extra, 'enable_metal=enabled')) && steps.impact.outputs.c_core == 'true' }}
-        run: >-
-          bash scripts/test/fetch-test-yuvs.sh
-          src01_hrc00_576x324.yuv
-          src01_hrc01_576x324.yuv
-          checkerboard_1920_1080_10_3_0_0.yuv
-          checkerboard_1920_1080_10_3_1_0.yuv
-          checkerboard_1920_1080_10_3_10_0.yuv
-          sparks_ref_480x270.yuv42010le.yuv
-          sparks_dis_480x270.yuv42010le.yuv
-          ref_dock-na-HDR_res2160_rate5p0_maxRate100000_bufSize200000_fps59p940_576x324_1frame.yuv
-          dis_dock-na-HDR_res1440_rate15p0_maxRate10000_bufSize20000_fps59p940_576x324_1frame.yuv
-          src01_hrc00_576x324.yuv422p10le.yuv
-          src01_hrc01_576x324.yuv422p10le.yuv
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
 
       - name: Run tests
         if: ${{ (!matrix.sycl && !matrix.cuda && !matrix.hip) && steps.impact.outputs.c_core == 'true' }}
@@ -596,19 +587,11 @@ jobs:
       # ADR-0726 (design notes)
 
       - name: Restore Netflix vmaf_resource fixtures
-        id: fixtures
-        if: ${{ ((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true' }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        # The Metal leg already provisioned the full set before the unit suite.
+        if: ${{ ((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true' && steps.metal_fixtures.outcome != 'success' }}
+        uses: ./.github/actions/netflix-fixtures
         with:
-          path: python/test/resource
-          key: vmaf-fixtures-resource-v1-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}
-          restore-keys: |
-            vmaf-fixtures-resource-v1-
-            vmaf-fixtures-resource-
-
-      - name: Drop unusable restored fixtures
-        if: ${{ ((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true' }}
-        run: bash scripts/ci/prune-corrupt-fixtures.sh --restore-tracked python/test/resource
+          phase: get
 
       # The motion PQ pin rows read this bundle; a failed download fails the leg.
       - name: Fetch the PQ fixture
@@ -659,11 +642,10 @@ jobs:
           phase: finish
 
       - name: Save Netflix vmaf_resource fixtures
-        if: ${{ success() && (((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true') && steps.fixtures.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: ${{ success() && (((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true') }}
+        uses: ./.github/actions/netflix-fixtures
         with:
-          path: python/test/resource
-          key: vmaf-fixtures-resource-v1-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}
+          phase: finish
 
       # ADR-1495 (design notes)
       - name: Check the host math library (icx)

@@ -1,0 +1,82 @@
+# Copyright 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+name: Netflix fixtures
+description: Restore and verify the shared Netflix test fixtures, then cache a successful full fetch.
+
+inputs:
+  phase:
+    description: "'get' to provision fixtures, 'finish' to save an eligible cache."
+    required: true
+  names:
+    description: "Optional space-separated fixture filenames for a subset fetch."
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Restore the shared fixture cache
+      id: restore
+      if: inputs.phase == 'get'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: python/test/resource
+        key: vmaf-fixtures-resource-v1-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}
+        restore-keys: |
+          vmaf-fixtures-resource-v1-
+          vmaf-fixtures-resource-
+
+    # A restored file that is empty, or that holds an HTML error page or a
+    # Git-LFS pointer, is worse than a missing one: download_reactively
+    # (compat/python-vmaf/config.py) fetches only absent files, so a bad copy
+    # is never repaired. A restore-keys hit also writes the tracked files the
+    # saving revision held under python/test/resource over this checkout;
+    # --restore-tracked puts them back (T-CI-FIXTURE-CACHE-STALE-TRACKED-2026-10-06).
+    - name: Drop unusable restored fixtures
+      if: inputs.phase == 'get'
+      shell: bash
+      run: bash scripts/ci/prune-corrupt-fixtures.sh --restore-tracked python/test/resource
+
+    - name: Verify and fetch the requested fixtures
+      if: inputs.phase == 'get'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+        FIXTURE_NAMES: ${{ inputs.names }}
+      run: |
+        read -r -a names <<< "${FIXTURE_NAMES}"
+        for name in ${names[@]+"${names[@]}"}; do
+          if [[ "${name}" == -* ]]; then
+            echo "::error::names accepts fixture filenames only"
+            exit 2
+          fi
+        done
+        bash scripts/test/fetch-test-yuvs.sh ${names[@]+"${names[@]}"}
+
+        # A subset fetch cannot publish the full fixture cache key.
+        save=false
+        if [[ "${CACHE_HIT}" != true && "${#names[@]}" -eq 0 ]]; then
+          save=true
+        fi
+        printf '%s\n' "${save}" > "${RUNNER_TEMP}/netflix-fixtures.save"
+
+    # The save is a separate step under the caller's default success() guard,
+    # not the combined actions/cache post step, which also saves after a
+    # cancelled or failed job. The key hashes python/test/*_test.py, so a
+    # partial tree saved under a fresh key would give every later run on the
+    # branch an exact hit on it (the failure behind PR 1261).
+    - name: Read the cache save decision
+      id: check_save
+      if: inputs.phase == 'finish'
+      shell: bash
+      run: |
+        marker="${RUNNER_TEMP}/netflix-fixtures.save"
+        if [[ -f "${marker}" ]] && [[ "$(cat "${marker}")" == true ]]; then
+          echo "save=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Save the shared fixture cache
+      if: inputs.phase == 'finish' && steps.check_save.outputs.save == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: python/test/resource
+        key: vmaf-fixtures-resource-v1-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}

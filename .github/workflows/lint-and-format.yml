@@ -521,11 +521,18 @@ jobs:
           locale -a | grep -qix 'de_DE.utf8'
       - name: Fetch the test pairs
         if: steps.impact.outputs.gstreamer_element == 'true'
-        run: >-
-          bash scripts/test/fetch-test-yuvs.sh
-          src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
-          checkerboard_1920_1080_10_3_0_0.yuv checkerboard_1920_1080_10_3_1_0.yuv
-          checkerboard_1920_1080_10_3_10_0.yuv
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+          names: >-
+            src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
+            checkerboard_1920_1080_10_3_0_0.yuv checkerboard_1920_1080_10_3_1_0.yuv
+            checkerboard_1920_1080_10_3_10_0.yuv
+      - name: Save Netflix vmaf_resource fixtures
+        if: steps.impact.outputs.gstreamer_element == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
       - name: Build libvmafx
         if: steps.impact.outputs.gstreamer_element == 'true'
         run: |

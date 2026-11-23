@@ -1,0 +1,1 @@
+- CI reuses verified Netflix test clips from a shared cache, so jobs with valid cached clips avoid intermittent download failures.

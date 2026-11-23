@@ -110,19 +110,10 @@ jobs:
           meson compile -C build
 
       - name: Restore Netflix vmaf_resource fixtures
-        id: fixtures
         if: steps.impact.outputs.golden_harness == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        uses: ./.github/actions/netflix-fixtures
         with:
-          path: python/test/resource
-          key: vmaf-fixtures-resource-v1-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}
-          restore-keys: |
-            vmaf-fixtures-resource-v1-
-            vmaf-fixtures-resource-
-
-      - name: Drop unusable restored fixtures
-        if: steps.impact.outputs.golden_harness == 'true'
-        run: bash scripts/ci/prune-corrupt-fixtures.sh --restore-tracked python/test/resource
+          phase: get
 
       - name: Get the PQ fixture
         if: steps.impact.outputs.golden_harness == 'true'
@@ -178,11 +169,10 @@ jobs:
           phase: finish
 
       - name: Save Netflix vmaf_resource fixtures
-        if: ${{ success() && (steps.impact.outputs.golden_harness == 'true') && steps.fixtures.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: ${{ success() && steps.impact.outputs.golden_harness == 'true' }}
+        uses: ./.github/actions/netflix-fixtures
         with:
-          path: python/test/resource
-          key: vmaf-fixtures-resource-v1-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}
+          phase: finish
 
   # ADR-0726 (design notes)
 
@@ -244,18 +234,16 @@ jobs:
           path: ${{ runner.temp }}/apt-archives
           key: apt-${{ runner.os }}-${{ runner.arch }}-compat-abi-parity-${{ hashFiles('.github/apt/compat-abi-parity.txt') }}
 
-      - name: Restore Netflix vmaf_resource fixtures
-        if: steps.impact.outputs.golden_harness == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: python/test/resource
-          key: vmaf-golden-fixtures-v3-${{ hashFiles('scripts/test/fetch-test-yuvs.sh') }}
-
       - name: Fetch Netflix fixtures if missing
         if: steps.impact.outputs.golden_harness == 'true'
-        run: |
-          mkdir -p python/test/resource/yuv
-          bash scripts/test/fetch-test-yuvs.sh
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Save Netflix vmaf_resource fixtures
+        if: steps.impact.outputs.golden_harness == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
 
       - name: Run Compat ABI Parity Probe
         if: steps.impact.outputs.golden_harness == 'true'
@@ -509,7 +497,14 @@ jobs:
           "${venv}/bin/pip" install --no-deps --no-build-isolation -e ai
       - name: Fetch the Netflix golden YUV fixtures
         if: steps.impact.outputs.tiny_ai == 'true'
-        run: bash scripts/test/fetch-test-yuvs.sh
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Save Netflix vmaf_resource fixtures
+        if: steps.impact.outputs.tiny_ai == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
       - name: Run ai/ pytests
         if: steps.impact.outputs.tiny_ai == 'true'
         env:
@@ -793,7 +788,14 @@ jobs:
           key: apt-${{ runner.os }}-${{ runner.arch }}-vmaf-tune-tests-${{ hashFiles('.github/apt/vmaf-tune-tests.txt') }}
       - name: Fetch the Netflix golden YUV fixtures
         if: steps.impact.outputs.python == 'true'
-        run: bash scripts/test/fetch-test-yuvs.sh
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Save Netflix vmaf_resource fixtures
+        if: steps.impact.outputs.python == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
       - name: Run the suite
         if: steps.impact.outputs.python == 'true'
         env:
@@ -921,7 +923,13 @@ jobs:
 
       - name: Fetch the Netflix golden YUV fixtures
         # ADR-1528 (design notes)
-        run: bash scripts/test/fetch-test-yuvs.sh
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Save Netflix vmaf_resource fixtures
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
 
       - name: Run Python MCP server pytests
         env:
@@ -1061,7 +1069,14 @@ jobs:
         run: python3 scripts/ci/prefetch_go_modules.py
       - name: Fetch the Netflix golden YUV fixtures for the unit suite
         if: steps.impact.outputs.golden_harness == 'true'
-        run: bash scripts/test/fetch-test-yuvs.sh
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Save Netflix vmaf_resource fixtures
+        if: steps.impact.outputs.golden_harness == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
       - name: Run meson unit suite (with gcov counters)
         id: coverage_meson_suite
         if: steps.impact.outputs.golden_harness == 'true'

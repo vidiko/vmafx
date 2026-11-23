@@ -726,6 +726,7 @@
         "scripts/ci/vmafx_window_pooling.py",
         "scripts/ci/werror-args.sh",
         "scripts/test/fetch-test-yuvs.sh",
+        ".github/actions/netflix-fixtures/action.yml",
         "compat/python-vmaf/tools/retrying_download.py",
         "requirements/locks/build.txt",
         "build-config.env",

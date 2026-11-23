@@ -152,7 +152,15 @@ jobs:
           sudo -E apt-get -yq install ninja-build gcc nasm pkg-config libzimg-dev
       - name: Fetch the Netflix 576x324 pair
         if: steps.impact.outputs.mode == 'full' || steps.impact.outputs.c_core == 'true' || steps.impact.outputs.actions == 'true'
-        run: bash scripts/test/fetch-test-yuvs.sh src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+          names: src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
+      - name: Save Netflix vmaf_resource fixtures
+        if: steps.impact.outputs.mode == 'full' || steps.impact.outputs.c_core == 'true' || steps.impact.outputs.actions == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
       - name: Build libvmafx and the vmaf CLI
         if: steps.impact.outputs.mode == 'full' || steps.impact.outputs.c_core == 'true' || steps.impact.outputs.actions == 'true'
         run: |

@@ -12,6 +12,9 @@ The tests source the script and call its main() with a fixture list of their
 own, against a stand-in server that answers 504 before 200. The retry runs for
 real here (one wait of the policy's first delay); the policy's length and its
 other entry points are tested in compat/python-vmaf/tests/test_retrying_download.py.
+
+An HTTP 403 replay checks that restored fixtures make zero requests. A
+workflow contract keeps direct fetches and cache steps in the fixture actions.
 """
 
 from __future__ import annotations
@@ -25,7 +28,9 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+import yaml  # type: ignore[import-untyped]  # hook environments omit PyYAML stubs
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -104,6 +109,23 @@ class FetchTestYuvs(unittest.TestCase):
             "download failed for first.yuv; not trying the fixtures after it", done.stderr
         )
         self.assertIn(SUMMARY.format(0, 0, 0, 1), done.stdout)
+
+    def test_restored_fixtures_make_no_requests_when_the_host_returns_403(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, StandIn([403] * len(BODIES)) as server:
+            directory = Path(tmp)
+            (directory / "first.yuv").write_bytes(FIRST)
+            (directory / "second.yuv").write_bytes(SECOND)
+            done = fetch(server, directory)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(server.requests, [])
+        self.assertIn(SUMMARY.format(2, 0, 0, 0), done.stdout)
+
+    def test_an_empty_cache_fails_after_one_request_when_the_host_returns_403(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, StandIn([403] * len(BODIES)) as server:
+            done = fetch(server, Path(tmp))
+            self.assertEqual(done.returncode, 1)
+            self.assertEqual(server.requests, ["/yuv/first.yuv"])
+        self.assertIn("HTTP Error 403", done.stderr)
 
     def test_a_download_with_the_wrong_content_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, StandIn(bodies=BODIES) as server:
@@ -497,6 +519,68 @@ def _unit_suite_gets_the_pair(workflow: str) -> bool:
     required = workflow.find("VMAFX_REQUIRE_NETFLIX_PAIR", suite)
     next_step = workflow.find("- name:", suite)
     return -1 < fetch < suite < required < next_step
+
+
+def _direct_fixture_steps(text: str) -> list[str]:
+    """Find steps that bypass the local fixture actions."""
+    document = yaml.safe_load(text)
+    containers = document["jobs"].values() if "jobs" in document else [document["runs"]]
+    violations = []
+    for container in containers:
+        for step in container.get("steps", []):
+            name = step.get("name", "<unnamed step>")
+            if "scripts/test/fetch-test-yuvs.sh" in str(step.get("run", "")):
+                violations.append(f"{name}: calls the fixture script directly")
+            if not re.match(r"^actions/cache(?:/(?:restore|save))?@", step.get("uses", "")):
+                continue
+            for path in step.get("with", {}).get("path", "").splitlines():
+                target = PurePosixPath(path.strip().removeprefix("${{ github.workspace }}/"))
+                if target.is_relative_to("python/test/resource"):
+                    violations.append(f"{name}: caches {target} directly")
+    return violations
+
+
+class NetflixFixtureActionContract(unittest.TestCase):
+    def test_only_fixture_actions_fetch_or_cache_the_resources(self) -> None:
+        github = ROOT / ".github"
+        actions = github / "actions"
+        allowed = {actions / name / "action.yml" for name in ("netflix-fixtures", "pq-fixture")}
+        workflows = set((github / "workflows").glob("*.yml"))
+        other_actions = set(actions.glob("*/action.y*ml")) - allowed
+        for path in sorted(workflows | other_actions):
+            with self.subTest(path=path):
+                self.assertEqual(_direct_fixture_steps(path.read_text(encoding="utf-8")), [])
+
+    def test_the_old_tiny_ai_fetch_is_refused(self) -> None:
+        workflow = """\
+jobs:
+  tiny-ai:
+    steps:
+      - name: Fetch the Netflix golden YUV fixtures
+        if: steps.impact.outputs.tiny_ai == 'true'
+        run: bash scripts/test/fetch-test-yuvs.sh
+"""
+        self.assertEqual(
+            _direct_fixture_steps(workflow),
+            ["Fetch the Netflix golden YUV fixtures: calls the fixture script directly"],
+        )
+
+    def test_a_direct_fixture_cache_is_refused(self) -> None:
+        workflow = """\
+jobs:
+  tiny-ai:
+    steps:
+      - name: Restore the fixtures
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            /tmp/other-cache
+            ./python/test/resource/
+"""
+        self.assertEqual(
+            _direct_fixture_steps(workflow),
+            ["Restore the fixtures: caches python/test/resource directly"],
+        )
 
 
 class PythonBindingBitExactRuns(unittest.TestCase):
