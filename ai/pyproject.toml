@@ -111,8 +111,11 @@ markers = [
     "slow: marks tests as slow (deselect with -m 'not slow')",
 ]
 
+# This package extends the root ruff configuration and keeps its own target
+# version, rule selection, ignores and isort classification, because a child
+# file's `select` and `ignore` replace the root lists rather than merging with them.
 [tool.ruff]
-line-length = 100
+extend = "../pyproject.toml"
 target-version = "py312"
 
 [tool.ruff.lint]

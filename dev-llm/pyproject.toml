@@ -56,6 +56,9 @@ build-backend = "hatchling.build"
 packages = ["src/vmaf_dev_llm"]
 
 
+# This package runs ruff's default rule set; extending the root file would
+# replace it with the root `select`, and ruff has no selector for its default
+# set; measured with ruff 0.17.3 on 2026-11-22 (findings under the root rules: 47).
 [tool.ruff]
 line-length = 100
 target-version = "py312"
