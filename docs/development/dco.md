@@ -235,9 +235,11 @@ the release bot itself (name `vmafx-release-bot[bot]`, lowercased email
 condition, because the generated-docs render commit 800122efd8 (#3613), the first
 that landed through the merge queue, is authored by the release bot and its
 squash commit names it again as co-author
-([ADR-3624](../adr/3624-landed-release-bot-self-coauthor.md)). A foreign
-co-author, a second self line, or the line on a commit by another author is
-still refused.
+([ADR-3624](../adr/3624-landed-release-bot-self-coauthor.md)). A second self
+line or a bot or coding-tool co-author (a `BANNED_COAUTHOR_TOKENS` match,
+`[bot]` included) is still refused; a human co-author line passes, as on any
+other commit. The line on a commit by another author is still refused unless
+the Renovate exemption above or the Python lock refresh class below applies.
 
 The Python lock refresh class ([ADR-3560](../adr/3560-python-lock-refresh.md))
 permits a signed release-bot commit with the exact refresh subject when every

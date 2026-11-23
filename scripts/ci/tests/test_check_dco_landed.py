@@ -117,6 +117,21 @@ class DcoLandedGateTest(unittest.TestCase):
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn("Co-authored-by", res.stdout)
 
+    def test_release_bot_human_coauthor_passes(self) -> None:
+        """Assert landed mode keeps a human co-author on a release-bot render commit."""
+        msg = (
+            "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+            "Signed-off-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            "Co-authored-by: vmafx-release-bot[bot] "
+            "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+            f"Co-authored-by: {fx.HUMAN[0]} <{fx.HUMAN[1]}>"
+        )
+        self.repo.commit(msg, fx.RELEASE_BOT_IDENT)
+        res = self.repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("PASS", res.stdout)
+
     def test_release_bot_second_self_line_refused(self) -> None:
         """Assert landed mode refuses duplicate release-bot self co-author lines."""
         msg = (

@@ -28,8 +28,12 @@ In `--landed` mode, when `(commit.author_name, commit.author_email.lower())`
 matches the release bot identity, strip one line whose `.strip()` equals
 `RELEASE_BOT_COAUTHOR` only when that line appears exactly once; zero or more
 than one occurrence keeps the message unchanged for attribution. No path or
-exception lookup applies. A foreign co-author on a release-bot commit, a second
-self line, and the release-bot line on a commit by any other author stay refused.
+exception lookup applies. A second self line and a bot or coding-tool co-author
+on a release-bot commit (a line matching `BANNED_COAUTHOR_TOKENS`, `[bot]`
+included) stay refused; a human co-author line passes, as on any other commit.
+The release-bot line on a commit by another author stays refused unless a
+Renovate exemption applies: the ADR-3555 path grant or the ADR-3560 Python lock
+refresh.
 
 ## Alternatives considered
 

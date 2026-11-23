@@ -21,8 +21,9 @@ release. Missing or invalid objects, malformed or duplicate-key JSON, and any
 other manifest change keep the trailer.
 
 ADR-3624 strips a single exact release-bot ``Co-authored-by:`` line in ``--landed`` mode
-when the commit author is that same release bot; a second line, any other trailer
-and any other author keep the refusal.
+when the commit author is that same release bot. A second line and any bot or
+coding-tool co-author keep the refusal; a human co-author passes, as on any commit.
+Another author keeps the refusal unless a Renovate exemption above applies.
 
 The forge must identify one PR with the squash SHA and a parseable ``merged_at``
 timestamp. Its complete commit list must have fewer than 250 entries and include
