@@ -1139,14 +1139,14 @@ def selected_comment(text: str, prefixes: tuple[str, ...], block_prefix: str) ->
     return "#"
 
 
-def editor_signoff_text(text: str, q: str, cleanup: str) -> str:
-    """Clean the message portion Git keeps for trailers in editor mode."""
+def editor_signoff_text(text: str, q: str, cleanup: str, truncate: bool) -> str:
+    """Clean the sign-off portion Git keeps; scissors cuts only when truncate is set."""
     scissors = q + SCISSORS_TAIL.decode("utf-8")
     kept: list[str] = []
     lines = text.split("\n")
     # Bounded by len(lines) (at most MAX_COMMIT_MESSAGE_BYTES + 1).
     for line in lines:
-        if line.rstrip("\r") == scissors:
+        if truncate and line.rstrip("\r") == scissors:
             break
         kept.append(line)
     cut = "\n".join(kept)
@@ -1171,8 +1171,10 @@ def check_message_file(path: str) -> int:
     committer_name, committer_email = message_identity("COMMITTER")
     message = run_git(["stripspace"], stdin=text)
     if editor:
+        cleanup = cleanup_mode()
         q = selected_comment(text, prefixes, block_prefix)
-        signoff_text = editor_signoff_text(text, q, cleanup_mode())
+        truncate = bool(block_prefix) or cleanup == "scissors"
+        signoff_text = editor_signoff_text(text, q, cleanup, truncate)
     else:
         signoff_text = message
     stored = signoff_text.splitlines()

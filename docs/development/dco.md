@@ -37,9 +37,11 @@ coding tool attribution. Merge commits are exempt. For a new commit use
 
 The hook reads `GIT_EDITOR`, which Git sets to `:` when no editor runs (`-m`,
 `-F`, `--no-edit`). Without an editor, every line is checked as Git stores it.
-With an editor, the sign-off is checked on the text above Git's first scissors
-line with comment lines removed (unless `commit.cleanup` keeps them), and
-attribution is checked on all text above the staged diff that `-v` writes.
+With an editor, the sign-off is checked on the text Git keeps, which is the
+text above Git's first scissors line with `-v` or `commit.cleanup=scissors` and
+the whole text otherwise, with comment lines removed unless `commit.cleanup`
+keeps them. Attribution is checked on all text above the staged diff that `-v`
+writes.
 Under `core.commentChar=auto`, the hook uses the comment string of Git's own
 template lines.
 
