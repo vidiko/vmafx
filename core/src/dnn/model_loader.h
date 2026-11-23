@@ -8,6 +8,9 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 
 #include "libvmaf/model.h"
 
@@ -214,6 +217,16 @@ int vmaf_dnn_validate_onnx(const char *path, size_t max_bytes);
  *  ``<dirname(onnx_path)>/registry.json``. */
 /* Public API — must be visible in the shared library (ADR-0379). */
 VMAF_EXPORT int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path);
+
+#ifndef _WIN32
+/* Owner and mode rule for the cosign temporary directory chain (ADR-2985),
+ * internal and declared here for core/test/dnn/test_tiny_model_verify.c. With
+ * private_only 0 (TMPDIR and each directory above it) root or euid must own the
+ * directory and a group- or other-writable one needs the sticky bit; with
+ * private_only 1 (the mkdtemp(3) directory) euid must own it and no group or
+ * other bit may be set. Returns 0 when the rule holds, -EACCES otherwise. */
+int vmaf_dnn_temp_dir_mode_ok(uid_t owner, mode_t mode, uid_t euid, int private_only);
+#endif
 
 #ifdef __cplusplus
 }

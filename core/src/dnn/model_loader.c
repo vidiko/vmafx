@@ -1538,65 +1538,134 @@ static int lookup_bundle_abs(const char *onnx_path, const char *registry_path, c
     return resolve_bundle_abs(reg_path, bundle_rel, out, out_sz);
 }
 
-/* Trim @p path in place to its parent directory; 1 when a parent remains, 0 at "/". */
-static int parent_dir_in_place(char *path)
-{
-    size_t len = strnlen(path, PATH_MAX);
-    for (; len > 1u && path[len - 1u] == '/'; len--)
-        path[len - 1u] = '\0';
-    if (len <= 1u)
-        return 0;
-    char *slash = strrchr(path, '/');
-    if (!slash)
-        return 0;
-    if (slash == path) {
-        path[1] = '\0';
-    } else {
-        *slash = '\0';
-    }
-    return 1;
-}
+/* Search-only directory open: O_PATH (Linux) and O_SEARCH (POSIX) need no read
+ * permission, so an execute-only directory on the TMPDIR path still opens. */
+#if defined(O_PATH)
+#define TEMP_DIR_OPEN_MODE O_PATH
+#elif defined(O_SEARCH)
+#define TEMP_DIR_OPEN_MODE O_SEARCH
+#else
+#define TEMP_DIR_OPEN_MODE O_RDONLY
+#endif
 
-/* Enforced security control: reject a missing, non-directory, or non-sticky
- * group/other-writable temporary directory before mkdtemp() or cosign runs. */
-static int check_temp_dir_one(const char *dir)
+/* Owner and mode rule for the temporary directory chain (ADR-2985). With
+ * @p private_only 0 (TMPDIR and each directory above it): root or @p euid owns
+ * the directory, and a group- or other-writable one carries the sticky bit, so
+ * no other user can rename or replace an entry in it. With @p private_only 1
+ * (the mkdtemp(3) directory): @p euid owns it and no group or other bit is set.
+ * 0 when the rule holds, -EACCES otherwise. */
+int vmaf_dnn_temp_dir_mode_ok(uid_t owner, mode_t mode, uid_t euid, int private_only)
 {
-    struct stat st;
-    if (dir[0] != '/' || stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "tiny model: temporary directory is not an absolute directory: %s\n", dir);
-        return -EINVAL;
-    }
-    const mode_t writable = (mode_t)S_IWGRP | (mode_t)S_IWOTH;
-    const mode_t sticky = (mode_t)S_ISVTX;
-    if ((st.st_mode & writable) != 0u && (st.st_mode & sticky) == 0u) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "tiny model: temporary directory is writable without sticky bit: %s\n", dir);
+    const mode_t group_other = (mode_t)S_IRWXG | (mode_t)S_IRWXO;
+    if (private_only)
+        return (owner == euid && (mode & group_other) == 0u) ? 0 : -EACCES;
+    if (owner != (uid_t)0 && owner != euid)
         return -EACCES;
-    }
+    const mode_t writable = (mode_t)S_IWGRP | (mode_t)S_IWOTH;
+    if ((mode & writable) != 0u && (mode & (mode_t)S_ISVTX) == 0u)
+        return -EACCES;
     return 0;
 }
 
-static int private_base_dir(const char *tmp_dir, const char **base)
+static void close_dir_fd(int fd, const char *path)
 {
-    *base = (tmp_dir && tmp_dir[0] != '\0') ? tmp_dir : "/tmp";
-    int err = check_temp_dir_one(*base);
-    if (err != 0)
-        return err;
-    const size_t blen = strnlen(*base, PATH_MAX);
-    if (blen >= PATH_MAX)
-        return -ENAMETOOLONG;
-    char *ancestor = calloc(PATH_MAX, 1u);
-    if (!ancestor)
-        return -ENOMEM;
-    copy_n_terminated(ancestor, *base, blen);
-    for (size_t step = 0u; step < PATH_MAX && parent_dir_in_place(ancestor); step++) {
-        err = check_temp_dir_one(ancestor);
-        if (err != 0)
-            break;
-    }
-    free(ancestor);
+    if (close(fd) != 0)
+        vmaf_log(VMAF_LOG_LEVEL_WARNING, "cannot close temporary directory: %s\n", path);
+}
+
+/* Open directory @p name under @p parent without following a symbolic link
+ * and check it with vmaf_dnn_temp_dir_mode_ok(); the descriptor, or a negative
+ * errno. */
+static int temp_dir_openat(int parent, const char *name, uid_t euid, int private_only)
+{
+    const int fd = openat(parent, name, TEMP_DIR_OPEN_MODE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -errno;
+    struct stat st;
+    int err = fstat(fd, &st) != 0 ? -errno : 0;
+    if (err == 0)
+        err = vmaf_dnn_temp_dir_mode_ok(st.st_uid, st.st_mode, euid, private_only);
+    if (err == 0)
+        return fd;
+    close_dir_fd(fd, name);
     return err;
+}
+
+/* Copy the component of @p path that starts after offset *@p pos into @p comp
+ * (NAME_MAX + 1 bytes) and move *@p pos past it: 1 when a component was
+ * copied, 0 at the end of the path, -ENAMETOOLONG for a longer component. */
+static int next_component(const char *path, size_t *pos, char *comp)
+{
+    size_t i = *pos;
+    while (i < PATH_MAX && path[i] == '/')
+        i++;
+    if (i >= PATH_MAX || path[i] == '\0')
+        return 0;
+    // SAFETY: i < PATH_MAX and path[i] is a byte of the NUL-terminated path.
+    const char *start = path + i;
+    const size_t n = strcspn(start, "/");
+    if (n > (size_t)NAME_MAX)
+        return -ENAMETOOLONG;
+    copy_n_terminated(comp, start, n);
+    *pos = i + n;
+    return 1;
+}
+
+/* Walk @p path (absolute, from realpath(3)) from "/" one directory at a time
+ * with temp_dir_openat(), so each check binds to the directory the path names
+ * now and a component swapped for a symbolic link fails the walk. Returns the
+ * descriptor of @p path's directory, or a negative errno after logging the
+ * first directory that failed. @p comp holds one component (NAME_MAX + 1
+ * bytes). */
+static int temp_dir_walk_in(const char *path, uid_t euid, char *comp)
+{
+    int fd = temp_dir_openat(AT_FDCWD, "/", euid, 0);
+    size_t pos = 0u;
+    for (size_t step = 0u; fd >= 0 && step < PATH_MAX; step++) {
+        const int more = next_component(path, &pos, comp);
+        if (more == 0)
+            return fd;
+        const int next = more < 0 ? more : temp_dir_openat(fd, comp, euid, 0);
+        close_dir_fd(fd, path);
+        fd = next;
+    }
+    if (fd >= 0) {
+        close_dir_fd(fd, path);
+        fd = -ENAMETOOLONG;
+    }
+    vmaf_log(VMAF_LOG_LEVEL_ERROR,
+             "tiny model: temporary directory %.*s is not trusted (%d): it must be owned by "
+             "root or the current user, and a group- or other-writable one needs the "
+             "sticky bit\n",
+             (int)(pos > 0u ? pos : 1u), path, fd);
+    return fd;
+}
+
+static int temp_dir_walk(const char *path, uid_t euid)
+{
+    char *comp = calloc((size_t)NAME_MAX + 1u, 1u);
+    if (!comp)
+        return -ENOMEM;
+    const int fd = temp_dir_walk_in(path, euid, comp);
+    free(comp);
+    return fd;
+}
+
+/* Resolve TMPDIR (@p tmp_dir, or /tmp when unset or empty) into @p resolved
+ * (PATH_MAX bytes) with realpath(3), so a symbolic link is judged by the
+ * directories it points into: -EINVAL unless it is absolute and names an
+ * existing directory. */
+static int temp_dir_resolve(const char *tmp_dir, char *resolved)
+{
+    const char *base = (tmp_dir && tmp_dir[0] != '\0') ? tmp_dir : "/tmp";
+    struct stat st;
+    if (base[0] != '/' || vmaf_fullpath_utf8(base, resolved, PATH_MAX) == NULL ||
+        stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                 "tiny model: temporary directory is not an absolute directory: %s\n", base);
+        return -EINVAL;
+    }
+    return 0;
 }
 
 static void private_dir_remove(const char *dir)
@@ -1605,13 +1674,36 @@ static void private_dir_remove(const char *dir)
         vmaf_log(VMAF_LOG_LEVEL_WARNING, "cannot remove temporary directory: %s\n", dir);
 }
 
-static int private_file_open(const char *dir, const char *out)
+/* mkdtemp(3) "<base>/vmafx-bundle-XXXXXX" into @p dir and write its "bundle"
+ * path to @p out; 0, or a negative errno with the directory removed. */
+static int private_dir_create(const char *base, char *dir, size_t dir_sz, char *out, size_t out_sz)
 {
-    int dirfd = openat(AT_FDCWD, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dirfd < 0) {
-        int err = -errno;
+    int n = snprintf(dir, dir_sz, "%s/vmafx-bundle-XXXXXX", base);
+    if (n < 0 || (size_t)n >= dir_sz)
+        return -ENAMETOOLONG;
+    if (mkdtemp(dir) == NULL)
+        return -errno;
+    n = snprintf(out, out_sz, "%s/bundle", dir);
+    if (n < 0 || (size_t)n >= out_sz) {
         private_dir_remove(dir);
-        return err;
+        return -ENAMETOOLONG;
+    }
+    return 0;
+}
+
+/* Open the new directory @p dir relative to the checked @p base_fd (no
+ * symbolic link, owned by @p euid, no group or other bit) and create "bundle"
+ * in it with O_EXCL | O_NOFOLLOW; the file descriptor, or a negative errno with
+ * the directory removed. */
+static int private_file_open(int base_fd, const char *dir, const char *out, uid_t euid)
+{
+    const char *slash = strrchr(dir, '/');
+    // SAFETY: dir was built as "<base>/vmafx-bundle-XXXXXX", so a non-NULL slash
+    // is followed by the NUL-terminated leaf name inside dir.
+    const int dirfd = slash ? temp_dir_openat(base_fd, slash + 1, euid, 1) : -EINVAL;
+    if (dirfd < 0) {
+        private_dir_remove(dir);
+        return dirfd;
     }
     int fd = openat(dirfd, "bundle", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     S_IRUSR | S_IWUSR);
@@ -1631,26 +1723,32 @@ static int private_file_open(const char *dir, const char *out)
     return fd;
 }
 
-/* Create a directory inaccessible to other users and a file inside it. */
+static int private_copy_open_in(const char *base, char *dir, size_t dir_sz, char *out,
+                                size_t out_sz)
+{
+    const uid_t euid = geteuid();
+    const int base_fd = temp_dir_walk(base, euid);
+    if (base_fd < 0)
+        return base_fd;
+    const int made = private_dir_create(base, dir, dir_sz, out, out_sz);
+    const int fd = made == 0 ? private_file_open(base_fd, dir, out, euid) : made;
+    close_dir_fd(base_fd, base);
+    return fd;
+}
+
+/* Create a directory inaccessible to other users under the resolved, trusted
+ * TMPDIR and a file inside it (ADR-2985). */
 static int private_copy_open(const char *tmp_dir, char *dir, size_t dir_sz, char *out,
                              size_t out_sz)
 {
-    const char *base;
-    const int base_err = private_base_dir(tmp_dir, &base);
-    if (base_err != 0)
-        return base_err;
-    int n = snprintf(dir, dir_sz, "%s/vmafx-bundle-XXXXXX", base);
-    if (n < 0 || (size_t)n >= dir_sz)
-        return -ENAMETOOLONG;
-    if (mkdtemp(dir) == NULL)
-        return -errno;
-    n = snprintf(out, out_sz, "%s/bundle", dir);
-    if (n < 0 || (size_t)n >= out_sz) {
-        int err = -ENAMETOOLONG;
-        private_dir_remove(dir);
-        return err;
-    }
-    return private_file_open(dir, out);
+    char *base = calloc(PATH_MAX, 1u);
+    if (!base)
+        return -ENOMEM;
+    int fd = temp_dir_resolve(tmp_dir, base);
+    if (fd == 0)
+        fd = private_copy_open_in(base, dir, dir_sz, out, out_sz);
+    free(base);
+    return fd;
 }
 
 static int write_all(int fd, const char *buf, size_t len)

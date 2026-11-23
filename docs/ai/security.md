@@ -177,8 +177,10 @@ The `--tiny-model-verify` flag does all of this at load time
   temporary directory, with the same
   anchored expression, and fails closed when the signature is missing or bad.
   A certificate of any other identity or owner is refused like a bad
-  signature (`-EPROTO`). `TMPDIR` must be absolute and name a directory; a
-  shared writable directory must have the sticky bit.
+  signature (`-EPROTO`). `TMPDIR` must be absolute and name a directory. It is
+  resolved with `realpath(3)`, and every directory from `/` down to it must be
+  owned by root or the current user; a group- or other-writable one must have
+  the sticky bit.
 - It is off by default for dev-friendliness and strongly recommended in
   production.
 - It drives `vmaf_dnn_verify_signature()` in

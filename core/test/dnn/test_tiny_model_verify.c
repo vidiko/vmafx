@@ -784,6 +784,112 @@ static char *test_tmpdir_rejects_unprotected_shared_ancestor(void)
     return result;
 }
 
+static char *test_tmpdir_mode_rule(void)
+{
+    const uid_t me = (uid_t)1000;
+    const uid_t other = (uid_t)1001;
+    const mode_t all = (mode_t)S_IRWXU | (mode_t)S_IRWXG | (mode_t)S_IRWXO;
+    const mode_t shared = all | (mode_t)S_ISVTX;
+    const mode_t m0755 =
+        (mode_t)S_IRWXU | (mode_t)S_IRGRP | (mode_t)S_IXGRP | (mode_t)S_IROTH | (mode_t)S_IXOTH;
+    const mode_t m0770 = (mode_t)S_IRWXU | (mode_t)S_IRWXG;
+    const mode_t m0740 = (mode_t)S_IRWXU | (mode_t)S_IRGRP;
+    mu_assert("root sticky shared ok", vmaf_dnn_temp_dir_mode_ok((uid_t)0, shared, me, 0) == 0);
+    mu_assert("own 0755 ok", vmaf_dnn_temp_dir_mode_ok(me, m0755, me, 0) == 0);
+    mu_assert("root euid ok", vmaf_dnn_temp_dir_mode_ok((uid_t)0, m0755, (uid_t)0, 0) == 0);
+    mu_assert("other owner refused", vmaf_dnn_temp_dir_mode_ok(other, m0755, me, 0) == -EACCES);
+    mu_assert("other owner sticky refused",
+              vmaf_dnn_temp_dir_mode_ok(other, shared, me, 0) == -EACCES);
+    mu_assert("root 0777 without sticky refused",
+              vmaf_dnn_temp_dir_mode_ok((uid_t)0, all, me, 0) == -EACCES);
+    mu_assert("own 0770 refused", vmaf_dnn_temp_dir_mode_ok(me, m0770, me, 0) == -EACCES);
+    mu_assert("private 0700 ok", vmaf_dnn_temp_dir_mode_ok(me, (mode_t)S_IRWXU, me, 1) == 0);
+    mu_assert("private group read refused", vmaf_dnn_temp_dir_mode_ok(me, m0740, me, 1) == -EACCES);
+    mu_assert("private root owner refused",
+              vmaf_dnn_temp_dir_mode_ok((uid_t)0, (mode_t)S_IRWXU, me, 1) == -EACCES);
+    return NULL;
+}
+
+static char *test_tmpdir_rejects_symlink_into_shared_with_buffers(char *parent, char *child,
+                                                                  char *home, char *link)
+{
+    mu_assert("create parent directory",
+              setup_scratch_dir(parent, TEST_BUFFER_256, "linkparent") == 0);
+    int n = snprintf(child, TEST_BUFFER_512, "%s/private", parent);
+    mu_assert("child path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
+    if (mkdir(child, S_IRWXU) != 0 && errno != EEXIST)
+        return "create child directory";
+    mu_assert("set child 0700", set_directory_mode(child, S_IRWXU) == 0);
+    mu_assert("create link directory", setup_scratch_dir(home, TEST_BUFFER_256, "linkhome") == 0);
+    n = snprintf(link, TEST_BUFFER_512, "%s/tmpdir", home);
+    mu_assert("link path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
+    if (unlink(link) != 0 && errno != ENOENT)
+        return "remove stale symlink";
+    mu_assert("create symlink", symlink(child, link) == 0);
+    mu_assert("make parent 0777 without sticky", set_directory_mode(parent, 0777) == 0);
+    char *msg = check_invalid_tmpdir(link, -EACCES);
+    const int chmod_rc = set_directory_mode(parent, S_IRWXU);
+    const int rm_link = unlink(link);
+    const int rm_home = rmdir(home);
+    const int rm_child = rmdir(child);
+    const int rm_parent = rmdir(parent);
+    mu_assert("restore parent permissions", chmod_rc == 0);
+    mu_assert("remove symlink", rm_link == 0);
+    mu_assert("remove link directory", rm_home == 0);
+    mu_assert("remove child directory", rm_child == 0);
+    mu_assert("remove parent directory", rm_parent == 0);
+    return msg;
+}
+
+/* TMPDIR is a symlink, inside a private 0700 scratch directory, to a 0700
+ * directory whose parent is 0777 without the sticky bit: the lexical path
+ * passes, the resolved one must not (CodeRabbit 4658621520). */
+static char *test_tmpdir_rejects_symlink_into_shared_parent(void)
+{
+    char *parent = calloc(TEST_BUFFER_256, 1u);
+    char *child = calloc(TEST_BUFFER_512, 1u);
+    char *home = calloc(TEST_BUFFER_256, 1u);
+    char *link = calloc(TEST_BUFFER_512, 1u);
+    char *result = "allocation failed";
+    if (parent && child && home && link)
+        result = test_tmpdir_rejects_symlink_into_shared_with_buffers(parent, child, home, link);
+    free(parent);
+    free(child);
+    free(home);
+    free(link);
+    return result;
+}
+
+static char *test_tmpdir_rejects_other_owner_with_buffer(char *dir)
+{
+    mu_assert("create temporary directory",
+              setup_scratch_dir(dir, TEST_BUFFER_256, "otherowner") == 0);
+    const int dfd = openat(AT_FDCWD, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    mu_assert("open temporary directory", dfd >= 0);
+    const int chown_rc = fchown(dfd, (uid_t)65534, (gid_t)-1);
+    const int close_rc = close(dfd);
+    mu_assert("hand directory to another user", chown_rc == 0 && close_rc == 0);
+    char *msg = check_invalid_tmpdir(dir, -EACCES);
+    const int remove_rc = rmdir(dir);
+    mu_assert("remove test directory", remove_rc == 0);
+    return msg;
+}
+
+/* A 0700 TMPDIR owned by another user is refused (CodeRabbit 4658621513).
+ * Only root can hand a directory to another user, so other users skip it;
+ * test_tmpdir_mode_rule covers the rule for them. */
+static char *test_tmpdir_rejects_other_owner(void)
+{
+    if (geteuid() != 0)
+        return NULL;
+    char *dir = calloc(TEST_BUFFER_256, 1u);
+    if (!dir)
+        return "allocation failed";
+    char *result = test_tmpdir_rejects_other_owner_with_buffer(dir);
+    free(dir);
+    return result;
+}
+
 /* Scratch-dir + registry + bundle + onnx setup shared by
  * test_verify_cosign_not_on_path. Extracted for the branch-budget reason
  * noted on setup_fake_cosign_fixture above. */
@@ -1103,6 +1209,9 @@ static const MuTest platform_tests[] = {
     MU_TEST(test_tmpdir_accepts_sticky_shared_tmp),
     MU_TEST(test_tmpdir_accepts_private_dir_under_0755_parent),
     MU_TEST(test_tmpdir_rejects_unprotected_shared_ancestor),
+    MU_TEST(test_tmpdir_mode_rule),
+    MU_TEST(test_tmpdir_rejects_symlink_into_shared_parent),
+    MU_TEST(test_tmpdir_rejects_other_owner),
     MU_TEST(test_verify_bundle_rejects_parent_traversal),
     MU_TEST(test_verify_bundle_rejects_absolute_path),
     MU_TEST(test_verify_bundle_path_at_length_limit),

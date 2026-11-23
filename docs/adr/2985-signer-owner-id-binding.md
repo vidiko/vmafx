@@ -61,11 +61,17 @@ path (`vmaf_fullpath_utf8()`) that resolves outside the registry directory
 
 It then writes those checked bytes to `bundle` (`O_EXCL | O_NOFOLLOW`) inside a
 mode 0700 directory (`mkdtemp(3)`) created under an existing absolute directory
-in `TMPDIR` (or `/tmp` if unset or empty). The temporary-directory and
-sticky-bit checks are mandatory and cover both the selected base directory and
-every ancestor up to `/`: if the base or any ancestor is group- or
-other-writable without the sticky bit, verification logs the rejected directory
-and fails with `-EACCES` before `mkdtemp(3)` or cosign runs. It passes the
+in `TMPDIR` (or `/tmp` if unset or empty). The temporary-directory checks are
+mandatory. `TMPDIR` is first resolved with `realpath(3)`, so a symbolic link is
+judged by the directories it points into. The resolved path is then opened one
+directory at a time from `/` with `O_NOFOLLOW`, and every directory from `/`
+down to the base must be owned by root or the current user and must not be
+group- or other-writable unless it has the sticky bit. No other user can then
+rename or replace a directory on the path that cosign opens. If a directory
+fails, verification logs it and fails with `-EACCES` before `mkdtemp(3)` or
+cosign runs. The new directory is opened relative to the checked base, again
+without following a symbolic link, and must be owned by the current user with no
+group or other permission bits before `bundle` is created in it. It passes the
 private file to cosign together with the same identity as an anchored
 expression, `VMAF_DNN_SIGNER_IDENTITY_REGEXP`. A malformed bundle or a
 certificate of any other identity or owner returns `-EPROTO`, as a signature
