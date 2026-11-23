@@ -70,7 +70,7 @@ class HeavyLinkTargetsTest(unittest.TestCase):
                 "build_by_default": True,
             },
         ]
-        tests = [
+        tests: list[dict[str, object]] = [
             {
                 "name": "dnn_case",
                 "suite": ["libvmaf:dnn"],
