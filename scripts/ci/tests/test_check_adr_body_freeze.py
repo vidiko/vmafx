@@ -529,6 +529,44 @@ class FreezeTests(unittest.TestCase):
         self.check_change(original.replace("\ncleanup()", "\n    cleanup()"), 1, "## Context")
         self.check_change(original.replace("Old context.", "Old\ncontext."), 0)
 
+    def test_fenced_status_text_is_content(self) -> None:
+        fence = "```markdown\n- **Status**: Accepted\n```\n"
+        original = BASE.replace("Old context.", fence + "Old context.")
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(
+            original.replace(fence, fence.replace("Accepted", "Proposed")), 1, "## Context"
+        )
+        self.check_change(
+            original.replace(
+                fence,
+                fence.replace("Accepted\n", "Superseded\n> [!NOTE]\n> Superseded by ADR-9999\n"),
+            ),
+            1,
+            "## Context",
+        )
+        self.check_change(original.replace("Accepted", "Superseded", 1), 0)
+
+    def test_fenced_directive_is_content(self) -> None:
+        fence = "```markdown\n<!-- markdownlint-disable MD013 -->\n```\n"
+        original = BASE.replace("Old context.", fence + "Old context.")
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace(fence, "```markdown\n```\n"), 1, "## Context")
+        self.check_change("<!-- markdownlint-disable MD060 -->\n" + original, 0)
+
+    def test_fenced_link_destination_is_content(self) -> None:
+        original = BASE.replace(
+            "Old context.", "See [guide](a.md).\n```markdown\n[source](old.md)\n```\nOld context."
+        )
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(original.replace("[source](old.md)", "[source](new.md)"), 1, "## Context")
+        self.check_change(original.replace("[guide](a.md)", "[guide](b.md)"), 0)
+
     def test_references_edit_then_dated_update(self) -> None:
         for heading, expected in (
             ("### Status update 2026-11-20", 0),

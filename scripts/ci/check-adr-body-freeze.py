@@ -202,19 +202,29 @@ def references_edit(old: list[str], start: int, end: int) -> bool:
     )
 
 
-def allowed_replace(before: list[str], after: list[str], old: list[str], status: int) -> bool:
-    """Allow status changes with a note, or linewise status and link repairs."""
+def allowed_replace(
+    before: list[tuple[int, str]],
+    after: list[tuple[int, str]],
+    old: list[str],
+    status: int,
+    fenced: tuple[list[bool], list[bool]],
+) -> bool:
+    """Allow status changes with a note, or linewise status and link repairs.
+
+    Exemptions are by position and never apply to fenced lines.
+    """
     if (
         len(before) == 1
         and len(after) > 1
-        and before[0] == old[status]
-        and STATUS_RE.match(after[0])
-        and allowed_note(old, status + 1, after[1:], status)
+        and before[0][0] == status
+        and STATUS_RE.match(after[0][1])
+        and allowed_note(old, status + 1, [line for _, line in after[1:]], status)
     ):
         return True
     return len(before) == len(after) and all(
-        (old_line == old[status] and STATUS_RE.match(new_line)) or link_repair(old_line, new_line)
-        for old_line, new_line in zip(before, after, strict=True)
+        (i == status and STATUS_RE.match(new_line))
+        or (not fenced[0][i] and not fenced[1][j] and link_repair(old_line, new_line))
+        for (i, old_line), (j, new_line) in zip(before, after, strict=True)
     )
 
 
@@ -225,10 +235,14 @@ def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]
     for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
-        before = [line for line in old[a:b] if not DIRECTIVE.fullmatch(line)]
-        after = [line for line in new[c:d] if not DIRECTIVE.fullmatch(line)]
+        before = [
+            (i, old[i]) for i in range(a, b) if old_fenced[i] or not DIRECTIVE.fullmatch(old[i])
+        ]
+        after = [
+            (j, new[j]) for j in range(c, d) if new_fenced[j] or not DIRECTIVE.fullmatch(new[j])
+        ]
         fenced = any(old_fenced[a:b]) or any(new_fenced[c:d])
-        if formatting_only(tag, before, after, fenced):
+        if formatting_only(tag, [line for _, line in before], [line for _, line in after], fenced):
             continue
         if tag == "insert" and (
             (in_references(old, max(0, a - 1)) and references_tail(new, c, d))
@@ -238,7 +252,9 @@ def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]
             continue
         if tag != "insert" and references_edit(old, a, b) and references_tail(new, c, d):
             continue
-        if tag == "replace" and allowed_replace(before, after, old, status):
+        if tag == "replace" and allowed_replace(
+            before, after, old, status, (old_fenced, new_fenced)
+        ):
             continue
         failures.append((max(1, c + 1), section(old, a)))
     return failures
