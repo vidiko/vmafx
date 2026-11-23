@@ -33,11 +33,13 @@ torcul may call the `vmaf` CLI instead
 
 These apply to every package in the table:
 
-1. The torcul counterpart issue is **closed** with tests that cover the cases
-   exercised by the VMAFx package's own tests (`pkg/<package>/*_test.go`).
+1. Every torcul issue listed in the package's row must be **closed**, and each
+   must have tests that cover the cases exercised by the VMAFx package's own
+   tests (`pkg/<package>/*_test.go`).
 2. Each listed VMAFx importer drops its import of the package. Every importer
-   that stays must preserve its behaviour, shown by its existing tests passing
-   unchanged.
+   that stays must preserve its behaviour. Its existing test cases must still
+   pass with the same expected results. Test edits are limited to fixture
+   construction and imports that referenced the removed package.
 3. The VMAFx package is deleted in one pull request with a
    `changelog.d/removed/` fragment, a `!` conventional-commit subject, and a
    `Migration:` footer, because external Go code may import these paths
