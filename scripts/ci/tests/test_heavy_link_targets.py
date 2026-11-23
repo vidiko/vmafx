@@ -21,6 +21,8 @@ SCRIPT = ROOT / "scripts/ci/heavy_link_targets.py"
 MODULE = runpy.run_path(str(SCRIPT))
 PROFILES = MODULE["PROFILES"]
 select_targets = MODULE["select_targets"]
+validate_profile_links = MODULE["validate_profile_links"]
+mcp_shared_link_paths = MODULE["mcp_shared_link_paths"]
 is_test_consumed = MODULE["test_is_consumed"]
 equivalent_rows = MODULE["equivalent_rows"]
 option_map_from_tokens = MODULE["option_map_from_tokens"]
@@ -141,6 +143,37 @@ class HeavyLinkTargetsTest(unittest.TestCase):
         self.assertEqual(summary["twin"], "Ubuntu gcc+DNN,Ubuntu clang+DNN")
         self.assertEqual((summary["tests_linked"], summary["tests_left"]), (1, 1))
 
+    def test_consumed_test_selects_both_dependency_outputs(self) -> None:
+        targets, tests = self.sample_fixtures()
+        targets.append(
+            {
+                "id": "dnn_data@cus",
+                "name": "dnn_data",
+                "type": "custom",
+                "filename": [
+                    str(self.build / "test/dnn_input.bin"),
+                    str(self.build / "test/dnn_expected.bin"),
+                ],
+                "build_by_default": False,
+            }
+        )
+        tests[0]["depends"] = ["dnn_test@exe", "dnn_data@cus"]
+        paths, _ = select_targets("dnn", targets, tests, ["obj/a.o"], False, True, self.build)
+        self.assertIn("test/dnn_input.bin", paths)
+        self.assertIn("test/dnn_expected.bin", paths)
+
+    def test_profile_link_accepts_second_output_and_rejects_unknown_path(self) -> None:
+        targets, _ = self.sample_fixtures()
+        targets[0]["filename"] = [
+            str(self.build / "tools/vmaf.debug"),
+            str(self.build / "tools/vmaf"),
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "link path missing from introspection: tools/missing"
+        ):
+            validate_profile_links(["tools/missing"], targets, self.build)
+        validate_profile_links(["tools/vmaf"], targets, self.build)
+
     def test_netflix_twin_active_when_tier_full(self) -> None:
         targets, tests = self.sample_fixtures()
         paths, _ = select_targets(
@@ -214,6 +247,21 @@ class HeavyLinkTargetsTest(unittest.TestCase):
         )
         self.assertIn("test/other", paths)
         self.assertIn("src/libvmaf.so.1", paths)
+
+    def test_mcp_shared_link_paths_selects_matching_second_output(self) -> None:
+        targets = [
+            {
+                "id": "libvmafx@sha",
+                "name": "libvmafx",
+                "type": "shared library",
+                "filename": [
+                    str(self.build / "src/debug-symbols"),
+                    str(self.build / "src/libvmafx.so.1"),
+                ],
+                "build_by_default": True,
+            }
+        ]
+        self.assertEqual(mcp_shared_link_paths(targets, self.build), ["src/libvmafx.so.1"])
 
     def test_negative_cases_raise(self) -> None:
         targets, tests = self.sample_fixtures()
