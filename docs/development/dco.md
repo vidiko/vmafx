@@ -43,17 +43,18 @@ the whole text otherwise, with comment lines removed unless `commit.cleanup`
 keeps them. Attribution is checked on all text above the staged diff that `-v`
 writes.
 Under `core.commentChar=auto`, the hook uses the comment string of Git's own
-template lines.
+template lines. The hook reads `commit.cleanup` only from Git configuration and
+may check more text than Git stores when you pass `--cleanup=...` on the command
+line.
+The binding pull request range check, also run on pre-push, reads stored commit
+messages through `list_head_commit()` in `scripts/ci/check-dco.py`.
 
 Limits:
 
-- An exported `GIT_EDITOR=:` together with `-e`, and `--cleanup=` given on the
-  command line, are not visible to the hook.
+- With `-e` and an exported `GIT_EDITOR=:`, the hook treats the message as
+  unedited.
 - An editor-typed copy of Git's verbose suffix can hide text.
 - Git 2.56 deprecates `core.commentChar=auto` (removal planned for Git 3.0).
-
-The range check (`check-dco.py` on pre-push and in CI) reads the stored
-message and is the binding check.
 
 ## Check before you push
 
