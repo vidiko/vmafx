@@ -43,14 +43,10 @@ parser enforces:
    | CHANGELOG fragment| `^CHANGELOG\.md` or `^changelog\.d/<sec>/.*\.md` |
    | Rebase note       | `^docs/rebase-notes\.md$`                        |
 
-3. **Toolchain claims backed by probe output.** When the description claims a
-   toolchain is missing or code was not compiled (e.g. `SYCL was not compiled:
-   this host has no icpx` or `no nvcc`), `scripts/ci/check-toolchain-claims.sh`
-   verifies:
-   - A `toolchain-probe v1` output block from `scripts/dev/toolchain-probe.sh`
-     is pasted into the PR body.
-   - The probe block does not report that the claimed-missing toolchain was
-     actually `found` on the host.
+3. **Toolchain claims backed by probe output.** Paste the output of
+   `scripts/dev/toolchain-probe.sh` when claiming a toolchain is missing or a
+   backend was skipped. See [toolchain claims and probe verification](#toolchain-claims-and-probe-verification)
+   for the evidence required by `scripts/ci/check-toolchain-claims.sh`.
 
 ## Parser shape gotchas
 
@@ -291,29 +287,62 @@ compiled must be backed by evidence from the repository's probe script:
 scripts/dev/toolchain-probe.sh
 ```
 
-The script searches standard vendor directories (sourcing `setvars.sh` for
-oneAPI in a subshell) and emits reproducible verification lines:
+The script searches standard vendor directories and sources oneAPI's
+`setvars.sh` in a subshell. Paste its output into the description as text.
 
 ```text
 toolchain-probe v1 host=<host> os=<os> date=<date>
 toolchain-probe: icpx found /opt/intel/oneapi/compiler/2026.0/bin/icpx ...
 toolchain-probe: nvcc found /opt/cuda/bin/nvcc ...
+toolchain-probe: metal absent searched=none os=Linux
 ```
 
-The gate in `scripts/ci/check-toolchain-claims.sh` (invoked automatically by
-`scripts/ci/deliverables-check.sh` and `scripts/ci/validate-pr-body.sh`):
+On non-Darwin hosts, `scripts/dev/toolchain-probe.sh` emits the Metal absence
+row with the operating system from `uname -s`.
 
-- Refuses any missing-toolchain claim if the PR body lacks a `toolchain-probe
-  v1` block.
-- Refuses claims asserting a toolchain is absent when the pasted probe block
-  reports it `found`.
-- Accepts claims when the probe confirms the toolchain is `absent`.
-- Exempts lines inside fenced code blocks containing probe output.
-- Treats a bare "not compiled" line that names no host (for example "the
-  golden build has no CUDA backend: the changed files are not compiled") as a
-  build-configuration statement: it still needs a probe block, but a probe
-  that found the toolchain does not contradict it.
-- Runs first in `deliverables-check.sh`, before any section that can exit early.
+`scripts/ci/check-toolchain-claims.sh` requires a `toolchain-probe v1`
+header with nonempty `host=`, `os=`, and `date=` fields. A result must follow
+that header inside the same fence or, for unfenced output, in the same run
+of consecutive nonblank lines. A `found` row requires a path and an `absent`
+row requires `searched=` with a value. The checker skips valid probe lines
+in unfenced output and in fences with a valid header. It also checks claims
+in ordinary fenced text, blockquotes, and prose mixed into probe output.
+
+The checker recognizes `no <tool>` and `<tool> (is|was|were)? <status>`,
+where the status can be `not installed`, `not found`, `missing`,
+`unavailable`, or `absent`. The same tool vocabulary applies to
+`without <tool>` when the line also says `on this host`, `here`, or
+`locally`. It includes every probe name below and the aliases `cuda toolkit`,
+`oneapi`, `rocm`, and `hip cc`.
+
+For compilation claims, the checker also recognizes the backend names
+`cuda`, `sycl`, `hip`, and `vulkan`. A backend or toolchain must appear on
+the same line as `not compiled`, `was not built`, `were not built`, or
+`compilation skipped` with optional `was` or `were`. Compilation claims
+require probe results. A `found` row contradicts an absence claim or
+a compilation claim about the build host. For example, the checker accepts
+`nvcc found` as evidence for a line describing a CPU-only build that did
+not compile CUDA.
+
+The checker uses the same mapping for required results and contradictions.
+If a claim line names compilers explicitly, only those probe rows apply.
+Otherwise the checker uses the backend aliases.
+
+| Probe result name | Claim words mapped to it |
+| --- | --- |
+| `icpx` | `icpx`, `sycl`, `oneapi` |
+| `icx` | `icx` |
+| `nvcc` | `nvcc`, `cuda`, `cuda toolkit` |
+| `hipcc` | `hipcc`, `hip cc`, `hip`, `rocm` |
+| `glslc` | `glslc`, `vulkan` |
+| `glslangValidator` | `glslangValidator` |
+| `metal` | `metal` |
+| `x86_64-w64-mingw32-gcc` | `x86_64-w64-mingw32-gcc` |
+
+`scripts/ci/deliverables-check.sh` runs the checker after body validation and
+before deliverables sections that can exit early, including the render-only
+route. `scripts/ci/validate-pr-body.sh` delegates to the same deliverables
+script.
 
 ## History
 

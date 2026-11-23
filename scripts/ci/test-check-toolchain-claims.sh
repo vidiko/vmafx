@@ -10,7 +10,7 @@
 #   - Negative planted: claim without probe -> fail (exit 1)
 #   - Negative planted: claim with probe saying found -> fail (exit 1)
 #   - Boundary: no claim -> pass (exit 0)
-#   - Boundary: claim inside probe fenced block -> pass (exit 0)
+#   - Boundary: probe rows are exempt, prose inside fences is checked
 #   - Probe stub test: fake setvars.sh exporting PATH to stub icpx -> found
 #   - Probe empty prefix test: empty prefix -> absent
 
@@ -112,7 +112,7 @@ All unit and regression tests pass.
 EOF
 expect_gate_exit "boundary: clean body with no claim -> exit 0" 0 "${work}/case4_clean.md"
 
-# ---------- Case 5: Boundary — claim only inside probe fenced block -> pass (exit 0) ----------
+# ---------- Case 5: Boundary — probe rows alone -> pass (exit 0) ----------
 cat >"${work}/case5_probe_only.md" <<'EOF'
 ## Summary
 
@@ -124,7 +124,7 @@ toolchain-probe: icpx absent searched=/opt/intel/oneapi/setvars.sh
 toolchain-probe: nvcc found /opt/cuda/bin/nvcc nvcc: NVIDIA (R) Cuda compiler driver
 ```
 EOF
-expect_gate_exit "boundary: claim inside probe fenced block only -> exit 0" 0 "${work}/case5_probe_only.md"
+expect_gate_exit "boundary: probe rows alone -> exit 0" 0 "${work}/case5_probe_only.md"
 
 # ---------- Case 6: CUDA claim without probe vs with probe ----------
 cat >"${work}/case6_cuda_no_probe.md" <<'EOF'
@@ -291,7 +291,7 @@ toolchain-probe v1 host=test-box os=Linux date=2026-11-04T00:00:00Z
 EOF
 expect_gate_exit "planted: claim with header-only probe -> exit 1" 1 "${work}/case13_header_only_probe.md"
 
-# ---------- Case 14: Fence matching — inner non-matching fence line treated as block content -> pass (exit 0) ----------
+# ---------- Case 14: A non-matching fence marker leaves scope open ----------
 cat >"${work}/case14_inner_fence.md" <<'EOF'
 ## Summary
 
@@ -301,12 +301,13 @@ Probe output containing inner fence markers:
 toolchain-probe v1 host=test-box os=Linux date=2026-11-04T00:00:00Z
 toolchain-probe: icpx found /opt/intel/oneapi/bin/icpx 2026.0
 ~~~
-no icpx on this host
+toolchain-probe: nvcc absent searched=PATH
+No nvcc on this host
 ```
 EOF
-expect_gate_exit "fence matching: inner fence treated as block content in probe block -> exit 0" 0 "${work}/case14_inner_fence.md"
+expect_gate_exit "different fence marker keeps subsequent probe result in scope" 0 "${work}/case14_inner_fence.md"
 
-# ---------- Case 15: Fence matching — 4-backtick opener not closed by 3 backticks -> pass (exit 0) ----------
+# ---------- Case 15: A shorter fence marker leaves scope open ----------
 cat >"${work}/case15_fence_length.md" <<'EOF'
 ## Summary
 
@@ -316,10 +317,11 @@ Probe block opened with 4 backticks containing 3-backtick line:
 toolchain-probe v1 host=test-box os=Linux date=2026-11-04T00:00:00Z
 toolchain-probe: icpx found /opt/intel/oneapi/bin/icpx 2026.0
 ```
-no icpx on this host
+toolchain-probe: nvcc absent searched=PATH
+No nvcc on this host
 ````
 EOF
-expect_gate_exit "fence matching: 4-backtick opener not closed by 3 backticks -> exit 0" 0 "${work}/case15_fence_length.md"
+expect_gate_exit "shorter fence marker keeps subsequent probe result in scope" 0 "${work}/case15_fence_length.md"
 
 # ---------- Case 16: Word boundary — shipping does not match hip with hipcc found -> exit 0 ----------
 cat >"${work}/case16_shipping_no_false_contradiction.md" <<'EOF'
@@ -350,7 +352,7 @@ expect_gate_exit "planted: claim naming nvcc and hipcc with probe for nvcc only 
 
 partial_rc=0
 out_partial="$(env -u PR_BODY "${gate}" <"${work}/case17_partial_probe_missing_hipcc.md" 2>&1)" || partial_rc=$?
-if [[ "${partial_rc}" -eq 1 && "${out_partial}" =~ hipcc ]]; then
+if [[ "${partial_rc}" -eq 1 && "${out_partial}" == *"missing probe results for claimed toolchains: hipcc"* ]]; then
   echo "PASS: partial probe failure message names missing toolchain hipcc"
   pass_count=$((pass_count + 1))
 else
@@ -375,6 +377,117 @@ toolchain-probe: hipcc absent searched=PATH,/opt/rocm
 EOF
 expect_gate_exit "positive: claim naming nvcc and hipcc with full probe -> exit 0" 0 "${work}/case18_full_probe_nvcc_hipcc.md"
 
+expect_body() {
+  local name="$1" expected="$2" body="$3"
+  printf '%s' "${body}" >"${work}/inline-body.md"
+  expect_gate_exit "${name}" "${expected}" "${work}/inline-body.md"
+}
+
+# Only strict probe lines can be exempt, even in a fence with a header.
+header='toolchain-probe v1 host=test-box os=Linux date=2026-11-04T00:00:00Z'
+absent_nvcc='toolchain-probe: nvcc absent searched=PATH'
+found_nvcc='toolchain-probe: nvcc found /opt/cuda/bin/nvcc 13.0'
+fence='```'
+expect_body "a probe mention does not exempt a fence" 1 "${fence}text
+# run toolchain-probe
+no nvcc
+${fence}"
+expect_body "a probe prefix does not exempt prose" 1 'toolchain-probe could not run because no nvcc'
+expect_body "a real probe fence still checks prose" 1 "${fence}text
+${header}
+${found_nvcc}
+no nvcc
+${fence}"
+expect_body "a probe result alone does not exempt a fence" 1 "${fence}text
+toolchain-probe: icpx found /opt/intel/oneapi/bin/icpx no nvcc
+${fence}"
+expect_body "an ordinary fence still checks claims" 1 "${fence}text
+no nvcc
+${fence}"
+expect_body "a blockquote still checks claims" 1 '> no nvcc'
+expect_body "explicitly empty PR_BODY passes" 0 ''
+
+expect_body "bare header and absent row lack required fields" 1 'No nvcc
+toolchain-probe v1
+toolchain-probe: nvcc absent'
+expect_body "a result before its header cannot cover a claim" 1 "No nvcc
+${absent_nvcc}
+${header}"
+expect_body "a blank line separates raw evidence" 1 "No nvcc
+${header}
+
+${absent_nvcc}"
+expect_body "a fence boundary separates evidence" 1 "No nvcc
+${fence}text
+${header}
+${fence}
+${fence}text
+${absent_nvcc}
+${fence}"
+expect_body "a found row needs a path" 1 "CUDA was not compiled
+${header}
+toolchain-probe: nvcc found"
+expect_body "an absent row needs searched directories" 1 "No nvcc
+${header}
+toolchain-probe: nvcc absent PATH"
+expect_body "raw evidence may follow a header with no intervening blank line" 0 "No nvcc
+${header}
+${absent_nvcc}"
+
+expect_body "Metal absence needs evidence" 1 'no metal'
+expect_body "glslangValidator absence needs evidence" 1 'no glslangValidator'
+expect_body "glslc missing needs evidence" 1 'glslc is missing'
+expect_body "nvcc not found needs evidence" 1 'nvcc was not found'
+expect_body "MinGW absence needs evidence" 1 'no x86_64-w64-mingw32-gcc'
+expect_body "without a tool in a build configuration passes" 0 'The CPU-only job builds without nvcc'
+expect_body "without a tool here needs evidence" 1 'The build runs without nvcc here'
+expect_body "without a tool on this host needs evidence" 1 'The build runs without nvcc on this host'
+expect_body "without a tool locally needs evidence" 1 'The build runs without nvcc locally'
+expect_body "CUDA skipping compilation needs evidence" 1 'CUDA compilation was skipped'
+expect_body "CUDA not built needs evidence" 1 'CUDA was not built'
+expect_body "a document is not a toolchain compilation claim" 0 'This document is not compiled into the binary'
+
+expect_body "a backend alias is not a probe result name" 1 "No nvcc
+
+${fence}text
+${header}
+toolchain-probe: cuda absent searched=PATH
+${fence}"
+expect_body "explicit icpx takes precedence over the SYCL alias" 0 "SYCL was not compiled because there is no icpx
+
+${fence}text
+${header}
+toolchain-probe: icpx absent searched=PATH,/opt/intel/oneapi
+toolchain-probe: icx found /opt/intel/oneapi/bin/icx 2026.0
+${fence}"
+expect_body "backend-only SYCL needs icpx evidence" 1 "SYCL was not compiled locally
+${header}
+toolchain-probe: icx absent searched=PATH"
+expect_body "the Linux Metal row covers a host compilation claim" 0 "Metal was not compiled locally
+
+${fence}text
+${header}
+toolchain-probe: icpx absent searched=PATH
+toolchain-probe: icx absent searched=PATH
+${absent_nvcc}
+toolchain-probe: hipcc absent searched=PATH
+toolchain-probe: glslc absent searched=PATH
+toolchain-probe: glslangValidator absent searched=PATH
+toolchain-probe: metal absent searched=none os=Linux
+toolchain-probe: x86_64-w64-mingw32-gcc absent searched=PATH
+${fence}"
+
+probe_os="$(uname -s)"
+if [[ "${probe_os}" != Darwin ]]; then
+  if [[ "${probe_empty_out}" == *"toolchain-probe: metal absent searched=none os=${probe_os}"* ]]; then
+    echo "PASS: non-Darwin probe emits the Metal absence row"
+    pass_count=$((pass_count + 1))
+  else
+    echo "FAIL: non-Darwin probe is missing the Metal absence row"
+    fail_count=$((fail_count + 1))
+  fi
+fi
+
 # ---------- Case 12: deliverables-check.sh integration test ----------
 deliv_script="${repo_root}/scripts/ci/deliverables-check.sh"
 deliv_exit=0
@@ -388,6 +501,26 @@ if [ "${deliv_exit}" -eq 1 ] &&
   pass_count=$((pass_count + 1))
 else
   echo "FAIL: deliverables-check.sh did not propagate failure (exit=${deliv_exit})"
+  fail_count=$((fail_count + 1))
+fi
+
+# A stub is needed because the caller always supplies the child's PR_BODY.
+mkdir "${work}/child-exit"
+cp "${deliv_script}" "${repo_root}/scripts/ci/"{pr-body-input,pr-diff-base}.sh "${work}/child-exit/"
+cat >"${work}/child-exit/check-toolchain-claims.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo 'fixture: toolchain claims child exit 2' >&2
+exit 2
+EOF
+deliv_exit=0
+deliv_out="$(PR_BODY='A valid description.' bash "${work}/child-exit/deliverables-check.sh" 2>&1)" ||
+  deliv_exit=$?
+if [[ "${deliv_exit}" -eq 2 && "${deliv_out}" == *"fixture: toolchain claims child exit 2"* ]]; then
+  echo "PASS: deliverables-check.sh propagates the child usage error (exit=2)"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: deliverables-check.sh did not propagate the child usage error (exit=${deliv_exit})"
   fail_count=$((fail_count + 1))
 fi
 

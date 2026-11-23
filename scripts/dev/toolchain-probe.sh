@@ -9,7 +9,7 @@
 #   - CUDA: nvcc
 #   - ROCm: hipcc
 #   - Vulkan: glslc, glslangValidator
-#   - Metal: xcrun metal (macOS only)
+#   - Metal: xcrun metal on macOS, reported absent on other hosts
 #   - MinGW cross: x86_64-w64-mingw32-gcc — thread model, runtime DLL
 #     resolution and the objdump pairing check (Linux -> Windows)
 #
@@ -291,7 +291,8 @@ probe_vulkan_tool() {
 }
 
 probe_metal() {
-  if [ "$(uname -s)" != "Darwin" ]; then
+  if [ "${os_name}" != "Darwin" ]; then
+    printf "toolchain-probe: metal absent searched=none os=%s\n" "${os_name}"
     return 0
   fi
   local tool="metal"
