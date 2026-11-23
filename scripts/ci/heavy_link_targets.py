@@ -96,32 +96,57 @@ def rel_filename(build_dir: Path, filename: str) -> str:
     return path.as_posix()
 
 
+def target_outputs(row: dict[str, Any], build_dir: Path) -> list[str]:
+    filenames = row.get("filename")
+    # bound: filename list length per target
+    if (
+        not isinstance(filenames, list)
+        or not filenames
+        or any(not isinstance(filename, str) for filename in filenames)
+    ):
+        raise ValueError(f"target {row.get('id')!r} filename must be a nonempty list of strings")
+    # bound: filename list length per target
+    return [rel_filename(build_dir, filename) for filename in filenames]
+
+
 def mcp_shared_link_paths(targets_json: list[dict[str, Any]], build_dir: Path) -> list[str]:
     paths: list[str] = []
     # bound: intro-targets.json entry count
     for row in targets_json:
         if row.get("type") != "shared library":
             continue
-        filename = row.get("filename")
-        if not isinstance(filename, str):
-            continue
-        rel = rel_filename(build_dir, filename)
-        base = Path(rel).name
-        # bound: configured MCP shared-library prefixes
-        if any(base.startswith(prefix) for prefix in MCP_SHARED_PREFIXES):
-            paths.append(rel)
+        # bound: filename list length per shared-library target
+        for path in target_outputs(row, build_dir):
+            if Path(path).name.startswith(MCP_SHARED_PREFIXES):
+                paths.append(path)
     return paths
+
+
+def test_in_suite(test: dict[str, Any], selector: str) -> bool:
+    tags = test.get("suite")
+    if not isinstance(tags, list):
+        return False
+    selected_project, _, selected_suite = selector.partition(":")
+    # bound: Meson suite tags per test
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        project, _, suite = tag.partition(":")
+        if not selected_suite:
+            matches = selected_project in (project, suite)
+        else:
+            matches = suite == selected_suite and selected_project in ("", project)
+        if matches:
+            return True
+    return False
 
 
 def test_is_consumed(test: dict[str, Any], suites: tuple[str, ...], names: tuple[str, ...]) -> bool:
     name = test.get("name")
     if isinstance(name, str) and name in names:
         return True
-    suite = test.get("suite")
-    if not isinstance(suite, list):
-        return False
-    # bound: meson suite tags per test (small)
-    return any(isinstance(tag, str) and tag in suites for tag in suite)
+    # bound: configured consumed suite selectors
+    return any(test_in_suite(test, selector) for selector in suites)
 
 
 def depends_paths(
@@ -143,9 +168,7 @@ def depends_paths(
             row.get("type") != "executable" or not row.get("build_by_default")
         ):
             continue
-        filename = row.get("filename")
-        if isinstance(filename, str):
-            paths.append(rel_filename(build_dir, filename))
+        paths.extend(target_outputs(row, build_dir))
     return paths
 
 
@@ -169,9 +192,10 @@ def validate_profile_links(
 ) -> None:
     # bound: intro-targets.json entry count
     known_outputs = {
-        rel_filename(build_dir, str(row["filename"]))
+        path
         for row in targets_json
-        if isinstance(row.get("filename"), str)
+        # bound: filename list length per target
+        for path in target_outputs(row, build_dir)
     }
     # bound: configured link paths (small)
     for path in links:
@@ -189,11 +213,7 @@ def validate_profile_tests(profile: dict[str, Any], tests_json: list[dict[str, A
     # bound: configured consumed suites (small)
     for suite in profile["test_suites"]:
         # bound: intro-tests.json entry count
-        found = any(
-            isinstance(test.get("suite"), list) and suite in test["suite"]
-            for test in tests_json
-            if isinstance(test, dict)
-        )
+        found = any(test_in_suite(test, suite) for test in tests_json if isinstance(test, dict))
         if not found:
             raise ValueError(f"consumed test suite absent from introspection: {suite}")
 

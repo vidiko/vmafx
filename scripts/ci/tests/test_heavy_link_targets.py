@@ -21,13 +21,14 @@ SCRIPT = ROOT / "scripts/ci/heavy_link_targets.py"
 MODULE = runpy.run_path(str(SCRIPT))
 PROFILES = MODULE["PROFILES"]
 select_targets = MODULE["select_targets"]
+is_test_consumed = MODULE["test_is_consumed"]
 equivalent_rows = MODULE["equivalent_rows"]
 option_map_from_tokens = MODULE["option_map_from_tokens"]
 
 
 class HeavyLinkTargetsTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.build = Path(tempfile.mkdtemp())
+        self.build = Path(tempfile.mkdtemp()).resolve()
 
     def sample_fixtures(self) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         targets = [
@@ -35,53 +36,93 @@ class HeavyLinkTargetsTest(unittest.TestCase):
                 "id": "vmaf@exe",
                 "name": "vmaf",
                 "type": "executable",
-                "filename": str(self.build / "tools/vmaf"),
+                "filename": [str(self.build / "tools/vmaf")],
                 "build_by_default": True,
             },
             {
                 "id": "dnn_test@exe",
                 "name": "dnn_test",
                 "type": "executable",
-                "filename": str(self.build / "test/dnn_test"),
+                "filename": [str(self.build / "test/dnn_test")],
                 "build_by_default": True,
             },
             {
                 "id": "other@exe",
                 "name": "other",
                 "type": "executable",
-                "filename": str(self.build / "test/other"),
+                "filename": [str(self.build / "test/other")],
                 "build_by_default": True,
             },
             {
                 "id": "optout@exe",
                 "name": "optout",
                 "type": "executable",
-                "filename": str(self.build / "test/optout"),
+                "filename": [str(self.build / "test/optout")],
                 "build_by_default": False,
             },
             {
                 "id": "libvmaf@sha",
                 "name": "libvmaf",
                 "type": "shared library",
-                "filename": str(self.build / "src/libvmaf.so.1"),
+                "filename": [str(self.build / "src/libvmaf.so.1")],
                 "build_by_default": True,
             },
         ]
         tests = [
             {
                 "name": "dnn_case",
-                "suite": ["dnn"],
+                "suite": ["libvmaf:dnn"],
                 "cmd": [],
                 "depends": ["dnn_test@exe"],
             },
             {
                 "name": "other_case",
-                "suite": ["fast"],
+                "suite": ["libvmaf:fast"],
                 "cmd": [],
                 "depends": ["other@exe"],
             },
         ]
         return targets, tests
+
+    def test_rejects_string_target_filename(self) -> None:
+        targets, tests = self.sample_fixtures()
+        targets[0]["filename"] = str(self.build / "tools/vmaf")
+        with self.assertRaisesRegex(ValueError, "vmaf@exe"):
+            select_targets("netflix-golden", targets, tests, ["obj/a.o"], True, True, self.build)
+
+    def test_rejects_empty_target_filename_list(self) -> None:
+        targets, tests = self.sample_fixtures()
+        targets[0]["filename"] = []
+        with self.assertRaisesRegex(ValueError, "vmaf@exe"):
+            select_targets("netflix-golden", targets, tests, ["obj/a.o"], True, True, self.build)
+
+    def test_rejects_missing_target_filename(self) -> None:
+        targets, tests = self.sample_fixtures()
+        del targets[0]["filename"]
+        with self.assertRaisesRegex(ValueError, "vmaf@exe"):
+            select_targets("netflix-golden", targets, tests, ["obj/a.o"], True, True, self.build)
+
+    def test_rejects_non_string_target_filename_element(self) -> None:
+        targets, tests = self.sample_fixtures()
+        targets[0]["filename"] = [str(self.build / "tools/vmaf"), 17]
+        with self.assertRaisesRegex(ValueError, "vmaf@exe"):
+            select_targets("netflix-golden", targets, tests, ["obj/a.o"], True, True, self.build)
+
+    def test_bare_selector_matches_suite(self) -> None:
+        self.assertTrue(is_test_consumed({"suite": ["libvmaf:dnn"]}, ("dnn",), ()))
+
+    def test_bare_selector_rejects_suite_prefix_match(self) -> None:
+        self.assertFalse(is_test_consumed({"suite": ["libvmaf:dnnx"]}, ("dnn",), ()))
+
+    def test_bare_selector_matches_project(self) -> None:
+        self.assertTrue(is_test_consumed({"suite": ["dnn:fast"]}, ("dnn",), ()))
+
+    def test_suite_only_and_project_qualified_selectors(self) -> None:
+        dnn = {"suite": ["libvmaf:dnn"]}
+        self.assertTrue(is_test_consumed(dnn, (":dnn",), ()))
+        self.assertFalse(is_test_consumed({"suite": ["dnn:fast"]}, (":dnn",), ()))
+        self.assertTrue(is_test_consumed(dnn, ("libvmaf:dnn",), ()))
+        self.assertFalse(is_test_consumed({"suite": ["other:dnn"]}, ("libvmaf:dnn",), ()))
 
     def test_dnn_twin_active_skips_unconsumed_tests(self) -> None:
         targets, tests = self.sample_fixtures()
@@ -157,11 +198,11 @@ class HeavyLinkTargetsTest(unittest.TestCase):
                     "id": ident,
                     "name": name,
                     "type": "executable",
-                    "filename": str(self.build / f"test/{name}"),
+                    "filename": [str(self.build / f"test/{name}")],
                     "build_by_default": True,
                 }
             )
-            tests.append({"name": name, "suite": ["mcp"], "cmd": [], "depends": [ident]})
+            tests.append({"name": name, "suite": ["libvmaf:mcp"], "cmd": [], "depends": [ident]})
         paths, _ = select_targets(
             "mcp-smoke",
             targets,
@@ -375,15 +416,15 @@ class CliHeavyLinkTargetsTest(unittest.TestCase):
     def write_netflix_introspection(self) -> None:
         self.write_introspection(
             [
-                {"id": "vmaf", "type": "executable", "filename": "tools/vmaf"},
+                {"id": "vmaf", "type": "executable", "filename": [str(self.build / "tools/vmaf")]},
                 {
                     "id": "one",
                     "type": "executable",
-                    "filename": "test/one",
+                    "filename": [str(self.build / "test/one")],
                     "build_by_default": True,
                 },
             ],
-            [{"name": "one", "suite": ["fast"], "depends": ["one"]}],
+            [{"name": "one", "suite": ["libvmaf:fast"], "depends": ["one"]}],
         )
 
     def assert_netflix_summary(self, result: TextCommandResult, twin: str) -> None:
