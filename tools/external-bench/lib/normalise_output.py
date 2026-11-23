@@ -110,9 +110,9 @@ def summary_values(raw: dict[str, object]) -> dict[str, float | int]:
 
 
 def runtime_total(raw: dict[str, object], frames: list[Row]) -> float:
-    """The reported total runtime, or the sum of the frame runtimes."""
+    """The reported total runtime, or the sum of the frame runtimes; both must be finite."""
     if "runtime_total_ms" not in raw:
-        return float(sum(frame["runtime_ms"] for frame in frames))
+        return finite(float(sum(frame["runtime_ms"] for frame in frames)), "runtime_total_ms")
     return finite(raw["runtime_total_ms"], "runtime_total_ms")
 
 
@@ -144,7 +144,7 @@ def main(argv: list[str]) -> int:
     except NormaliseError as exc:
         print(f"normalise_output: {competitor}: {exc}", file=sys.stderr)
         return 1
-    dst.write_text(json.dumps(document, indent=2))
+    dst.write_text(json.dumps(document, indent=2, allow_nan=False))
     return 0
 
 

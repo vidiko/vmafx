@@ -28,7 +28,7 @@ A measurement that was not taken, failed, or cannot be compared is an explicit n
 `scripts/perf/check-regression.py`:
 
 - Every cell that is not compared carries one of four states: `missing` (on one side only), `failed` (status not `ok`, or current median absent or not numeric), `skipped` (baseline status `skip`), or `incomparable` (workload field differs, hardware model differs or is absent, or baseline median not positive). The hardware check uses `cpu_model` for CPU cells and `gpu_model` for every other backend.
-- Exit codes: 0 when every cell was compared and none regressed, 1 on a regression, 2 on an input error (including a malformed `runs`), 3 when at least one cell was not compared. A regression outranks exit 3.
+- Exit codes: 0 when every cell was compared and none regressed, 1 on a regression, 2 on an input error (including a malformed `runs`), 3 when at least one cell was not compared or no cell for the requested backends is in either input. A regression outranks exit 3.
 - `--advisory` masks only exit 1. `--skip-if-no-baseline` stops before comparing and exits 3.
 - `--backend` remains the way to leave out a backend the host does not have.
 

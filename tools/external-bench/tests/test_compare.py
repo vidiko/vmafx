@@ -905,6 +905,17 @@ def test_normalise_output_sums_runtime_without_total(tmp_path: pathlib.Path) -> 
     assert data["summary"]["runtime_total_ms"] == pytest.approx(NORMALISED_RUNTIME_TOTAL_MS)
 
 
+def test_normalise_output_rejects_overflowing_runtime_sum(tmp_path: pathlib.Path) -> None:
+    dst = tmp_path / "norm.json"
+    raw = _complete_raw_payload(include_runtime_total=False)
+    raw["frames"][0]["runtime_ms"] = 1e308
+    raw["frames"][1]["runtime_ms"] = 1e308
+    proc = _invoke_normalise_output(tmp_path, raw)
+    assert proc.returncode == 1
+    assert "runtime_total_ms is not numeric" in proc.stderr
+    assert not dst.is_file()
+
+
 def test_normalise_output_rejects_frames_that_are_not_a_list(tmp_path: pathlib.Path) -> None:
     dst = tmp_path / "norm.json"
     raw = _complete_raw_payload()

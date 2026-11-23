@@ -63,6 +63,15 @@ def _filter_backends(
     return {k: v for k, v in cells.items() if k[1] in wanted}
 
 
+def _selected_cells(
+    payload: dict[str, Any],
+    *,
+    backends: Sequence[str] | None,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Index and optionally filter payload runs to the requested backends."""
+    return _filter_backends(_index_runs(payload), backends=backends)
+
+
 def _hardware(payload: dict[str, Any]) -> dict[str, Any]:
     """Return the payload hardware dict, or empty when absent or malformed."""
     hw = payload.get("hardware")
@@ -200,8 +209,8 @@ def compare_runs(
     current median_ms exceeds baseline by > tolerance_pct. The third list holds
     every cell that was not compared, each with a ``state``.
     """
-    base = _filter_backends(_index_runs(baseline), backends=backends)
-    cur = _filter_backends(_index_runs(current), backends=backends)
+    base = _selected_cells(baseline, backends=backends)
+    cur = _selected_cells(current, backends=backends)
     base_hw = _hardware(baseline)
     cur_hw = _hardware(current)
 
@@ -352,6 +361,29 @@ def _not_compared_counts(not_compared: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def _precheck(
+    args: argparse.Namespace,
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+) -> int | None:
+    """Validate inputs and short-circuit before compare_runs; return an exit code or None."""
+    base_cells = _selected_cells(baseline, backends=args.backend)
+    cur_cells = _selected_cells(current, backends=args.backend)
+    if args.skip_if_no_baseline and not _baseline_has_ok_cells(baseline, backends=args.backend):
+        sys.stderr.write(
+            "perf-regression-gate: baseline has no ok cells for the requested "
+            "backend(s); not compared (exit 3)\n"
+        )
+        return _EXIT_NOT_COMPARED
+    if not base_cells and not cur_cells:
+        sys.stderr.write(
+            "perf-regression-gate: no cell for the requested backend(s) in either "
+            "input; nothing compared (exit 3)\n"
+        )
+        return _EXIT_NOT_COMPARED
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point."""
     args = parse_args(argv)
@@ -363,12 +395,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _EXIT_INPUT
 
     try:
-        if args.skip_if_no_baseline and not _baseline_has_ok_cells(baseline, backends=args.backend):
-            sys.stderr.write(
-                "perf-regression-gate: baseline has no ok cells for the requested "
-                "backend(s); not compared (exit 3)\n"
-            )
-            return _EXIT_NOT_COMPARED
+        precheck = _precheck(args, baseline, current)
+        if precheck is not None:
+            return precheck
 
         regressions, improvements, not_compared = compare_runs(
             baseline,

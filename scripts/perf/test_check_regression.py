@@ -445,6 +445,46 @@ def test_skip_if_no_baseline_proceeds_when_baseline_has_ok_cells(
     assert exit_code == 1
 
 
+def test_skip_if_no_baseline_rejects_malformed_baseline_runs(tmp_path: Path) -> None:
+    """A malformed baseline `runs` is an input error even with --skip-if-no-baseline."""
+    baseline: dict[str, Any] = {"schema_version": "1", "runs": "not-a-list"}
+    current = _baseline_payload()
+    exit_code = _run_main(tmp_path, baseline, current, "--skip-if-no-baseline")
+    assert exit_code == check_regression._EXIT_INPUT
+
+
+def test_skip_if_no_baseline_rejects_malformed_current_runs(tmp_path: Path) -> None:
+    """A malformed current `runs` is an input error even with --skip-if-no-baseline."""
+    baseline = _baseline_payload()
+    current: dict[str, Any] = {"schema_version": "1", "runs": "not-a-list"}
+    exit_code = _run_main(tmp_path, baseline, current, "--skip-if-no-baseline")
+    assert exit_code == check_regression._EXIT_INPUT
+
+
+def test_backend_without_cells_is_not_compared(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --backend that matches no cell compares nothing and must not exit 0."""
+    baseline = _baseline_payload()
+    current = deepcopy(baseline)
+    exit_code = _run_main(tmp_path, baseline, current, "--backend", "vulkan")
+    assert exit_code == check_regression._EXIT_NOT_COMPARED
+    captured = capsys.readouterr()
+    assert "All cells within tolerance." not in captured.out
+    assert "nothing compared" in captured.err
+
+
+def test_empty_runs_are_not_compared(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Two inputs with empty `runs` compare nothing and must not exit 0."""
+    baseline: dict[str, Any] = {"schema_version": "1", "runs": []}
+    current: dict[str, Any] = {"schema_version": "1", "runs": []}
+    exit_code = _run_main(tmp_path, baseline, current)
+    assert exit_code == check_regression._EXIT_NOT_COMPARED
+    captured = capsys.readouterr()
+    assert "All cells within tolerance." not in captured.out
+    assert "nothing compared" in captured.err
+
+
 def test_baseline_has_ok_cells_respects_backend_filter() -> None:
     """_baseline_has_ok_cells must filter by backend when backends is given."""
     baseline = _baseline_payload()

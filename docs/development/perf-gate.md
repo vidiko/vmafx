@@ -38,7 +38,7 @@ a backend the host does not have.
 | 0 | Every cell compared, none regressed |
 | 1 | At least one regression (masked by `--advisory`) |
 | 2 | Input error: unreadable file, malformed JSON or a `runs` value that is not a list |
-| 3 | At least one cell not compared, or `--skip-if-no-baseline` found no `ok` baseline cell |
+| 3 | At least one cell not compared, no cell for the requested backends in either input, or `--skip-if-no-baseline` found no `ok` baseline cell |
 
 A regression outranks exit 3. `--advisory` masks only exit 1, so an advisory
 run still exits 3 when a cell was not compared.
