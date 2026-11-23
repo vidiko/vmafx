@@ -396,8 +396,25 @@ package operations use the snapshot, with fail-closed refreshes and retries.
 Those refreshes still download the live `archive.ubuntu.com` and
 `security.ubuntu.com` indexes as shadowed entries that APT does not resolve
 from, so a build needs both those hosts and `snapshot.ubuntu.com` reachable.
-A snapshot outage fails the refresh instead of falling back. CUDA's exact vendor-package lock remains separate; oneAPI repository pinning
-is tracked by issue 3190.
+A snapshot outage fails the refresh.
+
+All three Ubuntu development images keep only the inherited `ubuntu.sources`
+active during the build. They hold every other entry from
+`/etc/apt/sources.list.d` in `/etc/apt/vmafx-held-sources` before the first
+refresh, then restore the entries after package installation. This keeps the
+SYCL build independent of the live oneAPI and Intel graphics indexes
+configured by its base image. An active legacy `/etc/apt/sources.list`, a
+missing archive file, a pre-existing holding directory, or a restore name
+clash fails the build.
+
+The CUDA installer adds its NVIDIA source after the hold by installing the
+CUDA keyring. APT can then read that source for the toolkit installation and
+the subsequent Ubuntu setup. Restore checks for name clashes before moving
+the held entries, so it cannot overwrite the NVIDIA source. The final image
+contains both its inherited sources and any source added by the installer.
+CUDA's exact vendor-package lock remains separate, and oneAPI repository
+pinning remains tracked by issue 3190. See
+[ADR-3626](../adr/3626-dev-image-base-apt-source-allowlist.md).
 
 Renovate proposes a seven-day-old UTC midnight timestamp before 06:00 on
 Mondays, using the repository's `Europe/Vienna` timezone. Updates require

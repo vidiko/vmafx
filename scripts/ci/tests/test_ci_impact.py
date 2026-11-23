@@ -849,6 +849,7 @@ class UbuntuDevImagesRouting(unittest.TestCase):
         "docker/dev/ubuntu-26.04-cuda.Dockerfile",
         "docker/dev/ubuntu-26.04-sycl.Dockerfile",
         "scripts/setup/ubuntu.sh",
+        "scripts/setup/apt-source-allowlist.sh",
         "requirements/locks/build.txt",
         "requirements/locks/dev-linters.txt",
         "build-config.env",

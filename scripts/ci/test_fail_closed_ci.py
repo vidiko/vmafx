@@ -855,6 +855,14 @@ APT_CERTIFICATE_BOOTSTRAP = [
     ["apt-get", "--error-on=any", "-o", "Acquire::Retries=3", "update"],
     ["apt-get", "install", "-y", "--no-install-recommends", "ca-certificates"],
 ]
+# The helper runs from the directory the Dockerfile's own COPY stages it into.
+APT_SOURCE_HELPER_NAME = "apt-source-allowlist.sh"
+APT_SOURCE_HOLD_MESSAGE = "hold inherited APT sources exactly once before the first package step"
+APT_SOURCE_RESTORE_MESSAGE = (
+    "restore inherited APT sources exactly once after the last package step"
+)
+APT_SOURCE_SCOPE_MESSAGE = "join APT source hold, package steps and restore in one RUN with &&"
+APT_BOOTSTRAP_MARKER = "# UBUNTU_APT_CERTIFICATE_BOOTSTRAP:"
 
 
 def _snapshot_sets_apt_config(instruction: str, tokens: list[str]) -> bool:
@@ -953,13 +961,17 @@ def _snapshot_apt_override(cmd: list[str]) -> bool:
     )
 
 
+def _snapshot_runs_installer(cmd: list[str]) -> bool:
+    """Recognise calls to the copied installers, which run apt internally."""
+    return cmd[0] not in DOCKERFILE_INSTRUCTIONS and any(
+        posixpath.basename(token) in IMAGE_INSTALLER_NAMES for token in cmd
+    )
+
+
 def _snapshot_script_problems(cmd: list[str], position: int) -> list[str]:
     """Keep installer execution after configuration and prevent later config removal."""
     problems: list[str] = []
-    runs_installer = cmd[0] not in DOCKERFILE_INSTRUCTIONS and any(
-        posixpath.basename(token) in IMAGE_INSTALLER_NAMES for token in cmd
-    )
-    if position < 0 and runs_installer:
+    if position < 0 and _snapshot_runs_installer(cmd):
         problems.append("configure the snapshot before calling package installer scripts")
     rewrites = cmd != APT_SNAPSHOT_CHECK and any("/etc/apt/apt.conf" in token for token in cmd)
     if position > 0 and rewrites:
@@ -995,6 +1007,65 @@ def _snapshot_check_masked(
     return ends[write] not in {"&&", ""} or ops != ["&&"] * (len(ops) - 1) + [""]
 
 
+def _snapshot_source_run_problems(
+    commands: list[tuple[int, list[str]]], ends: list[str], hold: int, restore: int
+) -> list[str]:
+    """Keep both source controls and the enclosed package steps in one fail-closed RUN."""
+    run_line = commands[hold][0]
+    if run_line != commands[restore][0]:
+        return [APT_SOURCE_SCOPE_MESSAGE]
+    # At most one operator per parsed clause, all from the one RUN.
+    operators = [end for (number, _), end in zip(commands, ends, strict=True) if number == run_line]
+    if operators != ["&&"] * (len(operators) - 1) + [""]:
+        return [APT_SOURCE_SCOPE_MESSAGE]
+    return []
+
+
+def _snapshot_is_package_step(cmd: list[str]) -> bool:
+    """Count apt and installer calls, excluding COPY and cleanup of installer files."""
+    if cmd[0] in DOCKERFILE_INSTRUCTIONS or posixpath.basename(cmd[0]) == "rm":
+        return False
+    return any(_is_apt_token(token) for token in cmd) or _snapshot_runs_installer(cmd)
+
+
+def _apt_source_steps(commands: list[tuple[int, list[str]]]) -> tuple[list[str], list[str]]:
+    """Return the hold and restore calls of the helper staged by a COPY into a directory."""
+    # Each iteration reads one parsed Dockerfile command and its finite token list.
+    for _, cmd in commands:
+        if (
+            cmd[0] == "COPY"
+            and cmd[-1].endswith("/")
+            and any(posixpath.basename(source) == APT_SOURCE_HELPER_NAME for source in cmd[1:-1])
+        ):
+            helper = cmd[-1] + APT_SOURCE_HELPER_NAME
+            return ["bash", helper, "hold"], ["bash", helper, "restore"]
+    return [], []
+
+
+def _snapshot_source_problems(commands: list[tuple[int, list[str]]], ends: list[str]) -> list[str]:
+    """Check that every package step runs with inherited sources held."""
+    holds: list[int] = []
+    restores: list[int] = []
+    package_steps: list[int] = []
+    hold, restore = _apt_source_steps(commands)
+    # Each iteration consumes one parsed Dockerfile command and its finite token list.
+    for index, (_, cmd) in enumerate(commands):
+        if cmd == hold:
+            holds.append(index)
+        elif cmd == restore:
+            restores.append(index)
+        elif _snapshot_is_package_step(cmd):
+            package_steps.append(index)
+    problems: list[str] = []
+    if len(holds) != 1 or holds[0] >= min(package_steps, default=0):
+        problems.append(APT_SOURCE_HOLD_MESSAGE)
+    if len(restores) != 1 or restores[0] <= max(package_steps, default=len(commands)):
+        problems.append(APT_SOURCE_RESTORE_MESSAGE)
+    if problems:
+        return problems
+    return _snapshot_source_run_problems(commands, ends, holds[0], restores[0])
+
+
 def ubuntu_apt_snapshot_problems(text: str) -> list[str]:
     """Require a persistent pin before every package operation except the named bootstrap."""
     commands, ends, problems = _snapshot_commands(text)
@@ -1003,11 +1074,12 @@ def ubuntu_apt_snapshot_problems(text: str) -> list[str]:
         return [*problems, "write UBUNTU_APT_SNAPSHOT to persistent APT::Snapshot exactly once"]
     problems.extend(_snapshot_input_problems(commands, writes[0]))
     problems.extend(_snapshot_operation_problems(commands, writes[0]))
+    problems.extend(_snapshot_source_problems(commands, ends))
     if [cmd for _, cmd in commands[writes[0] + 1 : writes[0] + 2]] != [APT_SNAPSHOT_CHECK]:
         problems.append("check the written APT::Snapshot timestamp before any package operation")
     elif _snapshot_check_masked(commands, ends, writes[0]):
         problems.append("join the APT::Snapshot timestamp check and every later clause with &&")
-    if "# UBUNTU_APT_CERTIFICATE_BOOTSTRAP:" not in text:
+    if APT_BOOTSTRAP_MARKER not in text:
         problems.append("name the live archive certificate bootstrap explicitly")
     return problems
 
@@ -1296,6 +1368,110 @@ class LaunchpadPPAContract(DisposableRepoTestCase):
             self.assertEqual(problems, [], "\n".join(problems))
 
 
+class AptSourceAllowlistFixture(unittest.TestCase):
+    """Exercise source moves with a disposable APT directory."""
+
+    def setUp(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash not on PATH; the helper runs inside the Ubuntu image")
+        self.bash = bash
+        self.apt = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.sources = self.apt / "sources.list.d"
+        self.sources.mkdir()
+        self.archive = self.sources / "ubuntu.sources"
+        self.archive.write_bytes(b"Types: deb\n")
+        self.holding = self.apt / "vmafx-held-sources"
+
+    def source_step(self, step: str) -> TextCommandResult:
+        return run_command(
+            [self.bash, ROOT / "scripts/setup/apt-source-allowlist.sh", step, self.apt],
+            allowed_executables=(self.bash,),
+            capture_output=True,
+            text=True,
+            timeout_seconds=SCRIPT_TIMEOUT_S,
+        )
+
+    def assert_rejected(self, operation: str, reason: str) -> None:
+        result = self.source_step(operation)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(reason, result.stderr)
+
+    def test_hold_and_restore_preserve_source_bytes(self) -> None:
+        vendor = {
+            "vendor list.list": b"# vendor list\r\n",
+            "vendor.sources": b"Types: deb",
+            ".hidden.list": b"# hidden\n",
+        }
+        original_archive = self.archive.read_bytes()
+        (self.apt / "sources.list").write_bytes(b"\n \t# archive is in ubuntu.sources\n \t\n")
+        # Three fixture entries exercise both APT suffixes and a hidden name.
+        for name, data in vendor.items():
+            (self.sources / name).write_bytes(data)
+        held = self.source_step("hold")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        self.assertEqual(list(self.sources.iterdir()), [self.archive])
+        self.assertEqual(self.archive.read_bytes(), original_archive)
+        # The same three entries must be byte-identical while held.
+        for name, data in vendor.items():
+            self.assertEqual((self.holding / name).read_bytes(), data)
+        added = self.sources / "cuda.list"
+        added.write_bytes(b"# new vendor entry\n")
+        restored = self.source_step("restore")
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertFalse(self.holding.exists())
+        self.assertEqual(added.read_bytes(), b"# new vendor entry\n")
+        self.assertEqual(self.archive.read_bytes(), original_archive)
+        # The same three entries must also match after restore.
+        for name, data in vendor.items():
+            self.assertEqual((self.sources / name).read_bytes(), data)
+
+    def test_hold_and_restore_with_only_ubuntu_sources(self) -> None:
+        held = self.source_step("hold")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        self.assertEqual(list(self.holding.iterdir()), [])
+        restored = self.source_step("restore")
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertFalse(self.holding.exists())
+        self.assertEqual(list(self.sources.iterdir()), [self.archive])
+
+    def test_hold_requires_ubuntu_sources(self) -> None:
+        self.archive.unlink()
+        self.assert_rejected("hold", "missing or unreadable")
+        self.assertFalse(self.holding.exists())
+
+    def test_hold_refuses_active_legacy_sources(self) -> None:
+        (self.apt / "sources.list").write_bytes(b" # comment\n\n\t deb https://example.invalid/\n")
+        self.assert_rejected("hold", "active entry")
+        self.assertFalse(self.holding.exists())
+
+    def test_hold_refuses_an_existing_holding_directory(self) -> None:
+        self.holding.mkdir()
+        self.assert_rejected("hold", "cannot create holding directory")
+        self.assertEqual(list(self.holding.iterdir()), [])
+
+    def test_restore_refuses_a_name_clash_before_moving_any_source(self) -> None:
+        first = self.sources / "a.list"
+        existing = self.sources / "vendor.sources"
+        first.write_bytes(b"# first\n")
+        existing.write_bytes(b"# inherited\n")
+        held = self.source_step("hold")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        existing.write_bytes(b"# installed\n")
+        self.assert_rejected("restore", "refusing to overwrite")
+        self.assertEqual(existing.read_bytes(), b"# installed\n")
+        self.assertEqual((self.holding / existing.name).read_bytes(), b"# inherited\n")
+        self.assertFalse(first.exists())
+        self.assertEqual((self.holding / first.name).read_bytes(), b"# first\n")
+
+    def test_hold_refuses_more_than_256_source_entries(self) -> None:
+        # Add 256 entries, one over the helper's limit when the archive is included.
+        for index in range(256):
+            (self.sources / f"{index}.list").touch()
+        self.assert_rejected("hold", "more than 256 entries")
+        self.assertFalse(self.holding.exists())
+
+
 class UbuntuAptSnapshotContract(unittest.TestCase):
     """Pin all three Ubuntu dev images, including their nested package installers."""
 
@@ -1326,7 +1502,7 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
         for path in UBUNTU_DEV_DOCKERFILES:
             image = path.read_text(encoding="utf-8")
             for plant, before_pin in plants:
-                offset = image.index("RUN apt-get") if before_pin else len(image)
+                offset = image.index(APT_BOOTSTRAP_MARKER) if before_pin else len(image)
                 with self.subTest(path=path, plant=plant):
                     planted = image[:offset] + plant + "\n" + image[offset:]
                     self.assertTrue(ubuntu_apt_snapshot_problems(planted))
@@ -1364,7 +1540,7 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
 
     def test_only_parsed_instruction_shapes_are_accepted(self) -> None:
         image = self.image()
-        before_pin = image.index("RUN apt-get")
+        before_pin = image.index(APT_BOOTSTRAP_MARKER)
         after_pin = len(image)
         plants = (
             ('RUN ["apt-get", "install", "-y", "curl"]', APT_SNAPSHOT_RUN_MESSAGE, before_pin),
@@ -1427,7 +1603,7 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
         self.assertEqual(build_config_snapshot_problems(commented), [])
 
     def test_unpinned_install_is_rejected(self) -> None:
-        planted = self.image().replace("RUN apt-get", "RUN apt-get install -y curl && apt-get", 1)
+        planted = self.image().replace("&& apt-get", "&& apt-get install -y curl && apt-get", 1)
         self.assertIn(
             "only the named ca-certificates bootstrap may use the live archive",
             ubuntu_apt_snapshot_problems(planted),
@@ -1466,7 +1642,7 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
             ),
             ("&& . /tmp/build-config.env", "&& . /tmp/build-config.env && :"),
             ("$UBUNTU_APT_SNAPSHOT", "20261101T000000Z"),
-            ("# UBUNTU_APT_CERTIFICATE_BOOTSTRAP:", "# bootstrap:"),
+            (APT_BOOTSTRAP_MARKER, "# bootstrap:"),
         ):
             with self.subTest(removed=old):
                 self.assertNotEqual(self.image().replace(old, new), self.image())
@@ -1526,8 +1702,43 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
                     "only the named ca-certificates bootstrap may use the live archive",
                     ubuntu_apt_snapshot_problems(planted),
                 )
-        after_pin = self.image() + "\nRUN apt-get upgrade -y\n"
+        after_pin = self.image().replace(
+            "&& bash /tmp/ubuntu.sh", "&& apt-get upgrade -y && bash /tmp/ubuntu.sh", 1
+        )
         self.assertEqual(ubuntu_apt_snapshot_problems(after_pin), [])
+
+    def test_inherited_apt_sources_must_be_held_for_every_package_step(self) -> None:
+        image = self.image()
+        hold = f"bash /tmp/{APT_SOURCE_HELPER_NAME} hold"
+        restore = f"bash /tmp/{APT_SOURCE_HELPER_NAME} restore"
+        update = shlex.join(APT_CERTIFICATE_BOOTSTRAP[0])
+        start = f"RUN {hold} \\\n    && "
+        end = f"    && {restore} \\\n"
+        installer = "    && bash /tmp/ubuntu.sh \\\n"
+        plants = (
+            (image.replace(start, "RUN ", 1), APT_SOURCE_HOLD_MESSAGE),
+            (
+                image.replace(f"{start}{update}", f"RUN {update} \\\n    && {hold}", 1),
+                APT_SOURCE_HOLD_MESSAGE,
+            ),
+            (image.replace(end, "", 1), APT_SOURCE_RESTORE_MESSAGE),
+            (image.replace(start, f"{start}{hold} \\\n    && ", 1), APT_SOURCE_HOLD_MESSAGE),
+            (image.replace(end, end + end, 1), APT_SOURCE_RESTORE_MESSAGE),
+            (image.replace(installer + end, end + installer, 1), APT_SOURCE_RESTORE_MESSAGE),
+            (image + "\nRUN apt-get upgrade -y\n", APT_SOURCE_RESTORE_MESSAGE),
+            (image.replace(start, f"RUN {hold}\nRUN ", 1), APT_SOURCE_SCOPE_MESSAGE),
+            (image.replace(start, f"RUN {hold} \\\n    ; ", 1), APT_SOURCE_SCOPE_MESSAGE),
+            (
+                image.replace(f" scripts/setup/{APT_SOURCE_HELPER_NAME}", "", 1),
+                APT_SOURCE_HOLD_MESSAGE,
+            ),
+        )
+        # Replay the ten fixed mutations against the same parsed contract.
+        for planted, message in plants:
+            with self.subTest(message=message, planted=planted):
+                self.assertNotEqual(planted, image)
+                self.assertIn(message, ubuntu_apt_snapshot_problems(planted))
+        self.assertEqual(ubuntu_apt_snapshot_problems(image), [])
 
     def test_written_timestamp_is_checked_before_use(self) -> None:
         """The clause after the write checks the file APT reads; it cannot move or go."""
@@ -1593,7 +1804,7 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_installer_cannot_run_before_pin(self) -> None:
-        planted = self.image().replace("RUN apt-get", "RUN bash /tmp/ubuntu.sh && apt-get", 1)
+        planted = self.image().replace("&& apt-get", "&& bash /tmp/ubuntu.sh && apt-get", 1)
         self.assertIn(
             "configure the snapshot before calling package installer scripts",
             ubuntu_apt_snapshot_problems(planted),
