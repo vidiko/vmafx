@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Fixture coverage for the master-push render check (ADR-3295).
+"""Fixture coverage for the master-push and merge-group render checks.
 
 Every case builds a disposable repository whose stub ``Makefile`` renders
 ``CHANGELOG.md`` from ``changelog.d/`` and checks it, commits with fixed
@@ -25,6 +25,10 @@ from pathlib import Path
 import yaml  # type: ignore[import-untyped]  # hook environments omit PyYAML stubs
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from scripts.ci import ci_expressions as gx  # noqa: E402
+
 CHECK = ROOT / "scripts" / "ci" / "check_render_on_master.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "lint-and-format.yml"
 RENDER_PR_WORKFLOW = ROOT / ".github" / "workflows" / "docs-render-pr.yml"
@@ -156,6 +160,53 @@ class RenderOnMasterTest(unittest.TestCase):
         self.commit({"Makefile": MAKEFILE, "changelog.d/fixed/a.md": "- fixed a\n"}, age_h=1)
         self.assert_status(self.check(), 1, "no commit of HEAD carries a render")
 
+    def test_stale_merge_group_render_fails(self) -> None:
+        """Reject a render computed before an earlier group commit added a fragment."""
+        self.commit({"changelog.d/fixed/b.md": "- fixed b\n"}, age_h=3)
+        base = self.git("rev-parse", "HEAD").strip()
+        stale_render = "- fixed a\n- fixed b\n"
+        self.commit({"changelog.d/fixed/c.md": "- fixed c\n"}, age_h=2)
+        self.commit({"CHANGELOG.md": stale_render}, age_h=1)
+        render = self.git("rev-parse", "HEAD").strip()
+
+        res = self.check("--group-base", base)
+        self.assert_status(res, 1, f"merge-group render commit {render[:12]} is not the render")
+        self.assertIn("Re-render after the group's preceding changes land", res.stdout)
+
+    def test_exact_merge_group_render_passes_with_later_fragment(self) -> None:
+        """Check only the latest render, even when a later fragment is long owed."""
+        base = self.git("rev-parse", "HEAD").strip()
+        self.commit({"CHANGELOG.md": "- fixed a\n- hand edit\n"}, age_h=40)
+        self.commit({"changelog.d/fixed/b.md": "- fixed b\n"}, age_h=38)
+        self.commit({"CHANGELOG.md": "- fixed a\n- fixed b\n"}, age_h=35)
+        render = self.git("rev-parse", "HEAD").strip()
+        self.commit({"changelog.d/fixed/c.md": "- fixed c\n"}, age_h=30)
+
+        self.assert_status(self.check("--group-base", base), 0, f"render {render[:12]} is exact")
+
+    def test_merge_group_without_a_render_passes(self) -> None:
+        """Skip a fragment-only group even if its base already has an inexact render."""
+        self.commit({"CHANGELOG.md": "- fixed a\n- hand edit\n"}, age_h=2)
+        base = self.git("rev-parse", "HEAD").strip()
+        self.commit({"changelog.d/fixed/b.md": "- fixed b\n"}, age_h=1)
+
+        self.assert_status(
+            self.check("--group-base", base), 0, "no render commit in the merge group"
+        )
+
+    def test_merge_group_render_at_head_passes(self) -> None:
+        """Allow an exact render as the final commit of a group."""
+        base = self.git("rev-parse", "HEAD").strip()
+        self.commit({"changelog.d/fixed/b.md": "- fixed b\n"}, age_h=2)
+        self.commit({"CHANGELOG.md": "- fixed a\n- fixed b\n"}, age_h=1)
+        render = self.git("rev-parse", "HEAD").strip()
+
+        self.assert_status(self.check("--group-base", base), 0, f"render {render[:12]} is exact")
+
+    def test_merge_group_without_a_base_fails(self) -> None:
+        """Reject an empty CI base, which Git would read as HEAD."""
+        self.assert_status(self.check("--group-base", ""), 1, "missing merge-group base SHA")
+
     # --- the scheduled render pull request (ADR-3373) --------------------
 
     def decide(self) -> dict[str, str]:
@@ -171,6 +222,14 @@ class RenderOnMasterTest(unittest.TestCase):
         verdict = self.decide()
         self.assertEqual(verdict["open"], "false")
         self.assertNotEqual(verdict["owed_since"], "")
+
+    def test_inexact_last_render_opens_the_pull_request_immediately(self) -> None:
+        """Open a repair even though the first commit after the render is only an hour old."""
+        self.commit({"CHANGELOG.md": "- fixed a\n- hand edit\n"}, age_h=2)
+        self.commit({"changelog.d/fixed/b.md": "- fixed b\n"}, age_h=1)
+        first = self.git("rev-parse", "HEAD").strip()
+
+        self.assertEqual(self.decide(), {"open": "true", "owed_since": first, "owed_hours": "1.0"})
 
     def test_render_owed_past_the_threshold_opens_the_pull_request(self) -> None:
         # Planted case: no render ran for 7 hours. The decision opens the render
@@ -193,6 +252,34 @@ class RenderOnMasterWiringTest(unittest.TestCase):
         text = WORKFLOW.read_text()
         self.assertIn("python3 scripts/ci/check_render_on_master.py", text)
         self.assertNotIn("run: make docs-render-check\n", text)
+
+    def test_merge_group_step_runs_the_check_with_the_base_from_env(self) -> None:
+        """Pass the event base through the environment in the merge-group Docs step."""
+        data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        triggers = data.get("on", data.get(True))
+        self.assertIn("checks_requested", triggers["merge_group"]["types"])
+        steps = data["jobs"]["docs-lint"]["steps"]
+        checks = [step for step in steps if "--group-base" in step.get("run", "")]
+        self.assertEqual(len(checks), 1, "Docs must run the merge-group render check")
+        step = checks[0]
+        self.assertEqual(step["if"], "github.event_name == 'merge_group'")
+        self.assertEqual(
+            step["env"]["MERGE_GROUP_BASE_SHA"], "${{ github.event.merge_group.base_sha }}"
+        )
+        self.assertEqual(
+            step["run"],
+            'python3 scripts/ci/check_render_on_master.py --group-base "$MERGE_GROUP_BASE_SHA"',
+        )
+
+    def test_merge_group_checkout_fetches_full_history(self) -> None:
+        """Keep the group base and fragment landing history available to the check."""
+        data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        steps = data["jobs"]["docs-lint"]["steps"]
+        checkout = next(
+            step for step in steps if step.get("uses", "").startswith("actions/checkout@")
+        )
+        depth = checkout["with"]["fetch-depth"]
+        self.assertEqual(gx.evaluate(depth, {"github": {"event_name": "merge_group"}}), 0)
 
     def test_render_pull_request_runs_on_a_schedule(self) -> None:
         # Every render before ADR-3373 was opened by hand; without a scheduled
