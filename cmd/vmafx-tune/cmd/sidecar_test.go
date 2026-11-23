@@ -230,6 +230,98 @@ func TestSidecarRecordThenPredict(t *testing.T) {
 	}
 }
 
+type sidecarRecordSession struct {
+	firstVMAF float64
+	firstErr  error
+	calls     int
+}
+
+// Infer returns the configured first result and fails on subsequent calls.
+func (s *sidecarRecordSession) Infer(_ []float64) (float64, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.firstVMAF, s.firstErr
+	}
+	return 0, errors.New("unexpected second inference")
+}
+
+// TestSidecarRecordUsesSingleBaseline checks the payload and the reloaded fit.
+func TestSidecarRecordUsesSingleBaseline(t *testing.T) {
+	const codec, crf = "libx264", 26
+	features := predictor.ShotFeatures{ProbeBitrateKbps: 20}
+	analytical := predictor.New().PredictAnalytical(features, crf, codec)
+	for _, tc := range []struct {
+		name     string
+		session  sidecarRecordSession
+		observed float64
+		wantBase float64
+	}{
+		{
+			name: "learned", session: sidecarRecordSession{firstVMAF: 81.5},
+			observed: 91.5, wantBase: 81.5,
+		},
+		{
+			name: "fallback", session: sidecarRecordSession{firstErr: context.Canceled},
+			observed: 0, wantBase: analytical,
+		},
+		{
+			name: "clamped zero residual", session: sidecarRecordSession{firstVMAF: 105},
+			observed: 100, wantBase: 100,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := tc.session
+			sp, err := sidecar.ForCodec(predictor.WithSession(&session), codec, sidecar.Config{
+				CacheDir: t.TempDir(), HostUUID: "test-host",
+			})
+			if err != nil {
+				t.Fatalf("build sidecar: %v", err)
+			}
+			flags := &sidecarRecordFlags{
+				sidecarCommonFlags: sidecarCommonFlags{codec: codec, jsonOut: true},
+				crf:                crf, observedVMAF: tc.observed,
+			}
+			out := captureStdout(t, func() {
+				if err := recordSidecarCapture(sp, flags, features); err != nil {
+					t.Fatalf("record sidecar capture: %v", err)
+				}
+			})
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(out), &payload); err != nil {
+				t.Fatalf("decode record payload: %v", err)
+			}
+			wantResidual := tc.observed - tc.wantBase
+			if payload["base_vmaf"] != tc.wantBase || payload["residual"] != wantResidual {
+				t.Errorf("payload base/residual = %v/%v, want %v/%v",
+					payload["base_vmaf"], payload["residual"], tc.wantBase, wantResidual)
+			}
+			assertSidecarRecordState(t, sp, features, crf, sidecar.HistoryRow{
+				ObservedVMAF: tc.observed, PredictedVMAF: tc.wantBase, Residual: wantResidual,
+			})
+			if session.calls != 1 {
+				t.Errorf("inference calls = %d, want 1", session.calls)
+			}
+		})
+	}
+}
+
+func assertSidecarRecordState(
+	t *testing.T, sp *sidecar.Predictor, features predictor.ShotFeatures, crf int, row sidecar.HistoryRow,
+) {
+	t.Helper()
+	saved := sidecar.Load(sp.StatePath, sp.Model.Config)
+	if saved.NUpdates != 1 || !reflect.DeepEqual(saved.History, []sidecar.HistoryRow{row}) {
+		t.Errorf("saved updates/history = %d/%+v, want 1/%+v", saved.NUpdates, saved.History, row)
+	}
+	want := sidecar.NewModel(sp.Model.Config)
+	if err := want.Update(features, row.ObservedVMAF, row.PredictedVMAF, crf); err != nil {
+		t.Fatalf("compute ridge weights from payload baseline: %v", err)
+	}
+	if !reflect.DeepEqual(saved.Weights, want.Weights) {
+		t.Errorf("saved weights = %v, want %v", saved.Weights, want.Weights)
+	}
+}
+
 // TestSidecarNoPersist covers the tests-only flag: the fit updates in memory
 // but nothing reaches disk.
 func TestSidecarNoPersist(t *testing.T) {

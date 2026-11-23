@@ -311,12 +311,17 @@ func runSidecarRecord(ctx context.Context, d deps, flags *sidecarRecordFlags) er
 	if err != nil {
 		return err
 	}
+	return recordSidecarCapture(sp, flags, features)
+}
 
+func recordSidecarCapture(
+	sp *sidecar.Predictor, flags *sidecarRecordFlags, features predictor.ShotFeatures,
+) error {
 	base := sp.Base.PredictVMAF(features, flags.crf, flags.codec)
 	// A persistence failure here is an uncaught OSError in Python (exit 1),
 	// so the error stays untagged.
-	if err := sp.RecordCapture(
-		features, flags.crf, flags.observedVMAF, flags.codec, !flags.noPersist,
+	if err := sp.RecordCaptureWithBaseline(
+		features, flags.crf, flags.observedVMAF, base, !flags.noPersist,
 	); err != nil {
 		return err
 	}
@@ -331,7 +336,7 @@ func runSidecarRecord(ctx context.Context, d deps, flags *sidecarRecordFlags) er
 	if flags.jsonOut {
 		return emitJSONPayload(payload)
 	}
-	_, err = fmt.Printf("recorded updates=%d residual=%.6f state=%s\n",
+	_, err := fmt.Printf("recorded updates=%d residual=%.6f state=%s\n",
 		payload["n_updates"], payload["residual"], payload["state_path"])
 	return err
 }

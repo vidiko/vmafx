@@ -1324,9 +1324,10 @@ vmafx-tune-go sidecar record \
 
 The residual is computed against the bare predictor, never against the
 sidecar-corrected value, so repeated captures converge rather than compounding.
+Each capture uses one bare prediction for both the fit update and the output.
 The payload (schema `vmaf-tune-sidecar-record/v1`) is the `status` payload plus
-`crf`, `observed_vmaf`, `base_vmaf` and `residual`
-(`observed_vmaf - base_vmaf`); the text form is
+`crf`, `observed_vmaf`, `base_vmaf` and `residual` (`observed_vmaf - base_vmaf`).
+The text form is
 `recorded updates=<n> residual=<r> state=<path>`.
 
 ### sidecar batch-record
