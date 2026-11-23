@@ -1046,30 +1046,51 @@ def report_message_failure(commit: Commit, reason: str) -> None:
         )
 
 
-def comment_prefixes() -> tuple[str, ...]:
-    """Return Git's comment string, or every candidate when Git picks one itself."""
-    value = "#"
-    # git config --list -z ends each entry in NUL and splits key from value at a newline.
+def git_config_values(keys: tuple[str, ...]) -> dict[str, str]:
+    """Return the last configured value for each matching Git config key."""
+    wanted = {key.lower() for key in keys}
+    values: dict[str, str] = {}
+    # git config --list -z output is bounded by MAX_COMMIT_LOG_BYTES in run_git.
     for entry in run_git(["config", "--list", "-z"]).split("\0"):
         key, _, setting = entry.partition("\n")
-        if key in ("core.commentchar", "core.commentstring"):
-            value = setting
+        lower = key.lower()
+        if lower in wanted:
+            values.pop(lower, None)
+            values[lower] = setting
+    return values
+
+
+def comment_prefixes() -> tuple[str, ...]:
+    """Return Git's comment string, or every candidate when Git picks one itself."""
+    values = git_config_values(("core.commentchar", "core.commentstring"))
+    value = next(reversed(values.values()), "#")
     # Git matches core.commentChar/String "auto" without regard to case.
     if value.isascii() and value.lower() == "auto":
         return AUTO_COMMENT_CANDIDATES
     return (value,)
 
 
-def is_scissors_line(raw: bytes, prefixes: tuple[str, ...]) -> bool:
-    """Match Git's scissors line, which starts with the effective comment string."""
+def cleanup_mode() -> str:
+    """Return Git's configured commit.cleanup mode in lower case, or empty when unset."""
+    return git_config_values(("commit.cleanup",)).get("commit.cleanup", "").lower()
+
+
+def scissors_prefix(raw: bytes, prefixes: tuple[str, ...]) -> str | None:
+    """Return the comment prefix of a Git scissors line, or None when raw is not one."""
     line = raw.rstrip(b"\r\n")
-    return any(line == prefix.encode("utf-8") + SCISSORS_TAIL for prefix in prefixes)
+    # Bounded by len(prefixes), at most len(AUTO_COMMENT_CANDIDATES).
+    for prefix in prefixes:
+        if line == prefix.encode("utf-8") + SCISSORS_TAIL:
+            return prefix
+    return None
 
 
-def read_message_before_diff(path: Path, prefixes: tuple[str, ...]) -> str:
-    """Read a pending message up to Git's verbose diff, bounded like a stored message."""
+def read_pending_message(path: Path, prefixes: tuple[str, ...], editor: bool) -> tuple[str, str]:
+    """Read a pending message, stopping before Git's verbose diff block in editor mode."""
+    active_prefixes = prefixes if editor else ()
     data = bytearray()
-    cut = False
+    block_start: int | None = None
+    block_prefix = ""
     try:
         with path.open("rb") as stream:
             # Each line read adds at least one byte, so the byte bound ends the loop first.
@@ -1077,16 +1098,22 @@ def read_message_before_diff(path: Path, prefixes: tuple[str, ...]) -> str:
                 raw = stream.readline(MAX_COMMIT_MESSAGE_BYTES + 1)
                 if not raw:
                     break
-                if cut and raw.startswith(VERBOSE_DIFF_HEAD):
-                    break
+                if block_start is not None:
+                    if raw.startswith(VERBOSE_DIFF_HEAD):
+                        return data[:block_start].decode("utf-8"), block_prefix
+                    if not raw.startswith(block_prefix.encode("utf-8")):
+                        block_start = None
+                        block_prefix = ""
+                matched = scissors_prefix(raw, active_prefixes)
+                if matched is not None:
+                    block_start = len(data)
+                    block_prefix = matched
                 data += raw
-                if is_scissors_line(raw, prefixes):
-                    cut = True
                 if len(data) > MAX_COMMIT_MESSAGE_BYTES:
                     raise InputBoundError(
                         f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
                     )
-        return data.decode("utf-8")
+        return data.decode("utf-8"), ""
     except (OSError, UnicodeError) as exc:
         raise UsageError(f"{path}: {exc}") from exc
 
@@ -1097,22 +1124,43 @@ def strip_comments(message: str, prefix: str) -> str:
     return run_git(args, stdin=message)
 
 
-def pending_signoff_reason(entry: Commit, raw: str, prefixes: tuple[str, ...]) -> str | None:
-    """Accept the sign-off when dropping one comment string Git may use leaves it valid."""
-    reason = None
-    # At most len(AUTO_COMMENT_CANDIDATES) iterations.
-    for prefix in prefixes:
-        reason = signoff_reason(replace(entry, message=strip_comments(raw, prefix)))
-        if reason is None:
-            return None
-    return reason
+def selected_comment(text: str, prefixes: tuple[str, ...], block_prefix: str) -> str:
+    """Pick the single comment string Git uses for an edited commit message."""
+    if len(prefixes) == 1:
+        return prefixes[0]
+    if block_prefix:
+        return block_prefix
+    lines = text.splitlines()
+    # Bounded by len(lines) * len(prefixes) (within MAX_COMMIT_MESSAGE_BYTES).
+    for line in reversed(lines):
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                return prefix
+    return "#"
+
+
+def editor_signoff_text(text: str, q: str, cleanup: str) -> str:
+    """Clean the message portion Git keeps for trailers in editor mode."""
+    scissors = q + SCISSORS_TAIL.decode("utf-8")
+    kept: list[str] = []
+    lines = text.split("\n")
+    # Bounded by len(lines) (at most MAX_COMMIT_MESSAGE_BYTES + 1).
+    for line in lines:
+        if line.rstrip("\r") == scissors:
+            break
+        kept.append(line)
+    cut = "\n".join(kept)
+    if cleanup in ("whitespace", "verbatim", "scissors"):
+        return run_git(["stripspace"], stdin=cut)
+    return strip_comments(cut, q)
 
 
 def check_message_file(path: str) -> int:
     """Check a pending commit message with Git's effective identities."""
-    prefixes = comment_prefixes()
+    editor = os.environ.get("GIT_EDITOR") != ":"
+    prefixes = comment_prefixes() if editor else ()
     try:
-        raw = read_message_before_diff(Path(path), prefixes)
+        text, block_prefix = read_pending_message(Path(path), prefixes, editor)
     except UsageError as exc:
         raise UsageError(f"commit message file {path}: {exc}") from exc
     merge_path = Path(run_git(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())
@@ -1121,10 +1169,13 @@ def check_message_file(path: str) -> int:
         return 0
     author_name, author_email = message_identity("AUTHOR")
     committer_name, committer_email = message_identity("COMMITTER")
-    # Git keeps comment lines when the message is not edited (-m, -F): check attribution on them.
-    message = run_git(["stripspace"], stdin=raw)
-    # The report names the subject an edited message keeps once comment lines are dropped.
-    stored = strip_comments(raw, prefixes[0]).splitlines()
+    message = run_git(["stripspace"], stdin=text)
+    if editor:
+        q = selected_comment(text, prefixes, block_prefix)
+        signoff_text = editor_signoff_text(text, q, cleanup_mode())
+    else:
+        signoff_text = message
+    stored = signoff_text.splitlines()
     subject = stored[0] if stored else ""
     commit = Commit(
         "(commit being made)",
@@ -1135,7 +1186,8 @@ def check_message_file(path: str) -> int:
         subject,
         message,
     )
-    reason = commit_attribution_reason(commit) or pending_signoff_reason(commit, raw, prefixes)
+    signoff_commit = replace(commit, message=signoff_text)
+    reason = commit_attribution_reason(commit) or signoff_reason(signoff_commit)
     if reason:
         report_message_failure(commit, reason)
         return 1

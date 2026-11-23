@@ -35,17 +35,23 @@ It requires a sign-off matching the author or committer and refuses model or
 coding tool attribution. Merge commits are exempt. For a new commit use
 `git commit -s`; to repair the last commit use `git commit --amend -s --no-edit`.
 
-The hook checks attribution on every line, comment lines included, because
-Git keeps them when the message is not edited (`-m`, `-F`). The sign-off
-counts once comment lines are dropped; with `core.commentChar=auto` Git
-matches `auto` without regard to case, and it is enough that one character
-Git may pick leaves a valid sign-off. Below the scissors line the hook
-keeps checking every line, because Git stores them when the message is not
-edited (`-F`); only the staged diff that `-v` writes, from the first line
-below the scissors line that starts with `diff --git`, is skipped. The
-scissors line must start with the configured comment string; a crafted
-`diff --git` line under `-F` is caught by the range check (`check-dco.py`
-on pre-push and in CI), which reads the stored message.
+The hook reads `GIT_EDITOR`, which Git sets to `:` when no editor runs (`-m`,
+`-F`, `--no-edit`). Without an editor, every line is checked as Git stores it.
+With an editor, the sign-off is checked on the text above Git's first scissors
+line with comment lines removed (unless `commit.cleanup` keeps them), and
+attribution is checked on all text above the staged diff that `-v` writes.
+Under `core.commentChar=auto`, the hook uses the comment string of Git's own
+template lines.
+
+Limits:
+
+- An exported `GIT_EDITOR=:` together with `-e`, and `--cleanup=` given on the
+  command line, are not visible to the hook.
+- An editor-typed copy of Git's verbose suffix can hide text.
+- Git 2.56 deprecates `core.commentChar=auto` (removal planned for Git 3.0).
+
+The range check (`check-dco.py` on pre-push and in CI) reads the stored
+message and is the binding check.
 
 ## Check before you push
 
