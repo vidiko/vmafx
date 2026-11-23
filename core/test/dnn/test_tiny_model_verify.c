@@ -308,10 +308,7 @@ static int write_fake_cosign(const char *dir, int exit_code)
     return 0;
 }
 
-/* Scratch-dir + registry + bundle + onnx + fake-cosign-stub setup shared by
- * run_with_fake_cosign. Extracted so the caller's branch count stays inside
- * the readability-function-size budget: a helper `if (msg) return msg;` is
- * one branch versus the two each mu_assert contributes at the call site. */
+/* Scratch directory, registry, bundle, ONNX model and fake cosign setup. */
 static char *setup_fake_cosign_fixture(char *dir, size_t dir_sz, int exit_code, const char *bundle)
 {
     mu_assert("setup scratch dir",
@@ -456,37 +453,8 @@ static char *check_copy_observation(const char *dir, int must_run)
     return result;
 }
 
-static char *run_with_fake_cosign(const char *bundle, int exit_code, int expected_err,
-                                  char *argv_out, size_t argv_sz)
+static int cleanup_fake_cosign_fixture(const char *dir)
 {
-    char dir[256];
-    char *setup_msg = setup_fake_cosign_fixture(dir, sizeof(dir), exit_code, bundle);
-    if (setup_msg)
-        return setup_msg;
-
-    /* Save + override PATH so locate_cosign() resolves to our stub. */
-    char path_save[2048];
-    const char *path_env = getenv("PATH");
-    const int pn = snprintf(path_save, sizeof(path_save), "%s", path_env ? path_env : "");
-    mu_assert("snprintf PATH save", pn >= 0 && (size_t)pn < sizeof(path_save));
-    mu_assert("setenv PATH override", setenv("PATH", dir, 1) == 0);
-
-    char onnx_path[512];
-    const int n = snprintf(onnx_path, sizeof(onnx_path), "%s/k.onnx", dir);
-    mu_assert("snprintf onnx_path", n > 0 && (size_t)n < (int)sizeof(onnx_path));
-    char reg_path[512];
-    const int rn = snprintf(reg_path, sizeof(reg_path), "%s/registry.json", dir);
-    mu_assert("snprintf reg_path", rn > 0 && (size_t)rn < (int)sizeof(reg_path));
-
-    const int err = vmaf_dnn_verify_signature(onnx_path, reg_path);
-
-    /* Restore PATH before assertion so a fail doesn't leak state. */
-    mu_assert("restore PATH", setenv("PATH", path_save, 1) == 0);
-    if (argv_out)
-        read_recorded_argv(dir, argv_out, argv_sz);
-    char *copy_msg = check_copy_observation(dir, expected_err == 0 || exit_code != 0);
-    if (copy_msg)
-        return copy_msg;
     cleanup_in_dir(dir, "registry.json");
     cleanup_in_dir(dir, "k.onnx.sigstore.json");
     cleanup_in_dir(dir, "k.onnx");
@@ -494,10 +462,86 @@ static char *run_with_fake_cosign(const char *bundle, int exit_code, int expecte
     cleanup_in_dir(dir, "argv.txt");
     cleanup_in_dir(dir, "mode.txt");
     cleanup_in_dir(dir, "bytes.txt");
-    (void)rmdir(dir);
+    return rmdir(dir);
+}
 
+static int save_env(const char *name, char **saved)
+{
+    const char *value = vmaf_getenv_portable(name);
+    *saved = value ? VMAF_STRDUP(value) : NULL;
+    return value && !*saved ? -ENOMEM : 0;
+}
+
+static int restore_env(const char *name, char *saved)
+{
+    const int rc = saved ? setenv(name, saved, 1) : unsetenv(name);
+    free(saved);
+    return rc;
+}
+
+static char *verify_with_fake_cosign(const char *dir, int *status)
+{
+    char onnx_path[512];
+    const int n = snprintf(onnx_path, sizeof(onnx_path), "%s/k.onnx", dir);
+    if (n <= 0 || (size_t)n >= sizeof(onnx_path))
+        return "snprintf onnx_path";
+    char reg_path[512];
+    const int rn = snprintf(reg_path, sizeof(reg_path), "%s/registry.json", dir);
+    if (rn <= 0 || (size_t)rn >= sizeof(reg_path))
+        return "snprintf reg_path";
+
+    /* Override PATH so locate_cosign() finds the stub. */
+    char *path_save = NULL;
+    if (save_env("PATH", &path_save) != 0)
+        return "save PATH";
+    if (setenv("PATH", dir, 1) != 0) {
+        free(path_save);
+        return "setenv PATH override";
+    }
+    *status = vmaf_dnn_verify_signature(onnx_path, reg_path);
+    const int restored = restore_env("PATH", path_save);
+    mu_assert("restore PATH", restored == 0);
+    return NULL;
+}
+
+static char *run_with_fake_cosign_current_tmpdir(const char *bundle, int exit_code,
+                                                 int expected_err, char *argv_out, size_t argv_sz)
+{
+    char dir[256];
+    char *msg = setup_fake_cosign_fixture(dir, sizeof(dir), exit_code, bundle);
+    if (msg)
+        return msg;
+
+    int err = 0;
+    msg = verify_with_fake_cosign(dir, &err);
+    if (!msg) {
+        if (argv_out)
+            read_recorded_argv(dir, argv_out, argv_sz);
+        msg = check_copy_observation(dir, expected_err == 0 || exit_code != 0);
+    }
+    const int removed = cleanup_fake_cosign_fixture(dir);
+    if (msg)
+        return msg;
+    mu_assert("remove fake cosign fixture", removed == 0);
     mu_assert("verify_signature returned expected status", err == expected_err);
     return NULL;
+}
+
+static char *run_with_fake_cosign(const char *bundle, int exit_code, int expected_err,
+                                  char *argv_out, size_t argv_sz)
+{
+    char *tmpdir_save = NULL;
+    mu_assert("save TMPDIR", save_env("TMPDIR", &tmpdir_save) == 0);
+    /* Use the fixture's parent, which is also the loader's default. */
+    if (setenv("TMPDIR", "/tmp", 1) != 0) {
+        free(tmpdir_save);
+        return "set TMPDIR";
+    }
+    char *msg =
+        run_with_fake_cosign_current_tmpdir(bundle, exit_code, expected_err, argv_out, argv_sz);
+    const int restored = restore_env("TMPDIR", tmpdir_save);
+    mu_assert("restore TMPDIR", restored == 0);
+    return msg;
 }
 
 static char *test_verify_copy_uses_private_directory(void)
@@ -594,7 +638,8 @@ static char *check_invalid_tmpdir_with_buffers(const char *value, int expected_e
     int n = snprintf(saved, TEST_BUFFER_4096, "%s", old ? old : "");
     mu_assert("save TMPDIR", n >= 0 && (size_t)n < TEST_BUFFER_4096);
     mu_assert("set TMPDIR", setenv("TMPDIR", value, 1) == 0);
-    char *msg = run_with_fake_cosign(k_bundle_tag, 0, expected_err, argv_seen, TEST_BUFFER_4096);
+    char *msg = run_with_fake_cosign_current_tmpdir(k_bundle_tag, 0, expected_err, argv_seen,
+                                                    TEST_BUFFER_4096);
     int restored = had_old ? setenv("TMPDIR", saved, 1) : unsetenv("TMPDIR");
     mu_assert("restore TMPDIR", restored == 0);
     if (msg)
@@ -695,7 +740,7 @@ static char *check_valid_tmpdir_with_buffer(const char *value, char *saved)
     const int n = snprintf(saved, TEST_BUFFER_4096, "%s", old ? old : "");
     mu_assert("save TMPDIR", n >= 0 && (size_t)n < TEST_BUFFER_4096);
     mu_assert("set TMPDIR", setenv("TMPDIR", value, 1) == 0);
-    char *msg = run_with_fake_cosign(k_bundle_tag, 0, 0, NULL, 0u);
+    char *msg = run_with_fake_cosign_current_tmpdir(k_bundle_tag, 0, 0, NULL, 0u);
     const int restored = had_old ? setenv("TMPDIR", saved, 1) : unsetenv("TMPDIR");
     mu_assert("restore TMPDIR", restored == 0);
     return msg;

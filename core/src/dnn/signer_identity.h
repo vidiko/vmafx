@@ -51,13 +51,14 @@ extern "C" {
 #define VMAF_DNN_SIGNER_OWNER_ID "340303765"
 
 /**
- * Check the signing certificate of the Sigstore bundle in @p bundle
- * (@p len bytes, JSON). Returns 0 when the bundle holds exactly one
- * certificate, its subject alternative name is allowed and its owner ID is
- * VMAF_DNN_SIGNER_OWNER_ID; -EBADMSG when the bundle does not match the
- * Sigstore bundle v0.3 schema, nested values included, or the certificate
- * cannot be read; -EPERM when the certificate names another identity or owner.
- * Does not verify any signature: cosign does.
+ * Preflight the v0.3 Sigstore bundle in @p bundle (@p len bytes, JSON)
+ * against the allow-list of fields and value shapes in ADR-2985. Returns 0 when
+ * the preflight passes and the single certificate has an allowed subject
+ * alternative name and owner ID VMAF_DNN_SIGNER_OWNER_ID. Returns -EBADMSG
+ * if the preflight fails or the certificate cannot be read, and -EPERM if
+ * the certificate names another identity or owner. A return of 0 does not
+ * guarantee that cosign can load the bundle. Cosign verifies the content
+ * and signature.
  */
 int vmaf_dnn_signer_check_bundle(const char *bundle, size_t len);
 

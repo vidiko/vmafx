@@ -815,8 +815,12 @@ cosign verify ghcr.io/vidiko/vmafx@sha256:DIGEST \
     "https://github.com/vidiko/vmafx/.github/workflows/docker-publish-production.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-# Container image, GitHub-native attestation route (added by ADR-0902).
-gh attestation verify oci://ghcr.io/vidiko/vmafx@sha256:DIGEST --repo vidiko/vmafx
+# Container image, GitHub-native attestation route (added by ADR-0902). Pin the
+# production signer and the release tag: other workflows in the repository
+# (for example docker-publish-tester.yml) attest image digests too.
+gh attestation verify oci://ghcr.io/vidiko/vmafx@sha256:DIGEST --repo vidiko/vmafx \
+  --signer-workflow vidiko/vmafx/.github/workflows/docker-publish-production.yml \
+  --source-ref "refs/tags/${tag}"
 
 # Go server/operator/node images use their own workflow identity.
 cosign verify ghcr.io/vidiko/vmafx-node@sha256:DIGEST \

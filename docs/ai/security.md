@@ -156,14 +156,23 @@ The expression is anchored at both ends (`^` and `$`): cosign searches the
 certificate's identity for it, so an unanchored pattern also accepts an
 identity with anything before or after it.
 
-The identity is a name: the organisation's login, `vidiko`, which GitHub frees
-when an organisation is renamed. The signing certificate also carries the
-organisation's numeric ID, `340303765` (Fulcio extension
-`1.3.6.1.4.1.57264.1.17`), which a later owner of the name cannot have.
-cosign 3.1.3 has no option for it. The
-[release guide](../development/release.md#check-the-signers-owner-id)
-shows an owner-ID check for a separate GitHub provenance attestation; it does
-not check the model bundle’s certificate.
+The identity includes the organisation's login, `vidiko`. The certificate's
+numeric owner ID, `340303765`, binds the certificate to the organisation even
+if GitHub reassigns the login. After `cosign verify-blob` succeeds, check that
+ID in the same bundle's signing certificate with `jq` and OpenSSL. This uses
+the bundle certificate check from the
+[release guide](../development/release.md#check-the-signers-owner-id).
+
+```bash
+set -o pipefail
+jq -er '.verificationMaterial.certificate.rawBytes' model/tiny/vmaf_tiny_v2.onnx.sigstore.json \
+  | base64 -d \
+  | openssl x509 -inform DER -noout -text \
+  | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' \
+  | tail -n 1 | grep -Eq '^ *\.\.340303765$'
+```
+
+Load the model only after both commands succeed.
 
 The `--tiny-model-verify` flag does all of this at load time
 (T6-9, [ADR-0211](../adr/0211-model-registry-sigstore.md);
