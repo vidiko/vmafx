@@ -1674,6 +1674,9 @@ Contributed by luoye-cpu.
   (HISS-19).
 
 
+- Add a local check that reports numeric tokens in PR bodies and replies that are absent from their evidence files.
+
+
 - **Extra compilation-database entries bring three hand-built sources into clang-tidy coverage.**
   `scripts/ci/gen-mex-compile-commands.py` now provides entries for the LD_PRELOAD fault injector
   and the upstream parity harness, and `scripts/ci/gen-gpu-compile-commands.py` adds the
@@ -1907,6 +1910,9 @@ Contributed by luoye-cpu.
   clang-cl, icx-cl and MinGW-w64), and the local copies of the constants
   (fourteen in the feature sources, the SYCL twins included, and four in
   tests) are gone. Scores are unchanged: the copies held the same double.
+
+
+- **GitHub merge-queue `merge_group` support for `Required Checks Aggregator` ([ADR-3556](docs/adr/3556-merge-queue-merge-group.md)).** `required-aggregator.yml` and every workflow that produces a required check owed outside `pull_request` now trigger on `merge_group` (`types: [checks_requested]`, `branches: [master]`) under the `full` CI tier and full impact plan. On `merge_group`, the aggregator exempts `pullRequestOnly` contexts and both OpenSSF Scorecard gates (`Scorecard PR Gate` ran on the pull request; `Scorecard Master Gate` runs on the `master` push after the merge), while publish, Pages, and registry-push steps remain restricted to their existing events.
 
 
 - **Metal feature extractors unwind without `goto`.** Seven Metal host
@@ -2249,6 +2255,9 @@ Contributed by luoye-cpu.
 
 
 - Consolidated duplicated YUV format tables and file lifecycle helpers from `compat/python-vmaf/tools/reader.py` and `writer.py` into `_YuvIoBase`, and extracted local helpers for repeated blocks in `decorator.py`, `misc.py`, and `plot.py`.
+
+
+- **The research radar collector retries HTTP fetches through tenacity 9.2.1.** `scripts/research/radar_collect.py` replaces its hand-written retry loop in `http_fetch` with `tenacity.Retrying` (Apache-2.0), keeping the same three attempts, 1 s / 4 s backoff, retried transport error classes, and `FetchError` reporting.
 
 
 - **The roadmap and release pages list the full RC4 and RC5 scope.**
@@ -2829,6 +2838,9 @@ Contributed by luoye-cpu.
 - **CI:** wait on API rate limits and poll less often (issue 3582).
 
 
+- **Go security scan:** the node's eBPF binding no longer trips gosec G101 (hard-coded credentials): its bpf2go identifier is `rcloneTracker`, whose generated constant names hold no credential word, and `make lint-go` also scans generated Go files with `.gosec.json` (issue 3630).
+
+
 - **ADR allocator scans open pull request heads to avoid fork PR collisions.**
   In claim mode, `scripts/adr/next-free.sh` queries `gh` for open pull request
   head commit SHAs and scans their `docs/adr` trees alongside origin branches.
@@ -3188,6 +3200,10 @@ Contributed by luoye-cpu.
   the CLI, and in the context's log callback for the VMAFx API.
 
 
+- **CUDA:** the device compression check reads fatbin entry flags, avoiding
+  false failures when compressed payloads contain raw-code markers.
+
+
 - **CI:** a refused or unreachable connection no longer ends a CI download on the first attempt: curl and wget fetches in shell scripts, workflows and container recipes retry connection and host-resolution failures, the tidy lane's APT downloads retry, and a contract test checks curl and wget fetches for the retry flags and requires retried downloads to write to a file before use.
 
 
@@ -3524,6 +3540,9 @@ Contributed by luoye-cpu.
   20261030. `Msys2InheritContract` in
   `scripts/ci/test_ffmpeg_patch_workflow_contract.py` refuses such a step with
   the cache on.
+
+
+- **CI:** the mypy gate counts repeated findings, so a new occurrence of an inherited error is reported even when its path, code and message match.
 
 
 - CI: Renovate's CI Node.js pull request can pass the dependency-only deliverables exemption and move Node to a new major while the engine-locked documentation workflow keeps its own major until the next engine pin move.
