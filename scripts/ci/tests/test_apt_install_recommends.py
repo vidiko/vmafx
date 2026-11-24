@@ -9,7 +9,9 @@ without --no-install-recommends; multiple flagged installs on one line pass when
 --no-install-recommends.
 Negative: a fixture naming libcudart12 without --no-install-recommends fails; chained
 subcommands (refresh && install, refresh&&install) and multiple installs on one line fail
-when any flagged install omits --no-install-recommends.
+when any flagged install omits --no-install-recommends. An install line ending with
+backslash-space or backslash-tab before --no-install-recommends on the next line also fails
+because bash does not continue past escaped trailing blanks.
 Boundary: backslash-continued flags pass; continuations over MAX_CONTINUATION_LINES fail
 closed; flags after shell separators (&&) do not exempt an earlier install call; missing apt
 list files, oversize workflow/list inputs (MAX_WORKFLOW_BYTES, MAX_LIST_BYTES), and excess
@@ -262,6 +264,36 @@ class AptInstallRecommendsTest(unittest.TestCase):
         missing_findings = check_workflow_text(missing, repo_root=self.root)
         self.assertEqual(len(missing_findings), 1)
         self.assertIn("missing apt list", missing_findings[0])
+
+    def test_backslash_space_does_not_continue_to_flag_line(self) -> None:
+        self._write_list(".github/apt/cov.txt", "libcudart12\n")
+        snippet = (
+            "bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt \\ \n"
+            "--no-install-recommends\n"
+        )
+        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        self.assertEqual(
+            findings,
+            [
+                "fixture.yml:1: .github/apt/cov.txt names libcudart12"
+                " without --no-install-recommends"
+            ],
+        )
+
+    def test_backslash_tab_does_not_continue_to_flag_line(self) -> None:
+        self._write_list(".github/apt/cov.txt", "libcudart12\n")
+        snippet = (
+            "bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt \\\t\n"
+            "--no-install-recommends\n"
+        )
+        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        self.assertEqual(
+            findings,
+            [
+                "fixture.yml:1: .github/apt/cov.txt names libcudart12"
+                " without --no-install-recommends"
+            ],
+        )
 
     def test_chained_refresh_then_install_with_spaces_fails(self) -> None:
         self._write_list(".github/apt/coverage.txt", "libcudart12\n")

@@ -254,11 +254,13 @@ def ci_text_paths(root: Path) -> list[Path]:
 
 
 def _logical_ci_lines(text: str) -> list[tuple[int, str, bool]]:
-    """Join backslash-continued physical lines up to MAX_CONTINUATION_LINES."""
-    return _join_continued_lines(list(enumerate(text.splitlines(), 1)))
+    """Join bash backslash-continued lines (no blank after escape) up to MAX_CONTINUATION_LINES."""
+    return _join_continued_lines(list(enumerate(text.splitlines(), 1)), blank_after_escape=False)
 
 
-def _join_continued_lines(lines: list[tuple[int, str]]) -> list[tuple[int, str, bool]]:
+def _join_continued_lines(
+    lines: list[tuple[int, str]], *, blank_after_escape: bool
+) -> list[tuple[int, str, bool]]:
     """Join numbered lines, bounding storage by their original physical span."""
     logical: list[tuple[int, str, bool]] = []
     parts: list[str] = []
@@ -268,10 +270,10 @@ def _join_continued_lines(lines: list[tuple[int, str]]) -> list[tuple[int, str, 
         if count == 0:
             start_line = number
         count = number - start_line + 1
-        stripped = raw.rstrip()
-        continues = stripped.endswith("\\")
+        candidate = raw.rstrip(" \t") if blank_after_escape else raw
+        continues = candidate.endswith("\\")
         if count <= MAX_CONTINUATION_LINES:
-            parts.append(stripped[:-1] if continues else raw)
+            parts.append(candidate[:-1] if continues else raw)
         if not continues:
             logical.append((start_line, "\n".join(parts), count > MAX_CONTINUATION_LINES))
             parts = []
@@ -282,7 +284,7 @@ def _join_continued_lines(lines: list[tuple[int, str]]) -> list[tuple[int, str, 
 
 
 def _dockerfile_logical_lines(text: str) -> list[tuple[int, str, bool]]:
-    """Drop Docker comments and blanks before joining; retain leading escape directives."""
+    """Drop Docker comments/blanks, keep escape directives, and join BuildKit continuations."""
     logical: list[tuple[int, str, bool]] = []
     lines: list[tuple[int, str]] = []
     directives = True
@@ -300,7 +302,7 @@ def _dockerfile_logical_lines(text: str) -> list[tuple[int, str, bool]]:
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         lines.append((number, raw))
-    return [*logical, *_join_continued_lines(lines)]
+    return [*logical, *_join_continued_lines(lines, blank_after_escape=True)]
 
 
 def _is_hosted_workflow_or_action(path: Path) -> bool:
@@ -1384,6 +1386,13 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
             "\n".join(ubuntu_apt_snapshot_problems(image + "\n" + over_bound)),
         )
 
+    def test_dockerfile_continuation_allows_blank_after_escape(self) -> None:
+        """Keep BuildKit continuation joining when spaces or tabs trail the escape."""
+        self.assertEqual(_dockerfile_logical_lines("RUN a \\ \n  b\n"), [(1, "RUN a \n  b", False)])
+        self.assertEqual(
+            _dockerfile_logical_lines("RUN a \\\t\n  b\n"), [(1, "RUN a \n  b", False)]
+        )
+
     def test_only_parsed_instruction_shapes_are_accepted(self) -> None:
         image = self.image()
         before_pin = image.index("RUN apt-get")
@@ -1849,7 +1858,7 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
 
     def test_update_split_across_continuation(self) -> None:
         """Join backslash continuations with first-line reporting and bounded physical length."""
-        self.track({"split.sh": "apt-get -qq \\   \n  update\n"})
+        self.track({"split.sh": "apt-get -qq \\\n  update\n"})
         self.assertEqual(
             apt_update_contract_problems(self.root),
             [f"split.sh:1: {APT_UPDATE_MESSAGE}"],
@@ -1871,6 +1880,21 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
         self.assertEqual(
             apt_update_contract_problems(self.root),
             [f"split.sh:1: {APT_CONTINUATION_MESSAGE}"],
+        )
+
+    def test_logical_ci_lines_continuation_requires_adjacent_newline(self) -> None:
+        """Join bash `\\`+newline continuations, not `\\` followed by spaces or tabs."""
+        self.assertEqual(
+            _logical_ci_lines("a \\ \nb\n"),
+            [(1, "a \\ ", False), (2, "b", False)],
+        )
+        self.assertEqual(
+            _logical_ci_lines("a \\\t\nb\n"),
+            [(1, "a \\\t", False), (2, "b", False)],
+        )
+        self.assertEqual(
+            _logical_ci_lines("a \\\nb\n"),
+            [(1, "a \nb", False)],
         )
 
     def test_effective_acquire_retries_and_option_spellings(self) -> None:
