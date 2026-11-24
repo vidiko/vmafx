@@ -33,19 +33,23 @@ torcul may call the `vmaf` CLI instead
 
 These apply to every package in the table:
 
-1. Every torcul issue listed in the package's row must be **closed**, and each
-   must have tests that cover the cases exercised by the VMAFx package's own
-   tests (`pkg/<package>/*_test.go`).
+1. Every counterpart listed in the package's row is satisfied: each listed
+   torcul issue is **closed**, each listed torcul crate has shipped in a torcul
+   release, and the tests of the listed counterparts together cover the cases
+   exercised by the VMAFx package's own tests (`pkg/<package>/*_test.go`).
 2. Each listed VMAFx importer drops its import of the package. Every importer
    that stays must preserve its behaviour. Its existing test cases must still
-   pass with the same expected results. Test edits are limited to fixture
-   construction and imports that referenced the removed package.
+   pass. Test edits may replace references to the removed package (imports,
+   fixture construction, and calls at call or assertion sites) only where the
+   test inputs and expected results stay identical.
 3. The VMAFx package is deleted in one pull request with a
    `changelog.d/removed/` fragment, a `!` conventional-commit subject, and a
    `Migration:` footer, because external Go code may import these paths
    (HISS-14 append-only ABI).
 
-**Open.** VMAFx has yet to decide how its Go code would call a Rust crate.
+**Open.** Issue [#3640](https://github.com/vidiko/vmafx/issues/3640) tracks how
+VMAFx Go code would call a Rust crate; the first affected Go caller is
+[`cmd/vmafx-tune/cmd/auto.go`](../../cmd/vmafx-tune/cmd/auto.go).
 
 Per-package extras:
 
