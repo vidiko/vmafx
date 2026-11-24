@@ -635,7 +635,9 @@ them next to any other file. The outputs are written by one command,
   render was inexact on its own tree, or a render has been owed for 6 hours,
   `scripts/ci/open-render-pr.sh` renders the master tip on branch
   `chore/docs-render-auto`, opens the pull request as the release bot and arms
-  auto-merge. When master moves it renders again, and when master's render
+  auto-merge. When master moves it renders again. While its pull request waits
+  in the merge queue it leaves the branch alone, since the queued pull request
+  lands the render; when master's render
   is current it closes its own pull request
   ([ADR-3373](../adr/3373-scheduled-render-pull-request.md),
   [ADR-3552](../adr/3552-docs-render-on-master-push.md),
