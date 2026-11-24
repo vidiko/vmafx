@@ -25,6 +25,16 @@ HOOK_ID = "ffmpeg-patches-surface-docs"
 SURFACE_ONLY_DONE_LINE = "--surface-only: tree checks passed"
 GIT_TIMEOUT_S = 60
 SCRIPT_TIMEOUT_S = 300
+PROBE_SYMBOL = "vmaf_fixture_surface_probe"
+PROBE_HEADER_REL = "core/include/libvmaf/fixture_probe.h"
+PROBE_PATCH_REL = "ffmpeg-patches/0001-pass-autotune-cli-glue.patch"
+PROBE_HEADER_WITH_SYM = (
+    "#ifndef VMAF_FIXTURE_PROBE_H_\n"
+    "#define VMAF_FIXTURE_PROBE_H_\n"
+    f"int {PROBE_SYMBOL}(void);\n"
+    "#endif\n"
+)
+PROBE_HEADER_WITHOUT_SYM = "#ifndef VMAF_FIXTURE_PROBE_H_\n#define VMAF_FIXTURE_PROBE_H_\n#endif\n"
 
 
 def _clean_env(**extra: str) -> dict[str, str]:
@@ -61,6 +71,21 @@ def _git(repo: Path, *args: str) -> None:
         capture_output=True,
         timeout_seconds=GIT_TIMEOUT_S,
     )
+
+
+def _rev_parse(repo: Path, rev: str) -> str:
+    """Resolve a git revision in a fixture repository."""
+    git = _tool("git")
+    res = run_command(
+        [git, "-C", str(repo), "rev-parse", rev],
+        allowed_executables=[git],
+        check=True,
+        env=_clean_env(),
+        capture_output=True,
+        text=True,
+        timeout_seconds=GIT_TIMEOUT_S,
+    )
+    return res.stdout.strip()
 
 
 def _run_script(script: Path, cwd: Path, *args: str, **extra: str) -> TextCommandResult:
@@ -407,6 +432,119 @@ class SurfaceOnlyModeTests(_FixtureTree, unittest.TestCase):
         for path in ("core/src/libvmaf.c", "docs/usage/ffmpeg.txt", "Dockerfile.node"):
             with self.subTest(unread=path):
                 self.assertIsNone(files.search(path), f"{path} triggers {HOOK_ID}")
+
+
+class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
+    """Verify section 4 builds the consumed symbol set from HEAD_SHA, not the checkout."""
+
+    def _stage_probe_base(self, td: str) -> tuple[Path, Path, Path, str, str]:
+        """Create a base commit whose public header declares a symbol a patch consumes."""
+        tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+        header = tmp / PROBE_HEADER_REL
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text(PROBE_HEADER_WITH_SYM, encoding="utf-8")
+        patch = tmp / PROBE_PATCH_REL
+        orig_patch = patch.read_text(encoding="utf-8")
+        patch.write_text(f"{orig_patch}\n+    ret = {PROBE_SYMBOL}();\n", encoding="utf-8")
+        _git(tmp, "add", ".")
+        _git(tmp, "commit", "-q", "-m", "base with probe symbol")
+        return tmp, header, patch, orig_patch, _rev_parse(tmp, "HEAD")
+
+    def test_consumed_set_reads_head_sha_not_working_tree(self) -> None:
+        """Uncommitted working-tree patch edit cannot hide a symbol still consumed at HEAD_SHA."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, patch, orig_patch, base_sha = self._stage_probe_base(td)
+            header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
+            _git(tmp, "add", PROBE_HEADER_REL)
+            _git(tmp, "commit", "-q", "-m", "remove probe declaration without patch update")
+            head_sha = _rev_parse(tmp, "HEAD")
+            patch.write_text(orig_patch, encoding="utf-8")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("::error title=Agent hard rule 11::", res.stdout)
+            self.assertIn(PROBE_SYMBOL, res.stdout)
+
+    def test_consumed_set_boundary_head_commit_updates_patch(self) -> None:
+        """Removing the header declaration passes when the head commit also edits the patch."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, patch, orig_patch, base_sha = self._stage_probe_base(td)
+            header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
+            patch.write_text(orig_patch, encoding="utf-8")
+            _git(tmp, "add", PROBE_HEADER_REL, PROBE_PATCH_REL)
+            _git(tmp, "commit", "-q", "-m", "remove probe declaration and update patch")
+            head_sha = _rev_parse(tmp, "HEAD")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+
+    def test_consumed_set_zero_patches_at_head_sha_exits_zero(self) -> None:
+        """Zero patch files at HEAD_SHA emits 'missing; nothing to check' and exits 0."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, _patch, _orig_patch, base_sha = self._stage_probe_base(td)
+            header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
+            for p in (tmp / "ffmpeg-patches").glob("*.patch"):
+                p.unlink()
+            _git(tmp, "add", "-A")
+            _git(tmp, "commit", "-q", "-m", "drop patches at head")
+            head_sha = _rev_parse(tmp, "HEAD")
+            for src in (ROOT / "ffmpeg-patches").glob("*.patch"):
+                shutil.copy(src, tmp / "ffmpeg-patches" / src.name)
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("missing; nothing to check", res.stderr)
+
+    def test_consumed_set_negative_missing_head_or_blob_exits_two(self) -> None:
+        """Non-existent HEAD_SHA or missing patch blob at HEAD_SHA fails closed with exit 2."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, _patch, _orig_patch, base_sha = self._stage_probe_base(td)
+            script = tmp / "scripts" / "ci" / SCRIPT.name
+            missing_sha = "deadbeef" * 5
+            res = _run_script(
+                script, tmp, REPO_ROOT=str(tmp), BASE_SHA=base_sha, HEAD_SHA=missing_sha, PR_BODY=""
+            )
+            self.assertEqual(res.returncode, 2, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("ffmpeg-patches-surface-check:", res.stderr)
+            self.assertIn(missing_sha, res.stderr)
+
+            header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
+            _git(tmp, "add", PROBE_HEADER_REL)
+            _git(tmp, "commit", "-q", "-m", "remove probe declaration")
+            head_sha = _rev_parse(tmp, "HEAD")
+            blob_sha = _rev_parse(tmp, f"{head_sha}:{PROBE_PATCH_REL}")
+            (tmp / ".git" / "objects" / blob_sha[:2] / blob_sha[2:]).unlink()
+            bad_blob = _run_script(
+                script, tmp, REPO_ROOT=str(tmp), BASE_SHA=base_sha, HEAD_SHA=head_sha, PR_BODY=""
+            )
+            self.assertEqual(
+                bad_blob.returncode, 2, f"stdout:\n{bad_blob.stdout}\nstderr:\n{bad_blob.stderr}"
+            )
+            err_lines = bad_blob.stderr.strip().splitlines()
+            self.assertEqual(len(err_lines), 1, f"stderr:\n{bad_blob.stderr}")
+            self.assertTrue(err_lines[0].startswith("ffmpeg-patches-surface-check:"))
+            self.assertIn(head_sha, err_lines[0])
 
 
 if __name__ == "__main__":

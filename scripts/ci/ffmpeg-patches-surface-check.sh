@@ -10,12 +10,13 @@
 # Mirrors the deliverables-check.sh / ffmpeg-patches-check.sh
 # convention so a contributor can run the same gate locally before
 # `gh pr create`. Reads the PR body for an opt-out line, computes
-# the diff between BASE_SHA..HEAD_SHA (or merge-base origin/master),
-# and intersects the diff against a "consumed set" extracted from
-# the patches under ffmpeg-patches/.
+# the diff from the merge base of BASE_SHA and HEAD_SHA to HEAD_SHA
+# (or merge-base origin/master..HEAD), and intersects the diff against
+# a "consumed set" read from ffmpeg-patches/*.patch at that same diff
+# head revision, not from the checkout.
 #
 # Detection algorithm (bash + grep, no AST):
-#   1. Parse ffmpeg-patches/*.patch once, extract the union of:
+#   1. Parse ffmpeg-patches/*.patch at the diff head revision once, extract the union of:
 #        - vmaf_<ident>          (libvmaf public C symbols)
 #        - Vmaf<TitleCase>       (libvmaf public types: VmafModelConfig, VmafLogLevel, ...)
 #        - --enable-libvmaf-*    (FFmpeg configure flags)
@@ -41,8 +42,10 @@
 #       surface still fails. Classification lives in
 #       scripts/ci/pr-body-input.sh — see it for why `[ ! -t 0 ]` is
 #       the wrong test.
-#       Diff is computed from $BASE_SHA..$HEAD_SHA env vars,
-#       or falls back to $(git merge-base origin/master HEAD)..HEAD.
+#       Diff is computed from the merge base of $BASE_SHA and $HEAD_SHA
+#       up to $HEAD_SHA, or falls back to
+#       $(git merge-base origin/master HEAD)..HEAD; the consumed patch
+#       set is read from that same diff head revision, not the checkout.
 #
 #   PR_BODY="$(gh pr view 999 --json body -q .body)" \
 #       scripts/ci/ffmpeg-patches-surface-check.sh
@@ -432,13 +435,38 @@ fi
 
 # ---------- 4. Build the "consumed set" from patches ----------
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-PATCHES_DIR="${REPO_ROOT}/ffmpeg-patches"
+# Read patches from ${diff_head}, not the checkout, so both sides of the
+# surface intersection come from the same revision.
+if ! patch_tree="$(git ls-tree --name-only "${diff_head}" -- ffmpeg-patches/ 2>/dev/null)"; then
+  echo "ffmpeg-patches-surface-check: cannot list ffmpeg-patches/ at ${diff_head}." >&2
+  exit 2
+fi
 
-if [ ! -d "$PATCHES_DIR" ]; then
-  echo "ffmpeg-patches-surface-check: ${PATCHES_DIR} missing; nothing to check." >&2
+patch_paths=()
+while IFS= read -r patch_path; do
+  case "$patch_path" in
+    ffmpeg-patches/*.patch)
+      case "${patch_path#ffmpeg-patches/}" in
+        .* | */*) ;;
+        *) patch_paths+=("$patch_path") ;;
+      esac
+      ;;
+  esac
+done <<<"$patch_tree"
+
+if [ "${#patch_paths[@]}" -eq 0 ]; then
+  echo "ffmpeg-patches-surface-check: ffmpeg-patches/*.patch at ${diff_head} missing; nothing to check." >&2
   exit 0
 fi
+
+patch_text=""
+for patch_path in ${patch_paths[@]+"${patch_paths[@]}"}; do
+  if ! one_patch="$(git show "${diff_head}:${patch_path}" 2>/dev/null)"; then
+    echo "ffmpeg-patches-surface-check: cannot read ${patch_path} at ${diff_head}." >&2
+    exit 2
+  fi
+  patch_text="${patch_text}${one_patch}"$'\n'
+done
 
 # Concatenate added + context lines from every patch, then extract:
 #   - vmaf_[a-zA-Z0-9_]+          public C symbol names
@@ -451,9 +479,8 @@ fi
 # Filter false positives: drop tokens that are too short (<= 5 chars)
 # or that match a small ignore list of generic tokens like "vmaf_v0"
 # (pkg-config version literal, not a libvmaf symbol).
-{
-  cat "${PATCHES_DIR}"/*.patch 2>/dev/null
-} | grep -hoE '\b(vmaf_[a-zA-Z0-9_]+|Vmaf[A-Z][a-zA-Z0-9]+|libvmaf_[a-zA-Z0-9_]+|--enable-libvmaf[a-zA-Z0-9_-]*)\b' |
+printf '%s' "$patch_text" |
+  grep -hoE '\b(vmaf_[a-zA-Z0-9_]+|Vmaf[A-Z][a-zA-Z0-9]+|libvmaf_[a-zA-Z0-9_]+|--enable-libvmaf[a-zA-Z0-9_-]*)\b' |
   sort -u |
   grep -vE '^vmaf_v[0-9]+$' |
   grep -vE '^vmaf_(pre|tune)$' \
@@ -461,7 +488,7 @@ fi
 
 consumed_count=$(wc -l <"$tmp_consumed" | tr -d ' ')
 if [ "${consumed_count}" -eq 0 ]; then
-  echo "ffmpeg-patches-surface-check: WARN: extracted zero symbols from ${PATCHES_DIR}/*.patch; pattern likely broken." >&2
+  echo "ffmpeg-patches-surface-check: WARN: extracted zero symbols from ffmpeg-patches/*.patch at ${diff_head}; pattern likely broken." >&2
   exit 2
 fi
 
