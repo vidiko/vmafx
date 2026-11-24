@@ -422,7 +422,7 @@ else
   diff_src="auto (merge-base origin/master..HEAD)"
 fi
 
-git diff --name-only "${diff_base}..${diff_head}" >"$tmp_diff"
+git diff --no-relative --name-only "${diff_base}..${diff_head}" >"$tmp_diff"
 
 echo "ffmpeg-patches-surface-check: PR body from ${body_src}, diff from ${diff_src}"
 
@@ -437,7 +437,7 @@ fi
 
 # Read patches from ${diff_head}, not the checkout, so both sides of the
 # surface intersection come from the same revision.
-if ! patch_tree="$(git ls-tree --name-only "${diff_head}" -- ffmpeg-patches/ 2>/dev/null)"; then
+if ! patch_tree="$(git ls-tree --full-tree --name-only "${diff_head}" -- ffmpeg-patches/ 2>/dev/null)"; then
   echo "ffmpeg-patches-surface-check: cannot list ffmpeg-patches/ at ${diff_head}." >&2
   exit 2
 fi
@@ -503,7 +503,7 @@ fi
 # We extract identifiers from the union of `+` and `-` lines (added or
 # removed in the diff). Pure `+ // comment` or `+ /* comment */` lines
 # are filtered.
-header_diff="$(git diff "${diff_base}..${diff_head}" -- 'core/include/libvmaf/*.h' || nomatch_ok $?)"
+header_diff="$(git diff --no-relative "${diff_base}..${diff_head}" -- ':(top)core/include/libvmaf/*.h' || nomatch_ok $?)"
 
 if [ -n "$header_diff" ]; then
   printf '%s\n' "$header_diff" |
@@ -515,7 +515,7 @@ fi
 
 # meson_options.txt changes — capture any `option('<name>'` declaration
 # touched in `+` or `-` lines.
-meson_diff="$(git diff "${diff_base}..${diff_head}" -- 'core/meson_options.txt' || nomatch_ok $?)"
+meson_diff="$(git diff --no-relative "${diff_base}..${diff_head}" -- ':(top)core/meson_options.txt' || nomatch_ok $?)"
 
 if [ -n "$meson_diff" ]; then
   printf '%s\n' "$meson_diff" |

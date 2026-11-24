@@ -516,8 +516,33 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
             self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
             self.assertIn("missing; nothing to check", res.stderr)
 
+    def test_consumed_set_from_subdirectory_exits_one(self) -> None:
+        """Running from a subdirectory still reads patches and header diff from tree root."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, patch, orig_patch, base_sha = self._stage_probe_base(td)
+            header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
+            _git(tmp, "add", PROBE_HEADER_REL)
+            _git(tmp, "commit", "-q", "-m", "remove probe declaration without patch update")
+            head_sha = _rev_parse(tmp, "HEAD")
+            patch.write_text(orig_patch, encoding="utf-8")
+            subdir = tmp / "core"
+            script = (tmp / "scripts" / "ci" / SCRIPT.name).resolve()
+            self.assertTrue(subdir.is_dir())
+            self.assertTrue(script.is_absolute())
+
+            res = _run_script(
+                script,
+                subdir,
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("::error title=Agent hard rule 11::", res.stdout)
+            self.assertIn(PROBE_SYMBOL, res.stdout)
+
     def test_consumed_set_negative_missing_head_or_blob_exits_two(self) -> None:
-        """Non-existent HEAD_SHA or missing patch blob at HEAD_SHA fails closed with exit 2."""
+        """Missing HEAD_SHA (sec 2) or missing patch tree/blob at HEAD_SHA (sec 4) exits 2."""
         with tempfile.TemporaryDirectory() as td:
             tmp, header, _patch, _orig_patch, base_sha = self._stage_probe_base(td)
             script = tmp / "scripts" / "ci" / SCRIPT.name
@@ -526,25 +551,39 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
                 script, tmp, REPO_ROOT=str(tmp), BASE_SHA=base_sha, HEAD_SHA=missing_sha, PR_BODY=""
             )
             self.assertEqual(res.returncode, 2, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-            self.assertIn("ffmpeg-patches-surface-check:", res.stderr)
+            self.assertIn("ffmpeg-patches-surface-check: no merge base", res.stderr)
             self.assertIn(missing_sha, res.stderr)
 
             header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
             _git(tmp, "add", PROBE_HEADER_REL)
             _git(tmp, "commit", "-q", "-m", "remove probe declaration")
             head_sha = _rev_parse(tmp, "HEAD")
+            tree_sha = _rev_parse(tmp, f"{head_sha}:ffmpeg-patches")
+            self.assertEqual(tree_sha, _rev_parse(tmp, f"{base_sha}:ffmpeg-patches"))
             blob_sha = _rev_parse(tmp, f"{head_sha}:{PROBE_PATCH_REL}")
-            (tmp / ".git" / "objects" / blob_sha[:2] / blob_sha[2:]).unlink()
-            bad_blob = _run_script(
-                script, tmp, REPO_ROOT=str(tmp), BASE_SHA=base_sha, HEAD_SHA=head_sha, PR_BODY=""
-            )
-            self.assertEqual(
-                bad_blob.returncode, 2, f"stdout:\n{bad_blob.stdout}\nstderr:\n{bad_blob.stderr}"
-            )
-            err_lines = bad_blob.stderr.strip().splitlines()
-            self.assertEqual(len(err_lines), 1, f"stderr:\n{bad_blob.stderr}")
-            self.assertTrue(err_lines[0].startswith("ffmpeg-patches-surface-check:"))
-            self.assertIn(head_sha, err_lines[0])
+
+            for obj_sha, expected_msg in (
+                (blob_sha, "cannot read"),
+                (tree_sha, "cannot list ffmpeg-patches/"),
+            ):
+                with self.subTest(expected=expected_msg):
+                    (tmp / ".git" / "objects" / obj_sha[:2] / obj_sha[2:]).unlink()
+                    bad = _run_script(
+                        script,
+                        tmp,
+                        REPO_ROOT=str(tmp),
+                        BASE_SHA=base_sha,
+                        HEAD_SHA=head_sha,
+                        PR_BODY="",
+                    )
+                    self.assertEqual(
+                        bad.returncode, 2, f"stdout:\n{bad.stdout}\nstderr:\n{bad.stderr}"
+                    )
+                    err_lines = bad.stderr.strip().splitlines()
+                    self.assertEqual(len(err_lines), 1, f"stderr:\n{bad.stderr}")
+                    self.assertTrue(err_lines[0].startswith("ffmpeg-patches-surface-check:"))
+                    self.assertIn(expected_msg, err_lines[0])
+                    self.assertIn(head_sha, err_lines[0])
 
 
 if __name__ == "__main__":
