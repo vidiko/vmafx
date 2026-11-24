@@ -923,26 +923,40 @@ install-hooks:
 
 hooks-install: install-hooks
 
-# pr-check — local equivalent of the rule-enforcement.yml deliverables gate.
-# Runs scripts/ci/deliverables-check.sh against an existing PR's body
-# (PR=<num>) or against a local body file (BODY=<path>). Exits non-zero
-# if the six-deliverable checklist or any ticked file reference is
-# inconsistent with the diff vs origin/master.
+# pr-check — local equivalent of the three rule-enforcement.yml PR-body gates:
+# deliverables-check.sh (ADR-0108), state-md-touch-check.sh (ADR-0165), and
+# ffmpeg-patches-surface-check.sh (ADR-0409), via scripts/ci/pr-body-gates.sh.
+# Runs against an existing PR (PR=<num>, fetching title and body in one gh call)
+# or a local body file (BODY=<path> with optional TITLE=<text>; defaults to HEAD
+# commit subject when TITLE is empty).
 #
 # Usage:
 #   make pr-check PR=260
-#   make pr-check BODY=pr-body.md
+#   make pr-check BODY=pr-body.md [TITLE="fix: summary"]
 pr-check:
 	@if [ -n "$(PR)" ]; then \
-	    echo "--- pr-check: fetching PR $(PR) body via gh ---"; \
-	    PR_BODY="$$(gh pr view $(PR) --json body -q .body)" \
-	        bash scripts/ci/deliverables-check.sh; \
+	    echo "--- pr-check: fetching PR $(PR) title and body via gh ---"; \
+	    pr_json="$$(gh pr view $(PR) --json title,body)" || exit $$?; \
+	    PR_TITLE="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("title") or "")')" \
+	    PR_BODY="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("body") or "")')" \
+	        bash scripts/ci/pr-body-gates.sh; \
 	elif [ -n "$(BODY)" ]; then \
-	    echo "--- pr-check: reading body from $(BODY) ---"; \
+	    if [ ! -r "$(BODY)" ]; then \
+	        echo "pr-check: cannot read BODY file: $(BODY)" >&2; \
+	        exit 2; \
+	    fi; \
+	    if [ -n "$(TITLE)" ]; then \
+	        pr_title="$(TITLE)"; \
+	        echo "--- pr-check: reading body from $(BODY) (using TITLE: $$pr_title) ---"; \
+	    else \
+	        pr_title="$$(git log -1 --format=%s HEAD)" || exit 2; \
+	        echo "--- pr-check: reading body from $(BODY) (using HEAD title: $$pr_title) ---"; \
+	    fi; \
+	    PR_TITLE="$$pr_title" \
 	    PR_BODY="$$(cat "$(BODY)")" \
-	        bash scripts/ci/deliverables-check.sh; \
+	        bash scripts/ci/pr-body-gates.sh; \
 	else \
-	    echo "Usage: make pr-check PR=<number>  OR  make pr-check BODY=<file>" >&2; \
+	    echo "Usage: make pr-check PR=<number>  OR  make pr-check BODY=<file> [TITLE=<text>]" >&2; \
 	    exit 2; \
 	fi
 
@@ -1074,7 +1088,7 @@ help:
 	@echo "  make format-check     — same, no writes (CI gate)"
 	@echo "  make sec              — semgrep (CERT-C + CWE + fork rules)"
 	@echo "  make sbom             — SPDX + CycloneDX SBOMs via syft"
-	@echo "  make pr-check         — ADR-0108 deliverables gate (PR=<num> or BODY=<file>)"
+	@echo "  make pr-check         — deliverables, docs/state.md touch and ffmpeg-patches surface gates (PR=<num> or BODY=<file> [TITLE=<text>])"
 	@echo "  make silent-revert-check — ADR-1284: work this merge would remove from BASE"
 	@echo "  make test-netflix-golden — D24 gate: 3 Netflix CPU test pairs"
 	@echo "  make test-netflix-golden-arm64 — the same gate on an aarch64 cross build under qemu-user (GOLDEN_ARM64_CC=gcc|clang)"

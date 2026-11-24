@@ -18,11 +18,11 @@ pre-push hook (`scripts/git-hooks/pre-push-pr-body-lint.sh`, wired by
 # Install the pre-push hook (idempotent):
 make hooks-install
 
-# Run the validator manually against an open PR:
+# Run all three PR-body gates manually against an open PR:
 make pr-check PR=<number>
 
-# Run against a local body file:
-make pr-check BODY=pr-body.md
+# Run against a local body file (TITLE defaults to HEAD subject):
+make pr-check BODY=pr-body.md [TITLE="fix: summary"]
 
 # Run the raw validator:
 gh pr view <number> --json body -q .body \
@@ -164,17 +164,19 @@ error line:
 
 ## Exit codes
 
-The validator behind `make pr-check` and
-`scripts/ci/validate-pr-body.sh` exits with:
+`make pr-check` (`scripts/ci/pr-body-gates.sh`, running the deliverables,
+`docs/state.md` touch and `ffmpeg-patches` surface gates) and the standalone
+deliverables validator `scripts/ci/validate-pr-body.sh` exit with:
 
 | Code | Meaning |
 |------|---------|
-| 0 | PR body would pass the deliverables gate |
-| 1 | PR body would fail (same `::error` lines as CI emits) |
-| 2 | Usage error — missing body, unreadable diff file, etc. |
+| 0 | PR body passed every gate run |
+| 1 | One or more gates failed (same `::error` lines as CI emits) |
+| 2 | Usage or gate error — missing title/body, unreadable diff, etc. |
 
-For these two deliverables entry points, exit 2 also covers every shape where
-stdin cannot carry a body at all: a terminal, a closed `fd 0`, or `/dev/null`.
+For the two deliverables-only entry points (`deliverables-check.sh` and
+`validate-pr-body.sh`), exit 2 also covers every shape where stdin cannot
+carry a body at all: a terminal, a closed `fd 0`, or `/dev/null`.
 The other two body-reading gates (`ffmpeg-patches-surface-check.sh`,
 ADR-0409, and `state-md-touch-check.sh`, ADR-0165) answer an absent body from
 the diff instead. The classification rules are in
