@@ -15,6 +15,7 @@
 # value; scripts/githooks/tests/test_install.py enforces that.
 #
 # Usage: framework-hooks.sh pre-commit
+#        framework-hooks.sh commit-msg MESSAGE_FILE
 #        framework-hooks.sh pre-push REMOTE URL   (push refs on stdin)
 set -euo pipefail
 
@@ -79,6 +80,21 @@ case "$stage" in
   pre-commit)
     exec "$fw" run
     ;;
+  commit-msg)
+    if [ "$#" -gt 0 ]; then
+      shift
+    fi
+    if [ "$#" -eq 0 ] || [ -z "$1" ]; then
+      echo "framework-hooks.sh: commit-msg needs the message file" >&2
+      exit 2
+    fi
+    if [ "$#" -ne 1 ]; then
+      echo "framework-hooks.sh: commit-msg takes one message file, got $#" >&2
+      exit 2
+    fi
+    exec "$fw" hook-impl --config=.pre-commit-config.yaml --hook-type=commit-msg \
+      --hook-dir "$(git rev-parse --git-path hooks)" -- "$1"
+    ;;
   pre-push)
     if [ "$#" -gt 0 ]; then
       shift
@@ -89,7 +105,7 @@ case "$stage" in
       --hook-dir "$(git rev-parse --git-path hooks)" -- "$@"
     ;;
   *)
-    echo "framework-hooks.sh: unknown stage '$stage'; expected pre-commit or pre-push" >&2
+    echo "framework-hooks.sh: unknown stage '$stage'; expected pre-commit, commit-msg or pre-push" >&2
     exit 2
     ;;
 esac

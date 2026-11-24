@@ -11,8 +11,8 @@ the hash lock, which also carries `reuse` for the `reuse-lint` check:
 python3 -m pip install --require-hashes -r requirements/locks/pre-commit.txt
 ```
 
-Lefthook owns three hooks next to these dispatchers; install it first, as
-described in [Lefthook and the governance hooks](#lefthook-and-the-governance-hooks).
+Lefthook owns four hooks next to the `pre-rebase` dispatcher; install it first,
+as described in [Lefthook and the governance hooks](#lefthook-and-the-governance-hooks).
 
 The installer writes regular dispatcher files to Git's effective hooks
 directory, including a configured `core.hooksPath`. Each invocation finds
@@ -21,14 +21,16 @@ therefore cannot break hooks in the surviving checkout.
 
 ## Lefthook and the governance hooks
 
-[`lefthook.yml`](../../lefthook.yml) owns `pre-commit`, `pre-push` and
-`post-commit` ([ADR-1249](../adr/1249-praetor-governance-adoption.md)). Its
-`pre-commit` and `pre-push` jobs run the pre-commit framework stage through
-`scripts/git-hooks/framework-hooks.sh`, next to the praetor governance checks
+[`lefthook.yml`](../../lefthook.yml) owns `pre-commit`, `commit-msg`,
+`post-commit` and `pre-push` ([ADR-1249](../adr/1249-praetor-governance-adoption.md)).
+Its `pre-commit`, `commit-msg` and `pre-push` jobs run the corresponding
+pre-commit framework stage through `scripts/git-hooks/framework-hooks.sh`, next
+to the praetor governance checks on `pre-commit` and `pre-push`
 (`compile-context --verify`, `audit`, `hiss coverage --verify`, `dedupe scan`).
-`post-commit` synchronises private state. The dispatchers keep `commit-msg`
-(Conventional Commits) and `pre-rebase` (worktree drift guard). Install
-lefthook first, then the dispatchers:
+`post-commit` synchronises private state. `make install-hooks` installs the
+`pre-rebase` dispatcher (worktree drift guard) and leaves lefthook's shims in
+place, installing `pre-commit`, `commit-msg` and `pre-push` dispatchers only
+where lefthook does not own them. Install lefthook first, then the dispatchers:
 
 ```bash
 lefthook install
@@ -114,9 +116,10 @@ The hooks run in Git for Windows' Bash. Set up a checkout once:
 4. Install from a shell with the virtualenv active
    (`source .venv/Scripts/activate`): `lefthook install`, then
    `bash scripts/githooks/install.sh` (the command behind `make install-hooks`).
-   The `commit-msg` dispatcher looks `pre-commit` up on `PATH` when it runs, so
-   commit from a shell with the virtualenv active, or install the same lock into
-   the Python on `PATH`. Lefthook's jobs find `.venv` themselves.
+   Lefthook's `pre-commit`, `commit-msg` and `pre-push` jobs run through
+   `framework-hooks.sh` and find `.venv` themselves; only a checkout without
+   lefthook runs the `commit-msg` dispatcher, which looks `pre-commit` up on
+   `PATH`.
 5. For pushes, install the push-stage tools into the same virtualenv:
    `requirements/locks/mypy.txt` (with `--require-hashes`) and
    `docs/requirements.txt` for the MkDocs strict build. `govulncheck` on
@@ -132,16 +135,45 @@ change; see `T-HOOKS-WINDOWS-POSIX-FIXTURES-2026-09-30` in
 
 ## Installed checks
 
-| Git event | Framework mode, the default | Native mode |
-| --- | --- | --- |
-| `pre-commit` | Configured formatters and checks | Three native formatters |
-| `commit-msg` | Configured Conventional Commits validation | Same framework check |
-| `pre-push` | All configured push checks | Same framework checks |
-| `pre-rebase` | Agent worktree drift guard | Same guard |
+| Git event | Lefthook (`lefthook.yml`) | Dispatcher (`Framework` mode, default) | Dispatcher (`Native` mode) |
+| --- | --- | --- | --- |
+| `pre-commit` | `framework-hooks.sh pre-commit` plus governance checks | Configured formatters and checks | Three native formatters |
+| `commit-msg` | `framework-hooks.sh commit-msg {1}` (Conventional Commits) | Configured Conventional Commits validation | Same framework check |
+| `pre-push` | `framework-hooks.sh pre-push {1} {2}` plus governance checks | All configured push checks | Same framework checks |
+| `pre-rebase` | Not declared (`make install-hooks` owns it) | Agent worktree drift guard | Same guard |
 
-The dispatcher forwards Git's arguments and pushed-ref input to
+Both `framework-hooks.sh` (`commit-msg` and `pre-push`) and the ADR-1241
+dispatcher forward Git's arguments and pushed-ref input to
 `pre-commit hook-impl`. The framework selects checks and changed files
-from `.pre-commit-config.yaml`. Push checks include assertion density,
+from `.pre-commit-config.yaml`.
+
+At `commit-msg`, `.pre-commit-config.yaml` runs `conventional-pre-commit`
+`v4.5.0` with `--strict` and the repository's fourteen allowed types (`feat`,
+`fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore`, `revert`,
+`port`, `sycl`, `cuda`, `simd`). A refused message exits `1` and prints
+`[Bad commit message] >> <message>`,
+`Your commit message does not follow Conventional Commits formatting`,
+`https://www.conventionalcommits.org/` and
+`Use the --verbose arg for more information`
+(`conventional_pre_commit/output.py:32-48`). Without `--strict`,
+`conventional_pre_commit/hook.py:63-67` accepts autosquash commits
+(`amend!`, `fixup!`, `squash!` followed by a space in
+`conventional_pre_commit/format.py:10-16,60-69`) and merge commits
+(`re.match(r"^merge\b", commit_msg.lower())` in
+`conventional_pre_commit/format.py:71-82`). With `--strict`
+(`conventional_pre_commit/hook.py:30-33,63-70`), both exemptions are skipped
+and every message must satisfy `ConventionalCommit.is_valid()`
+(`conventional_pre_commit/format.py:217-238`): a declared `<type>` with
+optional `(<scope>)`, `!:` or `:`, a space and non-empty subject, and a blank
+line before any body (`conventional_pre_commit/format.py:146-172,204-215`).
+`--strict` therefore refuses `fixup!` / `squash!` / `amend!` commits,
+undeclared types such as `style:`, subjects without `<type>: <description>`,
+multi-line messages missing the blank separator line, and Git's default
+`Merge branch ...` (along with `Merge pull request ...`,
+`Merge remote-tracking branch ...` and `Merge tag ...`,
+`conventional_pre_commit/format.py:74-82`).
+
+Push checks include assertion density,
 twin drift, mypy, bounded-process regressions, FFmpeg patch replay, PR
 deliverables, and MkDocs strict validation. The PR-body check may skip a first
 push or draft PR. It also skips the PRs whose deliverables CI's checklist
@@ -169,11 +201,11 @@ npm's checkout writes the hook repository's tree into the worktree's index.
 The commit then fails or records the wrong tree. The pre-commit project does
 not plan a fix ([pre-commit/pre-commit#3609](https://github.com/pre-commit/pre-commit/issues/3609)).
 
-The `framework-hooks` entries of `lefthook.yml` (`pre-commit` and `pre-push`)
-therefore run `pre-commit install-hooks` with `GIT_INDEX_FILE`, `GIT_DIR`,
-`GIT_WORK_TREE` and `GIT_OBJECT_DIRECTORY` unset before `run` / `hook-impl`.
-Those two then run without `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
-`GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES`. They keep
+The `framework-hooks` entries of `lefthook.yml` (`pre-commit`, `commit-msg`
+and `pre-push`) therefore run `pre-commit install-hooks` with `GIT_INDEX_FILE`,
+`GIT_DIR`, `GIT_WORK_TREE` and `GIT_OBJECT_DIRECTORY` unset before
+`run` / `hook-impl`. Those stages then run without `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES`. They keep
 `GIT_INDEX_FILE`, which a partial commit (`git commit <path>`) needs in the
 `pre-commit` stage to list its staged files, and `GIT_CONFIG_PARAMETERS`, which
 carries the operator's own `git -c` settings. Git exports `GIT_DIR` to every hook, and a hook entry that starts

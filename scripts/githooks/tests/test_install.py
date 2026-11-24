@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml  # type: ignore[import-untyped]
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from scripts.lib.safe_subprocess import TextCommandResult
@@ -324,6 +326,28 @@ class HookInstallTests(unittest.TestCase):
         self.assertTrue(any(event[0] == "pre-push" for event in events))
         self.assertIn(["mkdocs"], events)
 
+    def test_framework_hooks_commit_msg_runs_configured_stage(self) -> None:
+        message = self.repo / ".git/COMMIT_EDITMSG"
+        message.write_text("bad: update stuff\n", encoding="utf-8")
+        rejected = self.run_command(
+            "bash",
+            "scripts/git-hooks/framework-hooks.sh",
+            "commit-msg",
+            str(message),
+            check=False,
+        )
+        self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+        message.write_text("fix: good\n", encoding="utf-8")
+        accepted = self.run_command(
+            "bash",
+            "scripts/git-hooks/framework-hooks.sh",
+            "commit-msg",
+            str(message),
+            check=False,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        self.assertTrue(any(event[0] == "commit-msg" for event in self.events()))
+
     def test_missing_mkdocs_blocks_selected_docs_but_not_direct_non_docs(self) -> None:
         self.install()
         (self.bin / "mkdocs").unlink()
@@ -547,10 +571,20 @@ class LefthookBridgeTests(unittest.TestCase):
             with self.subTest(run=value):
                 self.assertFalse(value.startswith(("|", ">")), "a block scalar hides its quotes")
                 self.assertNotIn('"', value)
-        for stage in ("pre-commit\n", "pre-push {1} {2}\n"):
+        for stage in ("pre-commit\n", "commit-msg {1}\n", "pre-push {1} {2}\n"):
             self.assertEqual(
                 lefthook.count(f"run: bash scripts/git-hooks/framework-hooks.sh {stage}"), 1
             )
+
+    def test_lefthook_declares_commit_msg_framework_hook(self) -> None:
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        self.assertIsInstance(config, dict)
+        self.assertIn("commit-msg", config)
+        commands = config["commit-msg"]["commands"]
+        self.assertEqual(
+            commands["framework-hooks"]["run"],
+            "bash scripts/git-hooks/framework-hooks.sh commit-msg {1}",
+        )
 
     def test_agent_hook_files_are_in_the_form_lefthook_rewrites_them_to(self) -> None:
         # `lefthook uninstall` (v2.1.14 internal/command/uninstall_ai.go) re-marshals
@@ -671,6 +705,31 @@ class LefthookBridgeTests(unittest.TestCase):
             script_text,
         )
 
+    def test_commit_msg_forwards_message_file(self) -> None:
+        self.stub(".venv/bin/pre-commit")
+        message = self.repo / ".git/COMMIT_EDITMSG"
+        message.write_text("fix: subject\n", encoding="utf-8")
+        result = self.bridge("commit-msg", str(message))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(calls[0].split("|")[1], "install-hooks")
+        arguments = calls[1].split("|")[1]
+        self.assertEqual(
+            arguments,
+            "hook-impl --config=.pre-commit-config.yaml --hook-type=commit-msg "
+            f"--hook-dir .git/hooks -- {message}",
+        )
+        self.assertTrue(arguments.endswith(f" -- {message}"))
+
+    def test_commit_msg_requires_message_file_argument(self) -> None:
+        self.stub(".venv/bin/pre-commit")
+        missing = self.bridge("commit-msg")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("framework-hooks.sh: commit-msg needs the message file", missing.stderr)
+        extra = self.bridge("commit-msg", "one", "two")
+        self.assertEqual(extra.returncode, 2)
+        self.assertIn("framework-hooks.sh: commit-msg takes one message file", extra.stderr)
+
     def test_pre_push_forwards_remote_arguments_and_push_refs(self) -> None:
         self.stub(".venv/bin/pre-commit")
         refs = "refs/heads/topic 1111 refs/heads/topic 0000\n"
@@ -711,9 +770,10 @@ class LefthookBridgeTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("pre-commit is missing", missing.stderr)
         self.stub(".venv/bin/pre-commit")
-        unknown = self.bridge("commit-msg")
+        unknown = self.bridge("post-merge")
         self.assertEqual(unknown.returncode, 2)
         self.assertIn("unknown stage", unknown.stderr)
+        self.assertIn("expected pre-commit, commit-msg or pre-push", unknown.stderr)
 
 
 if __name__ == "__main__":
