@@ -177,9 +177,13 @@ failed refresh is not a valid replacement series.
 On failure, `receipt.json` records `status: failed` and the first error in
 `error`. If removing the temporary checkout also fails, the receipt records
 that failure in `cleanup_error` and the command prints it on a separate line.
-If cleanup is the first failure, it appears in `error` and the command exits
-nonzero. Replay Git commands disable automatic maintenance and garbage
-collection so a detached Git process cannot race checkout removal.
+The receipt holds `status`, `error` and `cleanup_error` only when writing it
+succeeds. If the write fails, the command still reports the original error,
+with a `Could not write failure receipt: {receipt_error}` note, and
+`receipt.json` may be missing or left from an earlier write. If cleanup is the
+first failure, it appears in `error` and the command exits nonzero. Replay Git
+commands disable automatic maintenance and garbage collection so a detached Git
+process cannot race checkout removal.
 
 If a filesystem failure or a second interruption also prevents rollback, the
 tool preserves adjacent `.ffmpeg-refresh-<filename>-original-*` backups for
