@@ -18,13 +18,20 @@ import yaml  # type: ignore[import-untyped]  # no PyYAML stubs in the hook envir
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github" / "workflows" / "rule-enforcement.yml"
 DEFAULT_WRAPPER = ROOT / "scripts" / "ci" / "pr-body-gates.sh"
+DEFAULT_MAKEFILE = ROOT / "Makefile"
 BASH = shutil.which("bash") or "/bin/bash"
 GIT = shutil.which("git") or "/usr/bin/git"
+MAKE = shutil.which("make") or "/usr/bin/make"
 SUBPROCESS_TIMEOUT_S = 60
 RC_OK = 0
 RC_FAIL = 1
 RC_USAGE = 2
 STUB_EXIT_THREE = 3
+STUB_GATE_NAMES = (
+    "deliverables-check.sh",
+    "state-md-touch-check.sh",
+    "ffmpeg-patches-surface-check.sh",
+)
 BODY_STEP_SCRIPT_RE = re.compile(r"\bbash\s+scripts/ci/([A-Za-z0-9_.-]+\.sh)\b")
 GATES_ARRAY_RE = re.compile(r"(?m)^GATES=\(([^)]*)\)")
 CLEAN_ENV = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
@@ -241,3 +248,150 @@ def test_t5_boundary_exit_codes_and_missing_title(tmp_path: Path) -> None:
     )
     empty_body = _run_wrapper(title="ci: stub", body="", gates_dir=tmp_path)
     assert empty_body.returncode == RC_OK
+
+
+def _makefile_path() -> Path:
+    override = os.environ.get("PR_CHECK_MAKEFILE")
+    return Path(override).resolve() if override else DEFAULT_MAKEFILE
+
+
+def _head_subject() -> str:
+    done = subprocess.run(  # noqa: S603  # nosec B603
+        [GIT, "log", "-1", "--format=%s", "HEAD"],
+        cwd=ROOT,
+        env=_isolated_env(),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_S,
+    )
+    return done.stdout.rstrip("\r\n")
+
+
+def _write_echo_stubs(directory: Path) -> None:
+    script_body = (
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "title=${PR_TITLE}" "body=${PR_BODY}"\n'
+        "exit 0\n"
+    )
+    for name in STUB_GATE_NAMES:
+        script = directory / name
+        script.write_text(script_body, encoding="utf-8")
+        script.chmod(0o700)
+
+
+def _run_pr_check(
+    *,
+    gates_dir: Path,
+    pr: str | None = None,
+    body: str | None = None,
+    title: str | None = None,
+    extra_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = _isolated_env()
+    for key in ("PR", "BODY", "TITLE", "MAKEFLAGS", "MFLAGS"):
+        env.pop(key, None)
+    env["PR_BODY_GATES_DIR"] = str(gates_dir)
+    if extra_path is not None:
+        cur = env.get("PATH", "")
+        env["PATH"] = f"{extra_path}{os.pathsep}{cur}" if cur else str(extra_path)
+    cmd = [MAKE, "-s", "-C", str(ROOT), "-f", str(_makefile_path()), "pr-check"]
+    if pr is not None:
+        cmd.append(f"PR={pr}")
+    if body is not None:
+        cmd.append(f"BODY={body}")
+    if title is not None:
+        cmd.append(f"TITLE={title}")
+    return subprocess.run(  # noqa: S603  # nosec B603
+        cmd,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=SUBPROCESS_TIMEOUT_S,
+    )
+
+
+def _parse_stub_lines(stdout: str) -> tuple[list[str], list[str]]:
+    lines = stdout.split("\n")
+    titles = [line.removeprefix("title=") for line in lines if line.startswith("title=")]
+    bodies = [line.removeprefix("body=") for line in lines if line.startswith("body=")]
+    return titles, bodies
+
+
+def test_t6_planted_metacharacters_in_title_and_body_path(tmp_path: Path) -> None:
+    """TITLE metacharacters and BODY path with space/$ reach gates literally."""
+    stubs_dir = tmp_path / "stubs"
+    stubs_dir.mkdir()
+    _write_echo_stubs(stubs_dir)
+
+    body_dir = tmp_path / "dir with $dollar"
+    body_dir.mkdir()
+    body_file = body_dir / "pr-body.md"
+    body_text = "body payload with `echo no` $(echo no) $HOME \"dq\" 'sq'"
+    body_file.write_text(body_text, encoding="utf-8")
+
+    planted_title = "fix(ci): keep `echo injected` $(echo injected) $HOME \"dq\" 'sq'"
+    res = _run_pr_check(gates_dir=stubs_dir, body=str(body_file), title=planted_title)
+    assert res.returncode == RC_OK
+    titles, bodies = _parse_stub_lines(res.stdout)
+    assert len(titles) == len(STUB_GATE_NAMES)
+    for got_title in titles:
+        assert got_title.encode("utf-8") == planted_title.encode("utf-8")
+    assert bodies == [body_file.read_text(encoding="utf-8")] * len(STUB_GATE_NAMES)
+
+
+def test_t7_negative_control_unset_and_empty_title_use_head(tmp_path: Path) -> None:
+    """Unset or empty TITLE falls back to git log -1 --format=%s HEAD."""
+    stubs_dir = tmp_path / "stubs"
+    stubs_dir.mkdir()
+    _write_echo_stubs(stubs_dir)
+
+    body_file = tmp_path / "pr-body.md"
+    body_file.write_text("clean body", encoding="utf-8")
+    expected_subject = _head_subject()
+
+    for candidate in (None, ""):
+        res = _run_pr_check(gates_dir=stubs_dir, body=str(body_file), title=candidate)
+        assert res.returncode == RC_OK
+        titles, bodies = _parse_stub_lines(res.stdout)
+        assert titles == [expected_subject] * len(STUB_GATE_NAMES)
+        assert bodies == ["clean body"] * len(STUB_GATE_NAMES)
+
+
+def test_t8_boundary_unreadable_body_bad_pr_and_no_args(tmp_path: Path) -> None:
+    """Unreadable BODY, invalid PR (no gh call), and missing args exit 2."""
+    stubs_dir = tmp_path / "stubs"
+    stubs_dir.mkdir()
+    _write_echo_stubs(stubs_dir)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "gh-called.marker"
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        f"#!/usr/bin/env bash\nprintf 'called\\n' > {shlex.quote(str(marker))}\n"
+        'printf \'{"title":"ci: stub","body":"stub body"}\\n\'\n',
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o700)
+
+    unreadable = _run_pr_check(gates_dir=stubs_dir, body=str(tmp_path / "missing.md"))
+    assert unreadable.returncode == RC_USAGE
+
+    for bad_pr in ("12abc", "1; true", "0"):
+        bad = _run_pr_check(gates_dir=stubs_dir, pr=bad_pr, extra_path=fake_bin)
+        assert bad.returncode == RC_USAGE
+        assert "Usage:" in bad.stderr
+        assert not marker.exists()
+
+    neither = _run_pr_check(gates_dir=stubs_dir, extra_path=fake_bin)
+    assert neither.returncode == RC_USAGE
+    assert "Usage:" in neither.stderr
+    assert not marker.exists()
+
+    valid_pr = _run_pr_check(gates_dir=stubs_dir, pr="260", extra_path=fake_bin)
+    assert valid_pr.returncode == RC_OK
+    assert marker.exists()

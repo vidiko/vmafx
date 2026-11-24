@@ -933,30 +933,46 @@ hooks-install: install-hooks
 # Usage:
 #   make pr-check PR=260
 #   make pr-check BODY=pr-body.md [TITLE="fix: summary"]
+# Read PR, BODY and TITLE from env (GNU Make 4.4.1 §5.7.2 "Communicating Variables to a Sub-make").
+ifeq ($(origin PR),command line)
+pr-check: override export PR := $(value PR)
+endif
+ifeq ($(origin BODY),command line)
+pr-check: override export BODY := $(value BODY)
+endif
+ifeq ($(origin TITLE),command line)
+pr-check: override export TITLE := $(value TITLE)
+endif
 pr-check:
-	@if [ -n "$(PR)" ]; then \
-	    echo "--- pr-check: fetching PR $(PR) title and body via gh ---"; \
-	    pr_json="$$(gh pr view $(PR) --json title,body)" || exit $$?; \
+	@usage="Usage: make pr-check PR=<number>  OR  make pr-check BODY=<file> [TITLE=<text>]"; \
+	if [ -n "$${PR:-}" ]; then \
+	    case "$${PR:-}" in \
+	        ''|0*|*[!0123456789]*) \
+	            printf '%s\n' "$$usage" >&2; \
+	            exit 2 ;; \
+	    esac; \
+	    printf '%s\n' "--- pr-check: fetching PR $${PR:-} title and body via gh ---"; \
+	    pr_json="$$(gh pr view "$${PR:-}" --json title,body)" || exit $$?; \
 	    PR_TITLE="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("title") or "")')" \
 	    PR_BODY="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("body") or "")')" \
 	        bash scripts/ci/pr-body-gates.sh; \
-	elif [ -n "$(BODY)" ]; then \
-	    if [ ! -r "$(BODY)" ]; then \
-	        echo "pr-check: cannot read BODY file: $(BODY)" >&2; \
+	elif [ -n "$${BODY:-}" ]; then \
+	    if [ ! -r "$${BODY:-}" ]; then \
+	        printf 'pr-check: cannot read BODY file: %s\n' "$${BODY:-}" >&2; \
 	        exit 2; \
 	    fi; \
-	    if [ -n "$(TITLE)" ]; then \
-	        pr_title="$(TITLE)"; \
-	        echo "--- pr-check: reading body from $(BODY) (using TITLE: $$pr_title) ---"; \
+	    if [ -n "$${TITLE:-}" ]; then \
+	        pr_title="$${TITLE:-}"; \
+	        printf '%s\n' "--- pr-check: reading body from $${BODY:-} (using TITLE: $$pr_title) ---"; \
 	    else \
 	        pr_title="$$(git log -1 --format=%s HEAD)" || exit 2; \
-	        echo "--- pr-check: reading body from $(BODY) (using HEAD title: $$pr_title) ---"; \
+	        printf '%s\n' "--- pr-check: reading body from $${BODY:-} (using HEAD title: $$pr_title) ---"; \
 	    fi; \
 	    PR_TITLE="$$pr_title" \
-	    PR_BODY="$$(cat "$(BODY)")" \
+	    PR_BODY="$$(cat -- "$${BODY:-}")" \
 	        bash scripts/ci/pr-body-gates.sh; \
 	else \
-	    echo "Usage: make pr-check PR=<number>  OR  make pr-check BODY=<file> [TITLE=<text>]" >&2; \
+	    printf '%s\n' "$$usage" >&2; \
 	    exit 2; \
 	fi
 

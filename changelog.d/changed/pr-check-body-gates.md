@@ -5,4 +5,5 @@
   `docs/state.md` or `ffmpeg-patches` surface gates in CI. `PR=<num>` fetches
   the title and body in one `gh pr view` call; `BODY=<file>` accepts
   `TITLE=<text>` and defaults to the `HEAD` commit subject when `TITLE` is
-  empty.
+  empty. `TITLE` and `BODY` are passed to the gates literally without `make` or
+  shell expansion, and `PR` must be a positive decimal number.
