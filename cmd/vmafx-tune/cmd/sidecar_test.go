@@ -278,8 +278,8 @@ func TestSidecarRecordUsesSingleBaseline(t *testing.T) {
 				t.Fatalf("build sidecar: %v", err)
 			}
 			flags := &sidecarRecordFlags{
-				sidecarCommonFlags: sidecarCommonFlags{codec: codec, jsonOut: true},
-				crf:                crf, observedVMAF: tc.observed,
+				codec: codec, jsonOut: true,
+				crf: crf, observedVMAF: tc.observed,
 			}
 			out := captureStdout(t, func() {
 				if err := recordSidecarCapture(sp, flags, features); err != nil {
