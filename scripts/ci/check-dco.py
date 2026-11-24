@@ -741,7 +741,11 @@ def _drop_single_line(message: str, line: str) -> str | None:
 def landed_exempt_message(
     commit: Commit, root: Path = DEFAULT_ROOT, *, fetch: ci_tier.Fetcher | None = None
 ) -> str:
-    """Strip one release-bot co-author line on Renovate lock refresh or release-bot render."""
+    """Strip one release-bot co-author line for release-bot authors or Renovate grants.
+
+    Covers any landed commit authored by the release bot (seen on render commit
+    800122efd8) and Renovate commits matching ADR-3555 or ADR-3560 grants.
+    """
     if input_bound_reason(
         commit.message, "COMMIT_MESSAGE", MAX_COMMIT_MESSAGE_BYTES, MAX_COMMIT_MESSAGE_LINES
     ):

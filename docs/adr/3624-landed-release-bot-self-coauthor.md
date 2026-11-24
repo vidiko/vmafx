@@ -45,8 +45,10 @@ refresh.
 
 ## Consequences
 
-**Positive:** The landed commit message workflow accepts docs render commits on
-master without operator intervention.
+**Positive:** `.github/workflows/landed-commit-messages.yml` accepts any landed
+commit authored by `vmafx-release-bot[bot]` with one exact self
+`Co-authored-by:` line, such as docs render commit `800122efd8`, without
+operator intervention.
 
 **Negative:** Landed mode recognises one more stripped `Co-authored-by:` trailer
 shape.

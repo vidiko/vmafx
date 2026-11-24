@@ -88,7 +88,7 @@ class DcoLandedGateTest(unittest.TestCase):
                 self.assertIn(expected_text, res.stdout)
 
     def test_release_bot_self_coauthor_passes(self) -> None:
-        """Assert landed mode accepts a release-bot render commit with one self co-author."""
+        """Assert landed mode accepts a release-bot commit with one self co-author."""
         msg = (
             "chore(docs): render generated changelog and ADR index (#3613)\n\n"
             "Signed-off-by: vmafx-release-bot[bot] "
@@ -102,7 +102,7 @@ class DcoLandedGateTest(unittest.TestCase):
         self.assertIn("PASS", res.stdout)
 
     def test_release_bot_foreign_coauthor_refused(self) -> None:
-        """Assert landed mode refuses a release-bot commit with a foreign co-author."""
+        """Assert landed mode refuses a release-bot commit with another bot co-author."""
         msg = (
             "chore(docs): render generated changelog and ADR index (#3613)\n\n"
             "Signed-off-by: vmafx-release-bot[bot] "
@@ -118,7 +118,7 @@ class DcoLandedGateTest(unittest.TestCase):
         self.assertIn("Co-authored-by", res.stdout)
 
     def test_release_bot_human_coauthor_passes(self) -> None:
-        """Assert landed mode keeps a human co-author on a release-bot render commit."""
+        """Assert landed mode keeps a human co-author on a release-bot commit."""
         msg = (
             "chore(docs): render generated changelog and ADR index (#3613)\n\n"
             "Signed-off-by: vmafx-release-bot[bot] "
@@ -160,6 +160,75 @@ class DcoLandedGateTest(unittest.TestCase):
         res = self.repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn("Co-authored-by", res.stdout)
+
+    def test_release_bot_near_miss_coauthor_lines_refused(self) -> None:
+        """Assert landed mode refuses near-miss release-bot self co-author lines."""
+        cases = (
+            (
+                "lowercase_key",
+                "co-authored-by: vmafx-release-bot[bot] "
+                "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>",
+            ),
+            (
+                "double_space_after_colon",
+                "Co-authored-by:  vmafx-release-bot[bot] "
+                "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>",
+            ),
+            (
+                "wrong_noreply_id",
+                "Co-authored-by: vmafx-release-bot[bot] "
+                "<1+vmafx-release-bot[bot]@users.noreply.github.com>",
+            ),
+        )
+        for name, coauthor_line in cases:
+            msg = (
+                "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+                "Signed-off-by: vmafx-release-bot[bot] "
+                "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>\n"
+                f"{coauthor_line}"
+            )
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                repo = fx.Repo(Path(directory))
+                repo.commit(msg, fx.RELEASE_BOT_IDENT)
+                res = repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn("Co-authored-by", res.stdout)
+
+    def test_release_bot_author_identity_boundaries(self) -> None:
+        """Assert landed mode requires exact release-bot name and case-insensitive email."""
+        cases = (
+            (
+                "wrong_author_email",
+                ("vmafx-release-bot[bot]", "other@example.org"),
+                1,
+                "Co-authored-by",
+            ),
+            (
+                "mixed_case_author_name",
+                ("VMAFx-Release-Bot[bot]", fx.RELEASE_BOT_IDENT[1]),
+                1,
+                "Co-authored-by",
+            ),
+            (
+                "uppercase_author_email",
+                (fx.RELEASE_BOT_IDENT[0], fx.RELEASE_BOT_IDENT[1].upper()),
+                0,
+                "PASS",
+            ),
+        )
+        for name, ident, expected_rc, expected_text in cases:
+            msg = (
+                "chore(docs): render generated changelog and ADR index (#3613)\n\n"
+                f"Signed-off-by: {ident[0]} <{ident[1]}>\n"
+                "Co-authored-by: vmafx-release-bot[bot] "
+                "<340976456+vmafx-release-bot[bot]@users.noreply.github.com>"
+            )
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                repo = fx.Repo(Path(directory))
+                repo.commit(msg, ident)
+                res = repo.gate("--landed", "--landing-identity", fx.LANDING_ID)
+                self.assertEqual(res.returncode, expected_rc, res.stdout + res.stderr)
+                self.assertIn(expected_text, res.stdout)
 
     def test_model_author_identity_fails(self) -> None:
         """A landed coding tool author is refused with landing repair advice."""

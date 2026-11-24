@@ -327,6 +327,12 @@ also strips that exact line under the same author and single-line conditions
 when the squash paths and merged pull request satisfy the Python lock refresh
 conditions above.
 
+When the commit author is `vmafx-release-bot[bot]` itself (lowercased email
+`340976456+vmafx-release-bot[bot]@users.noreply.github.com`), `--landed` also
+strips one exact `RELEASE_BOT_COAUTHOR` line with no path condition
+([ADR-3624](../adr/3624-landed-release-bot-self-coauthor.md), detailed under
+[Exemptions](#exemptions) above).
+
 The check examines non-merge commits in the range `BASE_SHA..HEAD_SHA`. If
 the base SHA is all zeros (initial push) or not an ancestor-reachable commit,
 it evaluates the head commit alone.
