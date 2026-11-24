@@ -5,17 +5,19 @@
 
 Positive: checked-in tests-and-quality-gates.yml holds; quoted (`'`, `"`), split plain, and
 literal-block `run` steps fail without --no-install-recommends and pass with it; workflow and
-composite-action step `run` scalars report missing flags at their `run:` line; qualified apt
-tokens (`:arch`, `=version`, `/release`, trailing `+`) match their base package name.
+composite-action step `run` scalars report missing flags at their `run:` line; anchored `env`
+mappings aliased into a later job's `steps` report missing flags at the anchored `run:` line;
+qualified apt tokens (`:arch`, `=version`, `/release`, trailing `+`) match their base package name.
 Negative: non-driver packages, `-dev:arch` packages, and trailing-`-` removal tokens pass without
 --no-install-recommends; quoted `run` keys in job or step `env` mappings (`env.run`,
-`steps[*].env.run`) pass without findings; single-line plain `run` steps are recorded once across
-raw and YAML scans; chained subcommands and multiple installs on one line fail when any flagged
-install omits the flag.
-Boundary: YAML decoding scans only `MappingNode` items of `steps` sequences; backslash-continued
-flags pass; backslash-space/tab do not continue; continuations over MAX_CONTINUATION_LINES,
-invalid collection YAML, YAML over MAX_YAML_NODES, missing apt lists, oversize workflow/list
-inputs, and excess install calls (MAX_INSTALL_CALLS) fail closed.
+`steps[*].env.run`) pass without findings; anchored `env` mappings with no `steps` alias pass
+without findings; single-line plain `run` steps are recorded once across raw and YAML scans;
+chained subcommands and multiple installs on one line fail when any flagged install omits the flag.
+Boundary: YAML decoding scans only `MappingNode` items of `steps` sequences; aliased step mappings
+deduplicate by node id across repeated `steps` aliases and step-then-`env` reuse;
+backslash-continued flags pass; backslash-space/tab do not continue; continuations over
+MAX_CONTINUATION_LINES, invalid collection YAML, YAML over MAX_YAML_NODES, missing apt lists,
+oversize workflow/list inputs, and excess install calls (MAX_INSTALL_CALLS) fail closed.
 """
 
 from __future__ import annotations
@@ -133,14 +135,22 @@ def _mapping_run_scalars(mapping: yaml.MappingNode) -> list[tuple[int, int, str]
     return scalars
 
 
-def _record_step_mapping_ids(mapping: yaml.MappingNode, step_ids: set[int]) -> None:
-    """Record node ids of MappingNode items in any `steps` SequenceNode on mapping."""
+def _record_step_mapping_ids(
+    mapping: yaml.MappingNode,
+    step_ids: set[int],
+) -> list[yaml.MappingNode]:
+    """Register new `MappingNode` items in `steps` sequences on `mapping` and return them."""
+    new_steps: list[yaml.MappingNode] = []
     for key_node, val_node in mapping.value:
         if not (isinstance(key_node, yaml.ScalarNode) and key_node.value == "steps"):
             continue
         if not isinstance(val_node, yaml.SequenceNode):
             continue
-        step_ids.update(id(item) for item in val_node.value if isinstance(item, yaml.MappingNode))
+        for item in val_node.value:
+            if isinstance(item, yaml.MappingNode) and id(item) not in step_ids:
+                step_ids.add(id(item))
+                new_steps.append(item)
+    return new_steps
 
 
 def _yaml_run_scalars(
@@ -165,9 +175,8 @@ def _yaml_run_scalars(
             return (scalars, None)
         current = stack.pop()
         if isinstance(current, yaml.MappingNode):
-            _record_step_mapping_ids(current, step_ids)
-            if id(current) in step_ids:
-                scalars.extend(_mapping_run_scalars(current))
+            for step in _record_step_mapping_ids(current, step_ids):
+                scalars.extend(_mapping_run_scalars(step))
         _push_child_collections(current, stack, seen)
     return ([], f"{source_name}:1: {HOSTED_YAML_NODE_BOUND_MESSAGE}")
 
@@ -732,10 +741,107 @@ class AptInstallRecommendsTest(unittest.TestCase):
         )
         self.assertEqual(
             check_workflow_text(snippet, repo_root=self.root, source_name="action.yml"),
+            ["action.yml:4: .github/apt/cov.txt names libcudart12 without --no-install-recommends"],
+        )
+
+    def test_anchored_env_aliased_as_step_without_flag_fails(self) -> None:
+        self._write_list(".github/apt/cov.txt", "libcudart12\n")
+        expected = [
+            "fixture.yml:5: .github/apt/cov.txt names libcudart12 without --no-install-recommends"
+        ]
+        for quote in ("", "'"):
+            snippet = (
+                "jobs:\n"
+                "  a:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    env: &step\n"
+                f"      run: {quote}bash scripts/ci/apt-install-cached.sh"
+                f" install .github/apt/cov.txt{quote}\n"
+                "    steps:\n"
+                "      - run: echo ok\n"
+                "  b:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - *step\n"
+            )
+            self.assertEqual(
+                check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml"),
+                expected,
+            )
+
+    def test_aliased_step_mapping_dedup_boundary(self) -> None:
+        self._write_list(".github/apt/cov.txt", "libcudart12\n")
+        two_step_aliases = (
+            "jobs:\n"
+            "  a:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    env: &step\n"
+            "      run: 'bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt'\n"
+            "    steps:\n"
+            "      - run: echo ok\n"
+            "  b:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - *step\n"
+            "  c:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - *step\n"
+        )
+        expected = [
+            "fixture.yml:5: .github/apt/cov.txt names libcudart12 without --no-install-recommends"
+        ]
+        self.assertEqual(
+            check_workflow_text(two_step_aliases, repo_root=self.root, source_name="fixture.yml"),
+            expected,
+        )
+        step_then_env = (
+            "jobs:\n"
+            "  a:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - &step\n"
+            "        run: 'bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt'\n"
+            "  b:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    env: *step\n"
+            "    steps:\n"
+            "      - run: echo ok\n"
+        )
+        self.assertEqual(
+            check_workflow_text(step_then_env, repo_root=self.root, source_name="fixture.yml"),
             [
-                "action.yml:4: .github/apt/cov.txt names libcudart12"
+                "fixture.yml:6: .github/apt/cov.txt names libcudart12"
                 " without --no-install-recommends"
             ],
+        )
+
+    def test_anchored_env_without_step_alias_passes(self) -> None:
+        self._write_list(".github/apt/cov.txt", "libcudart12\n")
+        unaliased = (
+            "jobs:\n"
+            "  a:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    env: &step\n"
+            "      run: 'bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt'\n"
+            "    steps:\n"
+            "      - run: echo ok\n"
+        )
+        self.assertEqual(
+            check_workflow_text(unaliased, repo_root=self.root, source_name="fixture.yml"),
+            [],
+        )
+        env_only_alias = (
+            unaliased
+            + "  b:\n"
+            + "    runs-on: ubuntu-latest\n"
+            + "    env: *step\n"
+            + "    steps:\n"
+            + "      - run: echo ok\n"
+        )
+        self.assertEqual(
+            check_workflow_text(env_only_alias, repo_root=self.root, source_name="fixture.yml"),
+            [],
         )
 
 
