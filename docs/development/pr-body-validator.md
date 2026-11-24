@@ -360,6 +360,18 @@ claims: every probe name below plus `cuda`, `cuda toolkit`, `sycl`, `oneapi`,
 word, so `tidy-metal` does not match `metal` while `x86_64-w64-mingw32-gcc`
 matches as one name.
 
+A `no <tool>` phrase counts as an absence claim unless it is a change-scope
+phrase (`p_no_scope` in `scripts/ci/check-toolchain-claims.sh`) in one of two
+shapes: `no <tool>` followed directly or after one word by `change`, `changes`,
+`changed`, `edit`, `edits`, `edited`, `touched`, or `modified` (for example,
+`This PR has no SYCL changes.` or `no nvcc flags changed`), or `no <tool>`
+directly preceded by `touch`, `touches`, `touched`, `change`, `changes`,
+`changed`, `edit`, `edits`, `edited`, `modify`, `modifies`, or `modified` (for
+example, `Touches no CUDA code.`). Each change-scope match is stripped from the
+clause before classification and tool lookup; any other `no <tool>` sentence,
+including a second unscoped `no <tool>` in the same clause, still needs the
+`toolchain-probe v1` block.
+
 Both absence and compilation claims require probe results from
 `scripts/dev/toolchain-probe.sh`. An absence claim is a host claim unless the
 clause or line names a `CI`, `runner`, `image`, `container`, or `golden-build`

@@ -176,6 +176,13 @@ while IFS= read -r line; do
 done <<<"${body_text}"
 
 p_no="${wb_l}no${space}\`*(${claim_words})\`*${wb_tok_r}"
+# Allow-list change-scope `no <tool>` phrases in two shapes:
+#   (a) change word follows directly or after one word (`no SYCL changes`, `no nvcc flags changed`);
+#   (b) change verb directly precedes `no <tool>` (`Touches no CUDA`, `changes no HIP`).
+p_scope_word="\`*[a-zA-Z0-9][a-zA-Z0-9_-]*\`*"
+p_no_scope_after="no${space}\`*(${claim_words})\`*${space}(${p_scope_word}${space})?(change|changes|changed|edit|edits|edited|touched|modified)${wb_r}"
+p_no_scope_before="(touch|touches|touched|change|changes|changed|edit|edits|edited|modify|modifies|modified)${space}no${space}\`*(${claim_words})\`*${wb_tok_r}"
+p_no_scope="${wb_l}(${p_no_scope_after}|${p_no_scope_before})"
 p_lacks="${wb_l}(lacks|lacking)${space}((a|an|the)${space})?\`*(${claim_words})\`*${wb_tok_r}"
 p_status="${wb_tok_l}\`*(${claim_words})\`*(${space}(is|are|was|were))?${space}(not${space}(installed|found|available)|missing|unavailable|absent)${wb_r}"
 p_absence="(${p_no}|${p_lacks}|${p_status})"
@@ -282,16 +289,33 @@ check_clause_tools() {
   done < <(claim_tools "${clause}")
 }
 
+strip_scoped_no() {
+  local rem="$1" i
+  for ((i = 0; i < 32; i++)); do
+    if [[ ! "${rem}" =~ ${p_no_scope} ]]; then
+      stripped_clause="${rem}"
+      return 0
+    fi
+    rem="${rem/"${BASH_REMATCH[0]}"/ , }"
+  done
+  if [[ "${rem}" =~ ${p_no_scope} ]]; then
+    stripped_clause="$1"
+  else
+    stripped_clause="${rem}"
+  fi
+}
+
 check_claim() {
-  local idx="$1" line="$2" clause missing='' contradicted=''
+  local idx="$1" line="$2" clause stripped_clause='' missing='' contradicted=''
   local -A seen_miss=() seen_contra=()
   while IFS= read -r clause; do
-    classify_claim "${clause}" "${line}" || continue
+    strip_scoped_no "${clause}"
+    classify_claim "${stripped_clause}" "${line}" || continue
     if [ "${has_probe_header}" -eq 0 ]; then
       emit_missing_probe "${idx}" "${line}"
       return 1
     fi
-    check_clause_tools "${clause}"
+    check_clause_tools "${stripped_clause}"
   done < <(split_clauses "${line}")
   emit_claim_errors "${idx}" "${line}" "${missing}" "${contradicted}"
 }

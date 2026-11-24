@@ -583,6 +583,42 @@ toolchain-probe: metal absent searched=none os=Linux
 toolchain-probe: x86_64-w64-mingw32-gcc absent searched=PATH
 ${fence}"
 
+# ---------- Change-scope 'no <tool>' prose vs absence claims (PR 3298 review finding) ----------
+tick="${fence:0:1}"
+expect_body "scope pass: This PR has no SYCL changes." 0 'This PR has no SYCL changes.'
+expect_body "scope pass: Touches no CUDA code." 0 'Touches no CUDA code.'
+expect_body "scope pass: no nvcc flags changed" 0 'no nvcc flags changed'
+expect_body "scope pass: No Vulkan files changed." 0 'No Vulkan files changed.'
+expect_body "scope pass: changes no HIP code" 0 'changes no HIP code'
+expect_body "scope pass: no ${tick}nvcc${tick} flags changed" 0 "no ${tick}nvcc${tick} flags changed"
+expect_body "scope pass: There is no doubt SYCL is available." 0 'There is no doubt SYCL is available.'
+
+expect_body "scope fail: SYCL is not available on the runner." 1 'SYCL is not available on the runner.'
+expect_body "scope fail: There is no nvcc on this host." 1 'There is no nvcc on this host.'
+expect_body "scope fail: no nvcc found" 1 'no nvcc found'
+expect_body "scope fail: No CUDA toolkit here." 1 'No CUDA toolkit here.'
+expect_body "scope fail: bare no CUDA code stays fail-closed" 1 'no CUDA code'
+expect_body "scope fail: scoped SYCL + unscoped no nvcc without probe" 1 \
+  'This PR has no SYCL changes and there is no nvcc on this host.'
+expect_body "scope fail: scoped SYCL + built without nvcc here" 1 \
+  'no SYCL changes, built without nvcc here'
+
+expect_body "scope positive: scoped SYCL + unscoped no nvcc with nvcc absent probe" 0 \
+  "This PR has no SYCL changes and there is no nvcc on this host.
+
+${fence}text
+toolchain-probe v1 host=test-box os=Linux date=2026-11-04T00:00:00Z
+toolchain-probe: nvcc absent searched=PATH,/opt/cuda,/usr/local/cuda
+${fence}"
+
+scope_32=''
+for ((scope_i = 0; scope_i < 32; scope_i++)); do
+  scope_32+="${scope_32:+, }no SYCL changes"
+done
+expect_body "scope boundary: 32 scoped matches in one clause pass" 0 "${scope_32}"
+expect_body "scope boundary: 33 scoped matches exceed cap and fail closed" 1 \
+  "${scope_32}, no SYCL changes"
+
 probe_os="$(uname -s)"
 if [[ "${probe_os}" != Darwin ]]; then
   if [[ "${probe_empty_out}" == *"toolchain-probe: metal absent searched=none os=${probe_os}"* ]]; then
