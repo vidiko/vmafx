@@ -142,13 +142,17 @@ artifact (signature, certificate and Rekor entry in one file), not the legacy
 split `.sig` and `.pem` pair. The registry names a model's bundle
 `<name>.onnx.sigstore.json`, see [model-registry.md](model-registry.md).
 
-To verify a model by hand before loading it:
+To verify a model by hand before loading it, copy the bundle once into a
+private directory from `mktemp -d`:
 
 ```bash
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp model/tiny/vmaf_tiny_v2.onnx.sigstore.json "$work/bundle.json"
 cosign verify-blob \
     --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    --bundle model/tiny/vmaf_tiny_v2.onnx.sigstore.json \
+    --bundle "$work/bundle.json" \
     model/tiny/vmaf_tiny_v2.onnx
 ```
 
@@ -161,11 +165,12 @@ numeric owner ID, `340303765`, binds the certificate to the organisation even
 if GitHub reassigns the login. After `cosign verify-blob` succeeds, check that
 ID in the same bundle's signing certificate with `jq` and OpenSSL. This uses
 the bundle certificate check from the
-[release guide](../development/release.md#check-the-signers-owner-id).
+[release guide](../development/release.md#check-the-signers-owner-id). Run it
+in the same shell so `jq` reads the same `"$work/bundle.json"` copy.
 
 ```bash
 set -o pipefail
-jq -er '.verificationMaterial.certificate.rawBytes' model/tiny/vmaf_tiny_v2.onnx.sigstore.json \
+jq -er '.verificationMaterial.certificate.rawBytes' "$work/bundle.json" \
   | base64 -d \
   | openssl x509 -inform DER -noout -text \
   | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' \

@@ -780,8 +780,12 @@ and MCP wheel come from `supply-chain.yml`; the container images come from
 # slsa-verifier recipe further down.
 tag=v0.1.0
 
-# Release blob. Every vmaf/libvmaf.so*/libvmafx.so* asset has a matching FILE.bundle.
-cosign verify-blob --bundle vmaf.bundle vmaf \
+# Release blob. Every vmaf/libvmaf.so*/libvmafx.so* asset has a matching
+# FILE.bundle. Copy it once into a private directory from mktemp -d.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp vmaf.bundle "$work/vmaf.bundle"
+cosign verify-blob --bundle "$work/vmaf.bundle" vmaf \
   --certificate-identity \
     "https://github.com/vidiko/vmafx/.github/workflows/supply-chain.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
@@ -858,10 +862,11 @@ This checks the attestation certificate, not the separate cosign blob signature.
 For a cosign bundle (`<artifact>.bundle`), read the owner ID from the bundle's
 signing certificate after `cosign verify-blob` passes. The command needs `jq`
 and OpenSSL and checks the Fulcio extension `1.3.6.1.4.1.57264.1.17` (source
-repository owner identifier):
+repository owner identifier). Run it in the same shell so `jq` reads the copy
+in `$work`:
 
 ```bash
-jq -r '.verificationMaterial.certificate.rawBytes' vmaf.bundle | base64 -d \
+jq -r '.verificationMaterial.certificate.rawBytes' "$work/vmaf.bundle" | base64 -d \
   | openssl x509 -inform DER -noout -text \
   | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
   && echo "owner ID OK" || echo "owner ID mismatch"
