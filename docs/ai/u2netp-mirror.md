@@ -123,12 +123,16 @@ pattern matches the repository path, which a new account under the same
 name would also produce ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
 The second command reads the owner ID from the bundle's signing
 certificate. Run the commands in steps 5 and 6 from the download
-directory of step 4.
+directory of step 4. Copy `u2netp_mirror_v1.onnx.bundle` once into a
+private directory from `mktemp -d`:
 
 ```bash
 cd ~/Downloads/u2netp-mirror
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp u2netp_mirror_v1.onnx.bundle "$work/u2netp_mirror_v1.onnx.bundle"
 cosign verify-blob \
-  --bundle u2netp_mirror_v1.onnx.bundle \
+  --bundle "$work/u2netp_mirror_v1.onnx.bundle" \
   --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   u2netp_mirror_v1.onnx
@@ -145,10 +149,12 @@ the binary is not the one this fork released. Do not load it.
 
 Then check the owner ID. The command needs `jq` and OpenSSL. It reads the
 Fulcio certificate extension `1.3.6.1.4.1.57264.1.17` (source repository
-owner identifier) and requires `340303765`, the numeric ID of `vidiko`:
+owner identifier) and requires `340303765`, the numeric ID of `vidiko`. Run it
+in the same shell so `jq` reads the same
+`"$work/u2netp_mirror_v1.onnx.bundle"` copy:
 
 ```bash
-jq -r '.verificationMaterial.certificate.rawBytes' u2netp_mirror_v1.onnx.bundle | base64 -d \
+jq -r '.verificationMaterial.certificate.rawBytes' "$work/u2netp_mirror_v1.onnx.bundle" | base64 -d \
   | openssl x509 -inform DER -noout -text \
   | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
   && echo "owner ID OK" || echo "owner ID mismatch: do not load"
