@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -48,17 +49,20 @@ def _isolated_env() -> dict[str, str]:
     return env
 
 
-def _head_sha() -> str:
-    done = subprocess.run(  # noqa: S603  # nosec B603
-        [GIT, "rev-parse", "HEAD"],
-        cwd=ROOT,
+def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603  # nosec B603
+        [GIT, *args],
+        cwd=cwd,
         env=_isolated_env(),
         capture_output=True,
         text=True,
-        check=True,
+        check=check,
         timeout=SUBPROCESS_TIMEOUT_S,
     )
-    return done.stdout.strip()
+
+
+def _head_sha() -> str:
+    return _git(ROOT, "rev-parse", "HEAD").stdout.strip()
 
 
 def _wrapper_path() -> Path:
@@ -256,28 +260,63 @@ def _makefile_path() -> Path:
 
 
 def _head_subject() -> str:
-    done = subprocess.run(  # noqa: S603  # nosec B603
-        [GIT, "log", "-1", "--format=%s", "HEAD"],
-        cwd=ROOT,
-        env=_isolated_env(),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=SUBPROCESS_TIMEOUT_S,
+    return _git(ROOT, "log", "-1", "--format=%s", "HEAD").stdout.rstrip("\r\n")
+
+
+def _init_fixture_repo(repo_dir: Path) -> tuple[str, str]:
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    _git(repo_dir, "init", "-q", "-b", "main")
+    wrapper_dst = repo_dir / "scripts" / "ci" / "pr-body-gates.sh"
+    wrapper_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(DEFAULT_WRAPPER, wrapper_dst)
+    _git(repo_dir, "add", "-A")
+    commit_ident = (
+        "-c",
+        "user.name=Ada",
+        "-c",
+        "user.email=ada@example.org",
+        "-c",
+        "commit.gpgsign=false",
     )
-    return done.stdout.rstrip("\r\n")
+    _git(repo_dir, *commit_ident, "commit", "-q", "-m", "base")
+    base_sha = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+    (repo_dir / "change.txt").write_text("delta\n", encoding="utf-8")
+    _git(repo_dir, "add", "-A")
+    _git(repo_dir, *commit_ident, "commit", "-q", "-m", "head")
+    head_sha = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+    return base_sha, head_sha
 
 
-def _write_echo_stubs(directory: Path) -> None:
+def _write_echo_stubs(directory: Path, marker: Path | None = None) -> None:
+    directory.mkdir(exist_ok=True)
+    marker_cmd = f"printf 'ran\\n' >> {shlex.quote(str(marker))}\n" if marker else ""
     script_body = (
         "#!/usr/bin/env bash\n"
-        'printf \'%s\\n\' "title=${PR_TITLE}" "body=${PR_BODY}"\n'
+        f"{marker_cmd}"
+        'printf \'%s\\n\' "title=${PR_TITLE}" "body=${PR_BODY}" '
+        '"base=${BASE_SHA-<unset>}" "head=${HEAD_SHA-<unset>}"\n'
         "exit 0\n"
     )
     for name in STUB_GATE_NAMES:
         script = directory / name
         script.write_text(script_body, encoding="utf-8")
         script.chmod(0o700)
+
+
+def _write_fake_gh(
+    bin_dir: Path,
+    payload: dict[str, object],
+    marker: Path | None = None,
+) -> None:
+    bin_dir.mkdir(exist_ok=True)
+    marker_cmd = f"printf 'called\\n' > {shlex.quote(str(marker))}\n" if marker else ""
+    encoded = shlex.quote(json.dumps(payload))
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        f"#!/usr/bin/env bash\n{marker_cmd}printf '%s\\n' {encoded}\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o700)
 
 
 def _run_pr_check(
@@ -287,6 +326,7 @@ def _run_pr_check(
     body: str | None = None,
     title: str | None = None,
     extra_path: Path | None = None,
+    cwd: Path = ROOT,
 ) -> subprocess.CompletedProcess[str]:
     env = _isolated_env()
     for key in ("PR", "BODY", "TITLE", "MAKEFLAGS", "MFLAGS"):
@@ -295,7 +335,7 @@ def _run_pr_check(
     if extra_path is not None:
         cur = env.get("PATH", "")
         env["PATH"] = f"{extra_path}{os.pathsep}{cur}" if cur else str(extra_path)
-    cmd = [MAKE, "-s", "-C", str(ROOT), "-f", str(_makefile_path()), "pr-check"]
+    cmd = [MAKE, "-s", "-C", str(cwd), "-f", str(_makefile_path()), "pr-check"]
     if pr is not None:
         cmd.append(f"PR={pr}")
     if body is not None:
@@ -304,7 +344,7 @@ def _run_pr_check(
         cmd.append(f"TITLE={title}")
     return subprocess.run(  # noqa: S603  # nosec B603
         cmd,
-        cwd=ROOT,
+        cwd=cwd,
         env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -319,6 +359,13 @@ def _parse_stub_lines(stdout: str) -> tuple[list[str], list[str]]:
     titles = [line.removeprefix("title=") for line in lines if line.startswith("title=")]
     bodies = [line.removeprefix("body=") for line in lines if line.startswith("body=")]
     return titles, bodies
+
+
+def _parse_stub_revisions(stdout: str) -> tuple[list[str], list[str]]:
+    lines = stdout.split("\n")
+    bases = [line.removeprefix("base=") for line in lines if line.startswith("base=")]
+    heads = [line.removeprefix("head=") for line in lines if line.startswith("head=")]
+    return bases, heads
 
 
 def test_t6_planted_metacharacters_in_title_and_body_path(tmp_path: Path) -> None:
@@ -362,21 +409,18 @@ def test_t7_negative_control_unset_and_empty_title_use_head(tmp_path: Path) -> N
 
 
 def test_t8_boundary_unreadable_body_bad_pr_and_no_args(tmp_path: Path) -> None:
-    """Unreadable BODY, invalid PR (no gh call), and missing args exit 2."""
+    """Unreadable BODY, invalid PR (no gh call), missing args, and failed gate exit 2."""
     stubs_dir = tmp_path / "stubs"
-    stubs_dir.mkdir()
     _write_echo_stubs(stubs_dir)
 
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
     marker = tmp_path / "gh-called.marker"
-    fake_gh = fake_bin / "gh"
-    fake_gh.write_text(
-        f"#!/usr/bin/env bash\nprintf 'called\\n' > {shlex.quote(str(marker))}\n"
-        'printf \'{"title":"ci: stub","body":"stub body"}\\n\'\n',
-        encoding="utf-8",
+    sha = _head_sha()
+    _write_fake_gh(
+        fake_bin,
+        {"title": "ci: stub", "body": "stub body", "baseRefOid": sha, "headRefOid": sha},
+        marker=marker,
     )
-    fake_gh.chmod(0o700)
 
     unreadable = _run_pr_check(gates_dir=stubs_dir, body=str(tmp_path / "missing.md"))
     assert unreadable.returncode == RC_USAGE
@@ -395,3 +439,125 @@ def test_t8_boundary_unreadable_body_bad_pr_and_no_args(tmp_path: Path) -> None:
     valid_pr = _run_pr_check(gates_dir=stubs_dir, pr="260", extra_path=fake_bin)
     assert valid_pr.returncode == RC_OK
     assert marker.exists()
+
+    _write_stubs(stubs_dir, dict.fromkeys(STUB_GATE_NAMES, RC_FAIL))
+    failed_gate = _run_pr_check(gates_dir=stubs_dir, pr="260", extra_path=fake_bin)
+    assert failed_gate.returncode == RC_USAGE
+    assert "pr-body-gates: summary pass=0 fail=3 error=0 rc=1" in failed_gate.stdout.splitlines()
+
+
+def test_t9_pr_mode_passes_pr_revisions_to_gates(tmp_path: Path) -> None:
+    """PR mode passes gh baseRefOid and headRefOid to every gate as BASE_SHA and HEAD_SHA."""
+    repo = tmp_path / "repo"
+    base_sha, head_sha = _init_fixture_repo(repo)
+    assert base_sha != head_sha
+
+    stubs_dir = tmp_path / "stubs"
+    _write_echo_stubs(stubs_dir)
+    fake_bin = tmp_path / "bin"
+    _write_fake_gh(
+        fake_bin,
+        {
+            "title": "fix: pr seven",
+            "body": "body seven",
+            "baseRefOid": base_sha,
+            "headRefOid": head_sha,
+        },
+    )
+
+    res = _run_pr_check(gates_dir=stubs_dir, pr="7", extra_path=fake_bin, cwd=repo)
+    assert res.returncode == RC_OK
+    titles, bodies = _parse_stub_lines(res.stdout)
+    bases, heads = _parse_stub_revisions(res.stdout)
+    assert titles == ["fix: pr seven"] * len(STUB_GATE_NAMES)
+    assert bodies == ["body seven"] * len(STUB_GATE_NAMES)
+    assert bases == [base_sha] * len(STUB_GATE_NAMES)
+    assert heads == [head_sha] * len(STUB_GATE_NAMES)
+
+
+def test_t10_pr_mode_fetches_missing_revision(tmp_path: Path) -> None:
+    """PR mode fetches a missing revision from origin before running the gates."""
+    upstream = tmp_path / "upstream"
+    base_sha, head_sha = _init_fixture_repo(upstream)
+    bare_origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-q", str(bare_origin))
+    _git(
+        upstream,
+        "push",
+        "-q",
+        str(bare_origin),
+        f"{base_sha}:refs/heads/main",
+        f"{head_sha}:refs/heads/pr-7",
+    )
+
+    local_repo = tmp_path / "local"
+    local_repo.mkdir()
+    _git(local_repo, "init", "-q", "-b", "main")
+    _git(local_repo, "remote", "add", "origin", str(bare_origin))
+    _git(local_repo, "fetch", "--no-tags", "-q", "origin", "refs/heads/main")
+    _git(local_repo, "checkout", "-q", "-B", "main", "FETCH_HEAD")
+    assert _git(local_repo, "cat-file", "-e", f"{head_sha}^{{commit}}", check=False).returncode != 0
+
+    stubs_dir = tmp_path / "stubs"
+    _write_echo_stubs(stubs_dir)
+    fake_bin = tmp_path / "bin"
+    _write_fake_gh(
+        fake_bin,
+        {
+            "title": "fix: fetched head",
+            "body": "fetched body",
+            "baseRefOid": base_sha,
+            "headRefOid": head_sha,
+        },
+    )
+
+    res = _run_pr_check(gates_dir=stubs_dir, pr="7", extra_path=fake_bin, cwd=local_repo)
+    assert res.returncode == RC_OK
+    assert _git(local_repo, "cat-file", "-e", f"{head_sha}^{{commit}}").returncode == RC_OK
+    bases, heads = _parse_stub_revisions(res.stdout)
+    assert bases == [base_sha] * len(STUB_GATE_NAMES)
+    assert heads == [head_sha] * len(STUB_GATE_NAMES)
+
+
+def test_t11_pr_mode_unobtainable_revision_fails(tmp_path: Path) -> None:
+    """Missing or non-hex PR revisions exit 2 with pr-check diagnostic and run no gate."""
+    repo = tmp_path / "repo"
+    base_sha, head_sha = _init_fixture_repo(repo)
+    bare_origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-q", str(bare_origin))
+    _git(repo, "remote", "add", "origin", str(bare_origin))
+
+    gate_marker = tmp_path / "gate-ran.marker"
+    stubs_dir = tmp_path / "stubs"
+    _write_echo_stubs(stubs_dir, marker=gate_marker)
+    fake_bin = tmp_path / "bin"
+
+    for kind, bad_base, bad_head, missing_sha in (
+        ("base", "a" * 40, head_sha, "a" * 40),
+        ("head", base_sha, "b" * 40, "b" * 40),
+        ("head", base_sha, "c" * 64, "c" * 64),
+    ):
+        _write_fake_gh(
+            fake_bin,
+            {"title": "fix: t11", "body": "b", "baseRefOid": bad_base, "headRefOid": bad_head},
+        )
+        res = _run_pr_check(gates_dir=stubs_dir, pr="7", extra_path=fake_bin, cwd=repo)
+        assert res.returncode == RC_USAGE
+        assert f"pr-check: cannot obtain {kind} revision {missing_sha} of PR 7" in res.stderr
+        assert not gate_marker.exists()
+
+    for bad_base, bad_head in (
+        ("not-a-hex-sha", head_sha),
+        (base_sha, "A" * 40),
+        (base_sha, "a" * 39),
+        ("", head_sha),
+    ):
+        _write_fake_gh(
+            fake_bin,
+            {"title": "fix: t11", "body": "b", "baseRefOid": bad_base, "headRefOid": bad_head},
+        )
+        res = _run_pr_check(gates_dir=stubs_dir, pr="7", extra_path=fake_bin, cwd=repo)
+        assert res.returncode == RC_USAGE
+        err_lines = [ln for ln in res.stderr.splitlines() if not ln.startswith("make:")]
+        assert len(err_lines) == 1 and err_lines[0].startswith("pr-check:")
+        assert not gate_marker.exists()

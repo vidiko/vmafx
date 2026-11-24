@@ -29,6 +29,9 @@ gh pr view <number> --json body -q .body \
   | scripts/ci/validate-pr-body.sh
 ```
 
+`make pr-check PR=<number>` diffs the PR's base and head revisions, fetching
+them from `origin` when missing, and fails when it cannot.
+
 !!! note "Hook behaviour and exemptions"
     The hook bounds `gh` lookup time, falls back to the repository's public
     pull-request pages when local credentials are unavailable, and blocks the
@@ -164,15 +167,20 @@ error line:
 
 ## Exit codes
 
-`make pr-check` (`scripts/ci/pr-body-gates.sh`, running the deliverables,
-`docs/state.md` touch and `ffmpeg-patches` surface gates) and the standalone
-deliverables validator `scripts/ci/validate-pr-body.sh` exit with:
+`scripts/ci/pr-body-gates.sh` (running the deliverables, `docs/state.md` touch
+and `ffmpeg-patches` surface gates) and the standalone deliverables validator
+`scripts/ci/validate-pr-body.sh` exit with:
 
 | Code | Meaning |
 |------|---------|
 | 0 | PR body passed every gate run |
 | 1 | One or more gates failed (same `::error` lines as CI emits) |
 | 2 | Usage or gate error — missing title/body, unreadable diff, etc. |
+
+`make pr-check` exits 0 when every gate passed and 2 when a gate failed, a gate
+errored or the arguments were wrong, because GNU Make reports any failed recipe
+as status 2; the `pr-body-gates: summary ... rc=N` line it prints carries the
+script status.
 
 For the two deliverables-only entry points (`deliverables-check.sh` and
 `validate-pr-body.sh`), exit 2 also covers every shape where stdin cannot

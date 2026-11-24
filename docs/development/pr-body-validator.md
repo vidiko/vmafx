@@ -5,7 +5,9 @@ To check a PR body before pushing, run `make pr-check PR=<number>`, run
 commit subject when empty), or install the pre-push hook with
 `make hooks-install`. The title and body path are passed to the gates
 literally without `make` or shell expansion, and `PR` must be a positive
-decimal number. `make pr-check` runs the deliverables, `docs/state.md`
+decimal number. PR mode diffs the PR's base and head revisions, fetching them
+from `origin` when missing, and fails when it cannot. `make pr-check` runs the
+deliverables, `docs/state.md`
 touch and `ffmpeg-patches` surface gates (`scripts/ci/pr-body-gates.sh`),
 while the pre-push hook runs the deliverables parser, catching a malformed
 body before a 3-10 minute CI cycle.

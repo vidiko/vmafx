@@ -926,9 +926,10 @@ hooks-install: install-hooks
 # pr-check — local equivalent of the three rule-enforcement.yml PR-body gates:
 # deliverables-check.sh (ADR-0108), state-md-touch-check.sh (ADR-0165), and
 # ffmpeg-patches-surface-check.sh (ADR-0409), via scripts/ci/pr-body-gates.sh.
-# Runs against an existing PR (PR=<num>, fetching title and body in one gh call)
-# or a local body file (BODY=<path> with optional TITLE=<text>; defaults to HEAD
-# commit subject when TITLE is empty).
+# Runs against an existing PR (PR=<num>, fetching title, body and revisions in
+# one gh call) or a local body file (BODY=<path> with optional TITLE=<text>;
+# defaults to HEAD commit subject when TITLE is empty). PR mode diffs the PR's
+# own base and head revisions and fails if they cannot be fetched.
 #
 # Usage:
 #   make pr-check PR=260
@@ -951,10 +952,37 @@ pr-check:
 	            printf '%s\n' "$$usage" >&2; \
 	            exit 2 ;; \
 	    esac; \
-	    printf '%s\n' "--- pr-check: fetching PR $${PR:-} title and body via gh ---"; \
-	    pr_json="$$(gh pr view "$${PR:-}" --json title,body)" || exit $$?; \
-	    PR_TITLE="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("title") or "")')" \
-	    PR_BODY="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("body") or "")')" \
+	    printf '%s\n' "--- pr-check: fetching PR $${PR:-} title, body and revisions via gh ---"; \
+	    pr_json="$$(gh pr view "$${PR:-}" --json title,body,baseRefOid,headRefOid)" || exit $$?; \
+	    pr_title="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("title") or "")')" || exit 2; \
+	    pr_body="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); sys.stdout.write(d.get("body") or "")')" || exit 2; \
+	    base_sha="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); v = d.get("baseRefOid"); sys.stdout.write(v if isinstance(v, str) else "")')" || exit 2; \
+	    head_sha="$$(printf '%s' "$$pr_json" | python3 -c 'import json, sys; d = json.load(sys.stdin); v = d.get("headRefOid"); sys.stdout.write(v if isinstance(v, str) else "")')" || exit 2; \
+	    check_rev() { \
+	        local rev_kind="$$1" rev_sha="$$2"; \
+	        if ! [[ "$$rev_sha" =~ ^[0123456789abcdef]{40}([0123456789abcdef]{24})?$$ ]]; then \
+	            printf 'pr-check: invalid %s revision %s of PR %s\n' "$$rev_kind" "$${rev_sha//[$$'\r\n']/?}" "$${PR:-}" >&2; \
+	            exit 2; \
+	        fi; \
+	    }; \
+	    fetch_rev() { \
+	        local rev_kind="$$1" rev_sha="$$2"; \
+	        if ! git cat-file -e "$$rev_sha^{commit}" 2>/dev/null; then \
+	            git fetch --no-tags origin "$$rev_sha" >/dev/null || true; \
+	            if ! git cat-file -e "$$rev_sha^{commit}" 2>/dev/null; then \
+	                printf 'pr-check: cannot obtain %s revision %s of PR %s\n' "$$rev_kind" "$$rev_sha" "$${PR:-}" >&2; \
+	                exit 2; \
+	            fi; \
+	        fi; \
+	    }; \
+	    check_rev base "$$base_sha"; \
+	    check_rev head "$$head_sha"; \
+	    fetch_rev base "$$base_sha"; \
+	    fetch_rev head "$$head_sha"; \
+	    PR_TITLE="$$pr_title" \
+	    PR_BODY="$$pr_body" \
+	    BASE_SHA="$$base_sha" \
+	    HEAD_SHA="$$head_sha" \
 	        bash scripts/ci/pr-body-gates.sh; \
 	elif [ -n "$${BODY:-}" ]; then \
 	    if [ ! -r "$${BODY:-}" ]; then \
