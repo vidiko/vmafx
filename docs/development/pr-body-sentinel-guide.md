@@ -30,7 +30,9 @@ gh pr view <number> --json body -q .body \
 ```
 
 `make pr-check PR=<number>` diffs the PR's base and head revisions, fetching
-them from `origin` when missing, and fails when it cannot.
+them from `origin` when missing, and fails when it cannot. In PR mode, the
+FFmpeg surface gate also runs its tree checks against the PR head tree rather
+than the local checkout.
 
 !!! note "Hook behaviour and exemptions"
     The hook bounds `gh` lookup time, falls back to the repository's public

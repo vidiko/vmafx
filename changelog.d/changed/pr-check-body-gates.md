@@ -7,5 +7,7 @@
   `TITLE=<text>` and defaults to the `HEAD` commit subject when `TITLE` is
   empty. `make pr-check PR=<num>` now checks the PR's own base and head
   revisions, fetching missing commits from `origin` and failing if they cannot
-  be obtained. `TITLE` and `BODY` are passed to the gates literally without
-  `make` or shell expansion, and `PR` must be a positive decimal number.
+  be obtained. In PR mode, the FFmpeg surface gate's tree checks also read the
+  PR head tree rather than the local checkout. `TITLE` and `BODY` are passed to
+  the gates literally without `make` or shell expansion, and `PR` must be a
+  positive decimal number.

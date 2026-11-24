@@ -9,11 +9,13 @@
 #
 # Mirrors the deliverables-check.sh / ffmpeg-patches-check.sh
 # convention so a contributor can run the same gate locally before
-# `gh pr create`. Reads the PR body for an opt-out line, computes
-# the diff from the merge base of BASE_SHA and HEAD_SHA to HEAD_SHA
-# (or merge-base origin/master..HEAD), and intersects the diff against
-# a "consumed set" read from ffmpeg-patches/*.patch at that same diff
-# head revision, not from the checkout.
+# `gh pr create`. Section 0's tree checks read the $HEAD_SHA tree when
+# $HEAD_SHA is non-empty (and the checkout otherwise). The pull request
+# gate reads the PR body for an opt-out line, computes the diff from the
+# merge base of BASE_SHA and HEAD_SHA to HEAD_SHA (or merge-base
+# origin/master..HEAD), and intersects the diff against a "consumed set"
+# read from ffmpeg-patches/*.patch at that same diff head revision, not
+# from the checkout.
 #
 # Detection algorithm (bash + grep, no AST):
 #   1. Parse ffmpeg-patches/*.patch at the diff head revision once, extract the union of:
@@ -42,6 +44,8 @@
 #       surface still fails. Classification lives in
 #       scripts/ci/pr-body-input.sh — see it for why `[ ! -t 0 ]` is
 #       the wrong test.
+#       Section 0's tree checks read the $HEAD_SHA tree when $HEAD_SHA
+#       is non-empty, or the checkout when $HEAD_SHA is unset or empty.
 #       Diff is computed from the merge base of $BASE_SHA and $HEAD_SHA
 #       up to $HEAD_SHA, or falls back to
 #       $(git merge-base origin/master HEAD)..HEAD; the consumed patch
@@ -52,11 +56,12 @@
 #
 #   scripts/ci/ffmpeg-patches-surface-check.sh --surface-only
 #       Runs only the tree checks of section 0 (patch series, fork build
-#       configs, documentation examples, patch tests) and stops. They
-#       read the checkout, so this mode needs no PR body, no BASE_SHA /
-#       HEAD_SHA and no origin/master; the pre-commit hook
-#       ffmpeg-patches-surface-docs runs it. The pull request gate below
-#       (opt-out line, consumed-surface diff) runs in CI only.
+#       configs, documentation examples, patch tests) and stops. Section
+#       0 reads the checkout in this mode even if $HEAD_SHA is set, so
+#       it needs no PR body, no BASE_SHA / HEAD_SHA and no
+#       origin/master; the pre-commit hook ffmpeg-patches-surface-docs
+#       runs it. The pull request gate below (opt-out line,
+#       consumed-surface diff) runs in CI only.
 #
 # Exits 0 on PASS or no-public-surface-touched, 1 on a missing
 # patch update or a failed tree check, 2 on an environment / setup
@@ -91,6 +96,27 @@ nomatch_ok() {
 
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 PATCHES_DIR="${REPO_ROOT}/ffmpeg-patches"
+
+FORK_BUILD_CONFIGS=(
+  "Containerfile.vmafx"
+  "Dockerfile"
+  "Dockerfile.ffmpeg"
+  "dev/Containerfile"
+  "docker/Dockerfile.node"
+  "scripts/test/sycl-dev-container.sh"
+  ".github/workflows/ffmpeg-patch-stack.yml"
+  "scripts/ci/tidy-integrations-build.sh"
+  "ffmpeg-patches/test/build-and-run.sh"
+)
+
+tmp_surface_root=""
+head_surface_sha=""
+tmp_body=""
+tmp_diff=""
+tmp_consumed=""
+tmp_diff_syms=""
+tmp_diff_flags=""
+trap '[ -z "$tmp_body" ] || rm -f "$tmp_body"; [ -z "$tmp_diff" ] || rm -f "$tmp_diff"; [ -z "$tmp_consumed" ] || rm -f "$tmp_consumed"; [ -z "$tmp_diff_syms" ] || rm -f "$tmp_diff_syms"; [ -z "$tmp_diff_flags" ] || rm -f "$tmp_diff_flags"; [ -z "$tmp_surface_root" ] || rm -rf "$tmp_surface_root"' EXIT
 
 # ---------- 0. Invariant surface checks (Issue #2435, ADR-2166) ----------
 
@@ -137,19 +163,8 @@ check_surface_series() {
 
 check_surface_fork_build_configs() {
   local fail=0
-  local configs=(
-    "Containerfile.vmafx"
-    "Dockerfile"
-    "Dockerfile.ffmpeg"
-    "dev/Containerfile"
-    "docker/Dockerfile.node"
-    "scripts/test/sycl-dev-container.sh"
-    ".github/workflows/ffmpeg-patch-stack.yml"
-    "scripts/ci/tidy-integrations-build.sh"
-    "ffmpeg-patches/test/build-and-run.sh"
-  )
   local relpath fullpath
-  for relpath in "${configs[@]}"; do
+  for relpath in "${FORK_BUILD_CONFIGS[@]}"; do
     fullpath="${REPO_ROOT}/${relpath}"
     [ -f "$fullpath" ] || continue
     local m_flag
@@ -174,7 +189,7 @@ check_surface_fork_build_configs() {
   if [ "$fail" -ne 0 ]; then
     return 1
   fi
-  echo "ffmpeg-patches-surface-check: [PASS] fork build configs: zero retired filters/options in ${#configs[@]} allow-listed configs."
+  echo "ffmpeg-patches-surface-check: [PASS] fork build configs: zero retired filters/options in ${#FORK_BUILD_CONFIGS[@]} allow-listed configs."
   return 0
 }
 
@@ -239,21 +254,36 @@ scan_single_doc() {
   return "$doc_fail"
 }
 
+list_surface_docs() {
+  local use_find="${1:-0}"
+  if [ "$use_find" -eq 0 ] && git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "${REPO_ROOT}" ls-files "docs/*.md" "docs/**/*.md" "README.md" "ffmpeg-patches/README.md"
+    return $?
+  fi
+  if [ "$use_find" -eq 0 ]; then
+    (cd "${REPO_ROOT}" && find docs README.md ffmpeg-patches/README.md -name "*.md" 2>/dev/null | sed "s|^\./||")
+    return $?
+  fi
+  local doc_roots=()
+  local root_rel
+  for root_rel in docs README.md ffmpeg-patches/README.md; do
+    [ -e "${REPO_ROOT}/${root_rel}" ] && doc_roots+=("$root_rel")
+  done
+  if [ "${#doc_roots[@]}" -eq 0 ]; then
+    return 0
+  fi
+  (cd "${REPO_ROOT}" && find "${doc_roots[@]}" -name "*.md" 2>/dev/null | sed "s|^\./||")
+}
+
 check_surface_docs_examples() {
+  local use_find="${1:-0}"
   local fail=0
   local all_docs=()
   local docs_list
-  if git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    docs_list="$(git -C "${REPO_ROOT}" ls-files "docs/*.md" "docs/**/*.md" "README.md" "ffmpeg-patches/README.md")" || {
-      echo "ffmpeg-patches-surface-check: [FAIL] cannot list docs" >&2
-      return 1
-    }
-  else
-    docs_list="$(cd "${REPO_ROOT}" && find docs README.md ffmpeg-patches/README.md -name "*.md" 2>/dev/null | sed "s|^\./||")" || {
-      echo "ffmpeg-patches-surface-check: [FAIL] cannot list docs" >&2
-      return 1
-    }
-  fi
+  docs_list="$(list_surface_docs "$use_find")" || {
+    echo "ffmpeg-patches-surface-check: [FAIL] cannot list docs" >&2
+    return 1
+  }
 
   while IFS= read -r p; do
     [ -n "$p" ] && all_docs+=("$p")
@@ -345,11 +375,54 @@ check_surface_patch_tests() {
   return 0
 }
 
+prepare_head_surface_tree() {
+  local checkout_root="$1"
+  if ! head_surface_sha="$(git -C "${checkout_root}" rev-parse --verify --quiet "${HEAD_SHA}^{commit}" 2>/dev/null)"; then
+    echo "ffmpeg-patches-surface-check: cannot resolve HEAD_SHA '${HEAD_SHA}' to a commit." >&2
+    exit 2
+  fi
+  local surface_tree
+  if ! surface_tree="$(git -C "${checkout_root}" ls-tree --full-tree --name-only "${head_surface_sha}" -- ffmpeg-patches docs README.md "${FORK_BUILD_CONFIGS[@]}" 2>/dev/null)"; then
+    echo "ffmpeg-patches-surface-check: cannot list surface inputs at ${HEAD_SHA}." >&2
+    exit 2
+  fi
+  if ! tmp_surface_root="$(mktemp -d 2>/dev/null)"; then
+    echo "ffmpeg-patches-surface-check: cannot create temporary directory for ${HEAD_SHA}." >&2
+    exit 2
+  fi
+  local surface_paths=()
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] && surface_paths+=("$p")
+  done <<<"$surface_tree"
+  if [ "${#surface_paths[@]}" -gt 0 ]; then
+    if ! git -C "${checkout_root}" archive --format=tar "${head_surface_sha}" -- "${surface_paths[@]}" 2>/dev/null |
+      tar -x -C "${tmp_surface_root}" 2>/dev/null; then
+      echo "ffmpeg-patches-surface-check: cannot extract surface inputs at ${HEAD_SHA}." >&2
+      exit 2
+    fi
+  fi
+}
+
 # Run #2435 invariant surface checks
+checkout_repo_root="${REPO_ROOT}"
+checkout_patches_dir="${PATCHES_DIR}"
+surface_use_find=0
+if [ "$surface_only" -eq 0 ] && [ -n "${HEAD_SHA:-}" ]; then
+  prepare_head_surface_tree "${checkout_repo_root}"
+  REPO_ROOT="${tmp_surface_root}"
+  PATCHES_DIR="${tmp_surface_root}/ffmpeg-patches"
+  surface_use_find=1
+  echo "ffmpeg-patches-surface-check: tree checks read HEAD_SHA ${head_surface_sha} (extracted to ${tmp_surface_root})."
+fi
+
 check_surface_series || exit 1
 check_surface_fork_build_configs || exit 1
-check_surface_docs_examples || exit 1
+check_surface_docs_examples "$surface_use_find" || exit 1
 check_surface_patch_tests || exit 1
+
+REPO_ROOT="${checkout_repo_root}"
+PATCHES_DIR="${checkout_patches_dir}"
 
 if [ "$surface_only" -eq 1 ]; then
   echo "ffmpeg-patches-surface-check: --surface-only: tree checks passed; the pull request surface gate (PR body opt-out, diff from the merge base) runs in CI."
@@ -398,7 +471,6 @@ tmp_diff="$(mktemp)"
 tmp_consumed="$(mktemp)"
 tmp_diff_syms="$(mktemp)"
 tmp_diff_flags="$(mktemp)"
-trap 'rm -f "$tmp_body" "$tmp_diff" "$tmp_consumed" "$tmp_diff_syms" "$tmp_diff_flags"' EXIT
 
 # Strip markdown emphasis for opt-out matching, mirroring
 # deliverables-check.sh.

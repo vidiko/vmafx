@@ -273,6 +273,7 @@ class SurfaceOnlyModeTests(_FixtureTree, unittest.TestCase):
             res = _run_script(script, tmp, "--surface-only", REPO_ROOT=str(tmp))
             self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
             self.assertIn(SURFACE_ONLY_DONE_LINE, res.stdout)
+            self.assertNotIn("tree checks read HEAD_SHA", res.stdout)
             self.assertNotIn("PR body from", res.stdout)
 
             full = _run_script(script, tmp, REPO_ROOT=str(tmp))
@@ -412,7 +413,7 @@ class SurfaceOnlyModeTests(_FixtureTree, unittest.TestCase):
         files = re.compile(hook["files"])
 
         body = SCRIPT.read_text(encoding="utf-8")
-        block = re.search(r"local configs=\(\n(.*?)\n\s*\)", body, re.S)
+        block = re.search(r"^FORK_BUILD_CONFIGS=\(\n(.*?)\n\)", body, re.M | re.S)
         self.assertIsNotNone(block, "configs=( ... ) list not found in the script")
         assert block is not None
         configs = re.findall(r'"([^"]+)"', block.group(1))
@@ -492,10 +493,11 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
 
-    def test_consumed_set_zero_patches_at_head_sha_exits_zero(self) -> None:
-        """Zero patch files at HEAD_SHA emits 'missing; nothing to check' and exits 0."""
+    def test_consumed_set_zero_patches_at_head_sha(self) -> None:
+        """Zero patches at HEAD: HEAD_SHA set fails sec 0; HEAD_SHA unset hits sec 4 exit 0."""
         with tempfile.TemporaryDirectory() as td:
             tmp, header, _patch, _orig_patch, base_sha = self._stage_probe_base(td)
+            _git(tmp, "update-ref", "refs/remotes/origin/master", base_sha)
             header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
             for p in (tmp / "ffmpeg-patches").glob("*.patch"):
                 p.unlink()
@@ -504,17 +506,31 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
             head_sha = _rev_parse(tmp, "HEAD")
             for src in (ROOT / "ffmpeg-patches").glob("*.patch"):
                 shutil.copy(src, tmp / "ffmpeg-patches" / src.name)
+            script = tmp / "scripts" / "ci" / SCRIPT.name
 
-            res = _run_script(
-                tmp / "scripts" / "ci" / SCRIPT.name,
-                tmp,
-                REPO_ROOT=str(tmp),
-                BASE_SHA=base_sha,
-                HEAD_SHA=head_sha,
-                PR_BODY="",
-            )
-            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-            self.assertIn("missing; nothing to check", res.stderr)
+            with self.subTest(mode="head_sha_set"):
+                res = _run_script(
+                    script,
+                    tmp,
+                    REPO_ROOT=str(tmp),
+                    BASE_SHA=base_sha,
+                    HEAD_SHA=head_sha,
+                    PR_BODY="",
+                )
+                self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+                self.assertIn("no patches found", res.stderr)
+                self.assertNotIn("[PASS]", res.stdout)
+
+            with self.subTest(mode="head_sha_unset"):
+                res = _run_script(
+                    script,
+                    tmp,
+                    REPO_ROOT=str(tmp),
+                    BASE_SHA=base_sha,
+                    PR_BODY="",
+                )
+                self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+                self.assertIn("missing; nothing to check", res.stderr)
 
     def test_consumed_set_from_subdirectory_exits_one(self) -> None:
         """Running from a subdirectory still reads patches and header diff from tree root."""
@@ -542,17 +558,24 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
             self.assertIn(PROBE_SYMBOL, res.stdout)
 
     def test_consumed_set_negative_missing_head_or_blob_exits_two(self) -> None:
-        """Missing HEAD_SHA (sec 2) or missing patch tree/blob at HEAD_SHA (sec 4) exits 2."""
+        """With HEAD_SHA set, missing HEAD_SHA or missing patch blob/tree fails in section 0."""
         with tempfile.TemporaryDirectory() as td:
             tmp, header, _patch, _orig_patch, base_sha = self._stage_probe_base(td)
             script = tmp / "scripts" / "ci" / SCRIPT.name
             missing_sha = "deadbeef" * 5
-            res = _run_script(
-                script, tmp, REPO_ROOT=str(tmp), BASE_SHA=base_sha, HEAD_SHA=missing_sha, PR_BODY=""
-            )
-            self.assertEqual(res.returncode, 2, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-            self.assertIn("ffmpeg-patches-surface-check: no merge base", res.stderr)
-            self.assertIn(missing_sha, res.stderr)
+            with self.subTest(expected="cannot resolve HEAD_SHA"):
+                res = _run_script(
+                    script,
+                    tmp,
+                    REPO_ROOT=str(tmp),
+                    BASE_SHA=base_sha,
+                    HEAD_SHA=missing_sha,
+                    PR_BODY="",
+                )
+                self.assertEqual(res.returncode, 2, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+                self.assertEqual(len(res.stderr.splitlines()), 1, f"stderr:\n{res.stderr}")
+                self.assertIn("ffmpeg-patches-surface-check: cannot resolve HEAD_SHA", res.stderr)
+                self.assertIn(missing_sha, res.stderr)
 
             header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
             _git(tmp, "add", PROBE_HEADER_REL)
@@ -563,8 +586,8 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
             blob_sha = _rev_parse(tmp, f"{head_sha}:{PROBE_PATCH_REL}")
 
             for obj_sha, expected_msg in (
-                (blob_sha, "cannot read"),
-                (tree_sha, "cannot list ffmpeg-patches/"),
+                (blob_sha, "cannot extract surface inputs at"),
+                (tree_sha, "cannot list surface inputs at"),
             ):
                 with self.subTest(expected=expected_msg):
                     (tmp / ".git" / "objects" / obj_sha[:2] / obj_sha[2:]).unlink()
@@ -584,6 +607,155 @@ class HeadRevisionConsumedSetTests(_FixtureTree, unittest.TestCase):
                     self.assertTrue(err_lines[0].startswith("ffmpeg-patches-surface-check:"))
                     self.assertIn(expected_msg, err_lines[0])
                     self.assertIn(head_sha, err_lines[0])
+
+    def test_consumed_set_negative_sec4_without_head_sha_exits_two(self) -> None:
+        """With HEAD_SHA unset, missing patch blob or tree fails in section 4 (exit 2)."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, _patch, _orig_patch, base_sha = self._stage_probe_base(td)
+            _git(tmp, "update-ref", "refs/remotes/origin/master", base_sha)
+            header.write_text(PROBE_HEADER_WITHOUT_SYM, encoding="utf-8")
+            _git(tmp, "add", PROBE_HEADER_REL)
+            _git(tmp, "commit", "-q", "-m", "drop probe symbol on head branch")
+            blob_sha = _rev_parse(tmp, f"HEAD:{PROBE_PATCH_REL}")
+            tree_sha = _rev_parse(tmp, "HEAD:ffmpeg-patches")
+            script = tmp / "scripts" / "ci" / SCRIPT.name
+
+            for label, missing_oid, sec4_msg in (
+                ("blob", blob_sha, "cannot read ffmpeg-patches/"),
+                ("tree", tree_sha, "cannot list ffmpeg-patches/ at HEAD"),
+            ):
+                with self.subTest(deleted=label):
+                    (tmp / ".git" / "objects" / missing_oid[:2] / missing_oid[2:]).unlink()
+                    res = _run_script(script, tmp, REPO_ROOT=str(tmp), PR_BODY="")
+                    self.assertEqual(
+                        res.returncode, 2, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+                    )
+                    stderr_lines = res.stderr.splitlines()
+                    self.assertEqual(len(stderr_lines), 1, f"stderr:\n{res.stderr}")
+                    self.assertTrue(stderr_lines[0].startswith("ffmpeg-patches-surface-check:"))
+                    self.assertIn(sec4_msg, stderr_lines[0])
+                    self.assertIn("at HEAD.", stderr_lines[0])
+
+
+class HeadRevisionTreeChecksTests(_FixtureTree, unittest.TestCase):
+    """Verify section 0 reads the HEAD_SHA tree (not checkout) when HEAD_SHA is set."""
+
+    def test_head_tree_retired_doc_fails_when_checkout_restored(self) -> None:
+        """Retired filter at HEAD_SHA fails section 0 even when checkout restores clean doc."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            faq = tmp / "docs" / "reference" / "faq.md"
+            base_text = faq.read_text(encoding="utf-8")
+            faq.write_text(
+                f"{base_text}\nPlanted retired option: libvmaf_tune.\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", "docs/reference/faq.md")
+            _git(tmp, "commit", "-q", "-m", "add retired filter to faq")
+            head_sha = _rev_parse(tmp, "HEAD")
+            faq.write_text(base_text, encoding="utf-8")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("tree checks read HEAD_SHA", res.stdout)
+            self.assertIn(head_sha, res.stdout)
+            self.assertIn(
+                "ffmpeg-patches-surface-check: [FAIL] retired filter/option in doc docs/reference/faq.md:",
+                res.stderr,
+            )
+            self.assertIn("libvmaf_tune", res.stderr)
+
+    def test_head_tree_clean_passes_with_uncommitted_checkout_defect(self) -> None:
+        """Uncommitted retired filter in checkout does not fail when HEAD_SHA tree is clean."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            readme = tmp / "README.md"
+            readme.write_text(
+                f"{readme.read_text(encoding='utf-8')}\nHarmless README note.\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", "README.md")
+            _git(tmp, "commit", "-q", "-m", "harmless readme update")
+            head_sha = _rev_parse(tmp, "HEAD")
+            faq = tmp / "docs" / "reference" / "faq.md"
+            faq.write_text(
+                f"{faq.read_text(encoding='utf-8')}\nUncommitted: libvmaf_tune.\n",
+                encoding="utf-8",
+            )
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn(
+                "ffmpeg-patches-surface-check: [PASS] docs examples: zero retired filters/options",
+                res.stdout,
+            )
+
+    def test_head_tree_boundary_deleted_build_config_passes(self) -> None:
+        """Deleting an allow-listed fork build config at HEAD_SHA skips it on export and passes."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            _git(tmp, "rm", "-q", "Dockerfile.ffmpeg")
+            _git(tmp, "commit", "-q", "-m", "remove Dockerfile.ffmpeg")
+            head_sha = _rev_parse(tmp, "HEAD")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("fork build configs: zero retired filters/options", res.stdout)
+
+    def test_head_tree_tmpdir_inside_worktree_uses_find(self) -> None:
+        """Temp export dir under TMPDIR inside a git worktree still lists docs via find."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            readme = tmp / "README.md"
+            readme.write_text(
+                f"{readme.read_text(encoding='utf-8')}\nHarmless note.\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", "README.md")
+            _git(tmp, "commit", "-q", "-m", "readme note")
+            head_sha = _rev_parse(tmp, "HEAD")
+            nested_tmpdir = tmp / "nested-tmp"
+            nested_tmpdir.mkdir()
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+                TMPDIR=str(nested_tmpdir),
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn(
+                "ffmpeg-patches-surface-check: [PASS] docs examples: zero retired filters/options",
+                res.stdout,
+            )
 
 
 if __name__ == "__main__":
