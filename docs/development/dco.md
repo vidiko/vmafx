@@ -40,8 +40,10 @@ The hook reads `GIT_EDITOR`, which Git sets to `:` when no editor runs (`-m`,
 With an editor, the sign-off is checked on the text Git keeps, which is the
 text above Git's first scissors line with `-v` or `commit.cleanup=scissors` and
 the whole text otherwise, with comment lines removed unless `commit.cleanup`
-keeps them. Attribution is checked on all text above the staged diff that `-v`
-writes.
+keeps them. Attribution is checked on all text above the staged diff block that
+`-v` writes (a scissors line, comment lines with the same prefix, and
+a `diff --git` line); such a line directly below a scissors line is still
+checked.
 Under `core.commentChar=auto`, the hook uses the comment string of Git's own
 template lines. The hook reads `commit.cleanup` only from Git configuration and
 may check more text than Git stores when you pass `--cleanup=...` on the command

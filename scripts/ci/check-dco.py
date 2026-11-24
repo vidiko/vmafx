@@ -121,7 +121,7 @@ MAX_COMMITS = 5000
 # origin/master 20fa27ac625e, 6290 messages, measured 2026-11-11; 4x headroom.
 MAX_COMMIT_MESSAGE_BYTES = 70_469 * 4
 MAX_COMMIT_MESSAGE_LINES = 1_459 * 4
-# Git's scissors line; a verbose diff follows below it only after editor cleanup.
+# Git's scissors line; in editor mode, a verbose diff follows comment lines below it.
 SCISSORS_TAIL = b" ------------------------ >8 ------------------------"
 VERBOSE_DIFF_HEAD = b"diff --git "
 # Characters Git's core.commentChar=auto may pick (builtin/commit.c, git v2.56.1).
@@ -1091,23 +1091,27 @@ def read_pending_message(path: Path, prefixes: tuple[str, ...], editor: bool) ->
     data = bytearray()
     block_start: int | None = None
     block_prefix = ""
+    has_comment = False
     try:
         with path.open("rb") as stream:
-            # Each line read adds at least one byte, so the byte bound ends the loop first.
+            # HISS-02: each line adds at least one byte, so the byte bound ends the loop first.
             for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
                 raw = stream.readline(MAX_COMMIT_MESSAGE_BYTES + 1)
                 if not raw:
                     break
                 if block_start is not None:
-                    if raw.startswith(VERBOSE_DIFF_HEAD):
+                    if has_comment and raw.startswith(VERBOSE_DIFF_HEAD):
                         return data[:block_start].decode("utf-8"), block_prefix
+                    has_comment = True
                     if not raw.startswith(block_prefix.encode("utf-8")):
                         block_start = None
                         block_prefix = ""
+                        has_comment = False
                 matched = scissors_prefix(raw, active_prefixes)
                 if matched is not None:
                     block_start = len(data)
                     block_prefix = matched
+                    has_comment = False
                 data += raw
                 if len(data) > MAX_COMMIT_MESSAGE_BYTES:
                     raise InputBoundError(
