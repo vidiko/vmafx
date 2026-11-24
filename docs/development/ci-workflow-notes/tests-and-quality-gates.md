@@ -36,9 +36,14 @@ The build step compiles every object, then links only `tools/vmaf` and any test
 binaries when no matching Builds matrix row is active. On `ubuntu-26.04`, the
 `Ubuntu gcc` and `Ubuntu clang` full-tier rows match this job's Meson options;
 when `c_core` is true and the PR is in full tier, their `ninja install` covers
-the omitted test links. [ADR-3625](../../adr/3625-heavy-job-link-profile.md)
-records the link profile decision. The step emits a `::notice::` line from
-`heavy_link_targets.py` with object, link, and twin counts. Local replay:
+the omitted test links. Option comparison in `scripts/ci/heavy_link_targets.py`
+merges project `default_options` from `core/meson.build` with
+`core/meson_options.txt`. Unknown Meson setup flags or unparseable setup lines
+make a row unequal rather than ignored. Each heavy build step also stops with
+exit 2 if `link-targets.txt` yields an empty target list before `ninja` runs.
+[ADR-3625](../../adr/3625-heavy-job-link-profile.md) records the link profile
+decision. The step emits a `::notice::` line from `heavy_link_targets.py` with
+object, link, and twin counts. Local replay:
 `python3 scripts/ci/heavy_link_targets.py --job netflix-golden --build-dir
 core/build --tier-full false --c-core true`.
 

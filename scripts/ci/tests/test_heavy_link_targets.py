@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -17,8 +18,11 @@ from pathlib import Path
 from scripts.lib.safe_subprocess import TextCommandResult, run
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = ROOT / "scripts/ci/heavy_link_targets.py"
+SCRIPT = Path(
+    os.environ.get("HEAVY_LINK_TARGETS_SCRIPT", ROOT / "scripts/ci/heavy_link_targets.py")
+)
 MODULE = runpy.run_path(str(SCRIPT))
+JOB_BUILD_STEP_NAMES = MODULE["JOB_BUILD_STEP_NAMES"]
 PROFILES = MODULE["PROFILES"]
 select_targets = MODULE["select_targets"]
 validate_profile_links = MODULE["validate_profile_links"]
@@ -26,6 +30,10 @@ mcp_shared_link_paths = MODULE["mcp_shared_link_paths"]
 is_test_consumed = MODULE["test_is_consumed"]
 equivalent_rows = MODULE["equivalent_rows"]
 option_map_from_tokens = MODULE["option_map_from_tokens"]
+options_equal = MODULE["options_equal"]
+parse_meson_defaults = MODULE["parse_meson_defaults"]
+parse_project_defaults = MODULE["parse_project_defaults"]
+tokenize_setup = MODULE["tokenize_setup"]
 
 
 class HeavyLinkTargetsTest(unittest.TestCase):
@@ -330,7 +338,8 @@ class EquivalentRowsTest(unittest.TestCase):
         tests = (ROOT / ".github/workflows/tests-and-quality-gates.yml").read_text(encoding="utf-8")
         matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
         options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
-        computed = equivalent_rows(tests, matrix, options)
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options, meson_build)
         # bound: three heavy job profiles
         self.assertEqual(computed, {job: profile["twins"] for job, profile in PROFILES.items()})
 
@@ -344,7 +353,8 @@ class EquivalentRowsTest(unittest.TestCase):
         )
         matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
         options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
-        computed = equivalent_rows(tests, matrix, options)
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options, meson_build)
         self.assertEqual(computed["dnn"], ())
 
     def test_on_block_drift_breaks_match(self) -> None:
@@ -355,7 +365,8 @@ class EquivalentRowsTest(unittest.TestCase):
         )
         matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
         options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
-        computed = equivalent_rows(tests, matrix, options)
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options, meson_build)
         self.assertEqual(computed, dict.fromkeys(PROFILES, ()))
 
     def test_option_drift_breaks_match(self) -> None:
@@ -370,7 +381,8 @@ class EquivalentRowsTest(unittest.TestCase):
             )
         )
         options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
-        computed = equivalent_rows(tests, matrix, options)
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options, meson_build)
         self.assertEqual(computed["dnn"], (("Ubuntu clang+DNN", "light"),))
 
     def test_shell_token_drift_breaks_match(self) -> None:
@@ -385,8 +397,107 @@ class EquivalentRowsTest(unittest.TestCase):
         )
         matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
         options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
-        computed = equivalent_rows(tests, matrix, options)
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options, meson_build)
         self.assertEqual(computed["netflix-golden"], ())
+
+    def test_setup_flag_aliases_and_unknown_flag(self) -> None:
+        base = option_map_from_tokens(["-Denable_float=true"], None, None)
+        # bound: four differentiating Meson setup flag lists
+        for extra in (
+            ["--default-library=static"],
+            ["--default-library", "static"],
+            ["--werror"],
+            ["--optimization=0"],
+        ):
+            other = option_map_from_tokens(["-Denable_float=true", *extra], None, None)
+            self.assertFalse(options_equal(base, other, {}), extra)
+        bt_space = option_map_from_tokens(["--buildtype", "release"], None, None)
+        bt_eq = option_map_from_tokens(["--buildtype=release"], None, None)
+        bt_d = option_map_from_tokens(["-Dbuildtype=release"], None, None)
+        self.assertTrue(options_equal(bt_space, bt_eq, {}))
+        self.assertTrue(options_equal(bt_eq, bt_d, {}))
+        aliases = option_map_from_tokens(
+            ["--warnlevel", "2", "--backend=ninja", "--strip", "--debug"], None, None
+        )
+        self.assertEqual(
+            aliases,
+            {"warning_level": "2", "backend": "ninja", "strip": "true", "debug": "true"},
+        )
+        self.assertEqual(
+            option_map_from_tokens(["--prefix", "x", "--prefix=x", "-Dfoo=1"], None, None),
+            {"foo": "1"},
+        )
+        with self.assertRaisesRegex(ValueError, r"unknown setup flag: --unity=on"):
+            option_map_from_tokens(["--unity=on"], None, None)
+
+    def test_project_defaults_parsed_and_merged(self) -> None:
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        meson_options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        project_defaults = parse_project_defaults(meson_build)
+        self.assertEqual(project_defaults["buildtype"], "release")
+        self.assertEqual(project_defaults["default_library"], "both")
+        self.assertEqual(project_defaults["b_lto"], "true")
+        self.assertEqual(project_defaults["c_std"], "c23,c2x,c17,none")
+        defaults = {**project_defaults, **parse_meson_defaults(meson_options)}
+        explicit_tokens, _ = tokenize_setup("meson setup build --buildtype release -Dwerror=true")
+        implicit_tokens, _ = tokenize_setup("meson setup build -Dwerror=true")
+        explicit = option_map_from_tokens(explicit_tokens, None, None)
+        implicit = option_map_from_tokens(implicit_tokens, None, None)
+        self.assertTrue(options_equal(explicit, implicit, defaults))
+        tests = (
+            (ROOT / ".github/workflows/tests-and-quality-gates.yml")
+            .read_text(encoding="utf-8")
+            .replace(" --buildtype=release", "", 1)
+        )
+        matrix = (ROOT / ".github/workflows/libvmaf-build-matrix.yml").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, meson_options, meson_build)
+        self.assertEqual(computed["netflix-golden"], PROFILES["netflix-golden"]["twins"])
+
+    def test_malformed_matrix_row_quote_is_skipped(self) -> None:
+        tests = (ROOT / ".github/workflows/tests-and-quality-gates.yml").read_text(encoding="utf-8")
+        matrix = (
+            (ROOT / ".github/workflows/libvmaf-build-matrix.yml")
+            .read_text(encoding="utf-8")
+            .replace(
+                "-Denable_dnn=enabled -Denable_zimg=true",
+                '"-Denable_dnn=enabled \'unterminated"',
+                1,
+            )
+        )
+        options = (ROOT / "core/meson_options.txt").read_text(encoding="utf-8")
+        meson_build = (ROOT / "core/meson.build").read_text(encoding="utf-8")
+        computed = equivalent_rows(tests, matrix, options, meson_build)
+        self.assertEqual(computed["dnn"], (("Ubuntu clang+DNN", "light"),))
+        self.assertEqual(computed["netflix-golden"], PROFILES["netflix-golden"]["twins"])
+
+    def test_workflow_steps_guard_empty_link_targets(self) -> None:
+        yaml = importlib.import_module("yaml")
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/tests-and-quality-gates.yml").read_text(encoding="utf-8")
+        )
+        mapfile_line = 'mapfile -t targets < "${RUNNER_TEMP}/link-targets.txt"'
+        guard_line = (
+            'if [ "${#targets[@]}" -eq 0 ]; then '
+            'echo "::error::heavy-link-targets printed no targets"; exit 2; fi'
+        )
+        # bound: three heavy job build steps
+        for job_id, step_name in JOB_BUILD_STEP_NAMES.items():
+            steps = workflow["jobs"][job_id]["steps"]
+            # bound: steps in one heavy job
+            matches = [step for step in steps if step.get("name") == step_name]
+            self.assertEqual(len(matches), 1, job_id)
+            lines = [line.strip() for line in matches[0]["run"].splitlines()]
+            self.assertIn(mapfile_line, lines, job_id)
+            self.assertIn(guard_line, lines, job_id)
+            ninja_lines = [
+                idx
+                for idx, line in enumerate(lines)
+                if line.startswith("ninja -C ") and line.endswith(' "${targets[@]}"')
+            ]
+            self.assertEqual(len(ninja_lines), 1, job_id)
+            self.assertLess(lines.index(mapfile_line), lines.index(guard_line), job_id)
+            self.assertLess(lines.index(guard_line), ninja_lines[0], job_id)
 
 
 @unittest.skipUnless(

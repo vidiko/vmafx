@@ -117,6 +117,7 @@ jobs:
             exit 2
           fi
           mapfile -t targets < "${RUNNER_TEMP}/link-targets.txt"
+          if [ "${#targets[@]}" -eq 0 ]; then echo "::error::heavy-link-targets printed no targets"; exit 2; fi
           ninja -C build "${targets[@]}"
           echo "::notice::$(cat "${RUNNER_TEMP}/link-summary.txt") (ADR-3625)"
 
@@ -512,6 +513,7 @@ jobs:
             exit 2
           fi
           mapfile -t targets < "${RUNNER_TEMP}/link-targets.txt"
+          if [ "${#targets[@]}" -eq 0 ]; then echo "::error::heavy-link-targets printed no targets"; exit 2; fi
           ninja -C build "${targets[@]}"
           echo "::notice::$(cat "${RUNNER_TEMP}/link-summary.txt") (ADR-3625)"
       - name: Run meson dnn suite
@@ -903,6 +905,7 @@ jobs:
             exit 2
           fi
           mapfile -t targets < "${RUNNER_TEMP}/link-targets.txt"
+          if [ "${#targets[@]}" -eq 0 ]; then echo "::error::heavy-link-targets printed no targets"; exit 2; fi
           ninja -C build-mcp "${targets[@]}"
           echo "::notice::$(cat "${RUNNER_TEMP}/link-summary.txt") (ADR-3625)"
 

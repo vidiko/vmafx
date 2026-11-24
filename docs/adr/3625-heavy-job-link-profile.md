@@ -25,12 +25,16 @@ The `tools/vmaf` CLI finished linking in 27 s, 56 s, and 39 s respectively.
   remain on the critical path.
 - Link only the targets that job consumes, plus test executables that no
   `libvmaf-build-matrix` row on the same GitHub event would link under the same
-  effective Meson options and `ubuntu-26.04` runner OS label.
+  effective Meson options and `ubuntu-26.04` runner OS label. Effective
+  defaults merge project `default_options` from `core/meson.build` with
+  `core/meson_options.txt`. Unknown Meson setup flags or malformed setup lines
+  make a row unequal.
 - When a matching matrix row is active (`c_core` and the row tier rule from
   ADR-2169), omit links for non-consumed test binaries; the matrix row builds
   them instead.
 - Record the selection on each build step as a `::notice::` line from
-  `scripts/ci/heavy_link_targets.py`.
+  `scripts/ci/heavy_link_targets.py`. Each build step stops with exit 2 if the
+  target list read into `targets` is empty before `ninja` runs.
 
 ## Alternatives considered
 

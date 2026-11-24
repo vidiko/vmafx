@@ -302,6 +302,45 @@ def parse_meson_defaults(text: str) -> dict[str, str]:
     return defaults
 
 
+def strip_meson_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    # bound: characters in one meson.build line
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote is not None:
+            escaped = char == "\\"
+            if char == quote:
+                quote = None
+        elif char == "#":
+            return line[:index]
+        elif char in {"'", '"'}:
+            quote = char
+    return line
+
+
+def parse_project_defaults(meson_build_text: str) -> dict[str, str]:
+    # bound: lines in meson.build
+    uncommented = "\n".join(strip_meson_comment(line) for line in meson_build_text.splitlines())
+    block = re.search(
+        r"\bdefault_options\s*:\s*\[((?:'[^']*'|\"[^\"]*\"|[^\]])*)\]",
+        uncommented,
+        re.DOTALL,
+    )
+    if block is None:
+        return {}
+    defaults: dict[str, str] = {}
+    # bound: quoted entries in project default_options
+    for match in re.finditer(r"'([^']*)'|\"([^\"]*)\"", block.group(1)):
+        entry = match.group(1) if match.group(1) is not None else match.group(2)
+        if entry is not None and "=" in entry:
+            key, value = entry.split("=", 1)
+            defaults[key.strip()] = value.strip()
+    return defaults
+
+
 def join_continuations(block: str) -> str:
     lines: list[str] = []
     # bound: run block line count in workflow step
@@ -358,21 +397,59 @@ def werror_options(werror_arg: str | None, row: dict[str, Any] | None) -> dict[s
     return {"werror-args": werror_arg}
 
 
+SETUP_VALUE_ALIASES: dict[str, str | None] = {
+    # Install location only; it does not change the build tree the tests link.
+    "--prefix": None,
+    "--buildtype": "buildtype",
+    "--default-library": "default_library",
+    "--optimization": "optimization",
+    "--warnlevel": "warning_level",
+    "--backend": "backend",
+}
+
+SETUP_BOOL_FLAGS: dict[str, str] = {
+    "--werror": "werror",
+    "--strip": "strip",
+    "--debug": "debug",
+}
+
+
+def consume_value_alias(
+    arg: str,
+    key: str | None,
+    has_eq: str,
+    inline_value: str,
+    next_arg: str | None,
+    options: dict[str, str],
+) -> int:
+    value = inline_value if has_eq else next_arg
+    if value is None:
+        if key is not None:
+            raise ValueError(f"unknown setup flag: {arg}")
+        return 1
+    if key is not None:
+        if value.startswith("$(") or "${" in value:
+            raise ValueError(f"unsupported shell expansion in setup: {value}")
+        options[key] = value
+    return 1 if has_eq else 2
+
+
 def consume_setup_option(arg: str, next_arg: str | None, options: dict[str, str]) -> int:
     if arg.startswith("$(") or "${" in arg:
         raise ValueError(f"unsupported shell expansion in setup: {arg}")
-    if arg in {"--prefix", "--buildtype"}:
-        if next_arg is None:
-            return 1
-        if arg == "--buildtype":
-            options["buildtype"] = next_arg
-        return 2
-    if arg.startswith("--buildtype="):
-        options["buildtype"] = arg.split("=", 1)[1]
-    elif arg.startswith("-D") and "=" in arg:
+    if arg.startswith("-D") and "=" in arg:
         key, value = arg[2:].split("=", 1)
         options[key] = value
-    elif not arg.startswith(("--", "build")):
+        return 1
+    if arg in SETUP_BOOL_FLAGS:
+        options[SETUP_BOOL_FLAGS[arg]] = "true"
+        return 1
+    flag, has_eq, inline_value = arg.partition("=")
+    if flag in SETUP_VALUE_ALIASES:
+        return consume_value_alias(
+            arg, SETUP_VALUE_ALIASES[flag], has_eq, inline_value, next_arg, options
+        )
+    if not arg.startswith("build"):
         raise ValueError(f"unknown setup flag: {arg}")
     return 1
 
@@ -488,6 +565,7 @@ def equivalent_rows(
     tests_workflow_text: str,
     matrix_workflow_text: str,
     meson_options_text: str,
+    meson_build_text: str,
 ) -> dict[str, tuple[tuple[str, str], ...]]:
     # Only the workflow drift check needs PyYAML.
     yaml = importlib.import_module("yaml")
@@ -496,7 +574,10 @@ def equivalent_rows(
     matrix_doc = yaml.safe_load(matrix_workflow_text)
     if workflow_on_block(tests_workflow_text) != workflow_on_block(matrix_workflow_text):
         return dict.fromkeys(PROFILES, ())
-    defaults = parse_meson_defaults(meson_options_text)
+    defaults = {
+        **parse_project_defaults(meson_build_text),
+        **parse_meson_defaults(meson_options_text),
+    }
     matrix_template = matrix_configure_command(matrix_doc)
     rows = matrix_doc["jobs"]["libvmaf-build"]["strategy"]["matrix"]["include"]
     result: dict[str, tuple[tuple[str, str], ...]] = {}
@@ -517,8 +598,8 @@ def equivalent_rows(
             if row_os != job_os:
                 continue
             row_setup = substitute_matrix_line(matrix_template, row)
-            row_tokens, row_werror = tokenize_setup(row_setup)
             try:
+                row_tokens, row_werror = tokenize_setup(row_setup)
                 row_opts = option_map_from_tokens(row_tokens, row_werror, row)
             except ValueError:
                 continue
