@@ -126,22 +126,28 @@ through the shared helper [`scripts/ci/pr-body-input.sh`][input]:
 The body is resolved in this order:
 
 1. `--body PATH` (`validate-pr-body.sh` only).
-2. `$PR_BODY`. For the two deliverables entry points, **set counts** — even
-   to the empty string, because setting it is the caller's answer, so a blank
-   one is reported against the variable rather than quietly replaced from
-   stdin. This is the path CI takes
+2. `$PR_BODY`. For `deliverables-check.sh`, `validate-pr-body.sh`, and
+   `check-toolchain-claims.sh`, **set counts** (`${PR_BODY+x}`), even to the
+   empty string, because setting it is the caller's answer. In
+   `deliverables-check.sh` and `validate-pr-body.sh`, a blank `$PR_BODY` is
+   reported against the variable (exit 1) rather than quietly replaced from
+   `stdin`; in `check-toolchain-claims.sh`, a set but blank `$PR_BODY` makes no
+   claims and exits 0. This is the path CI takes
    (`PR_BODY: ${{ github.event.pull_request.body }}`) and the path
    `make pr-check` takes. The surface and `state.md` gates instead take the
    variable only when it is **non-empty**: for them a blank `$PR_BODY` and a
-   blank stdin end at the same empty body, so falling through costs nothing
+   blank `stdin` end at the same empty body, so falling through costs nothing
    and lets an explicitly blank variable still be overridden by a real pipe.
-3. stdin, **when fd 0 is a pipe, a regular file or a socket**.
+3. `stdin`, **when fd 0 is a pipe, a regular file or a socket**.
 
 What happens when none of those supplies a body differs by gate, because the
 gates differ in what else they have to go on:
 
-- `deliverables-check.sh` and `validate-pr-body.sh` exist only to parse a
-  body. No body is a **usage error (exit 2)** naming what fd 0 actually is.
+- `deliverables-check.sh`, `validate-pr-body.sh`, and
+  `check-toolchain-claims.sh` exist only to parse a body. No body is a
+  **usage error (exit 2)** naming what `fd 0` actually is; an open `stdin` pipe
+  carrying no bytes also fails closed (`validate-pr-body.sh` and
+  `check-toolchain-claims.sh` exit 2, and `deliverables-check.sh` exits 1).
 - `ffmpeg-patches-surface-check.sh` and `state-md-touch-check.sh` also have a
   diff to check. No body makes their opt-out sentinel unclaimable, so they
   **name what fd 0 was and fall through to the diff** — passing when it is
@@ -301,32 +307,53 @@ On non-Darwin hosts, `scripts/dev/toolchain-probe.sh` emits the Metal absence
 row with the operating system from `uname -s`.
 
 `scripts/ci/check-toolchain-claims.sh` requires a `toolchain-probe v1`
-header with nonempty `host=`, `os=`, and `date=` fields. A result must follow
-that header inside the same fence or, for unfenced output, in the same run
-of consecutive nonblank lines. A `found` row requires a path and an `absent`
-row requires `searched=` with a value. The checker skips valid probe lines
-in unfenced output and in fences with a valid header. It also checks claims
-in ordinary fenced text, blockquotes, and prose mixed into probe output.
+header with nonempty `host=`, `os=`, and `date=` fields from
+`scripts/dev/toolchain-probe.sh`. Probe rows are exempt from claim checking
+only inside a valid header block (`after_header=1`), inside the same fence
+after the header or in consecutive nonblank lines after an unfenced header;
+outside a header block, probe-shaped lines are checked as prose. Inside a
+header block, `scripts/ci/check-toolchain-claims.sh` accepts the stdout shapes
+printed by `scripts/dev/toolchain-probe.sh`: a `found` row with a path and
+optional version text, an `absent` row ending after `searched=<token>` (or
+`searched=none os=<token>` for `metal` on non-Darwin hosts, with no trailing
+text), and the `x86_64-w64-mingw32-gcc` detail rows (`dumpversion`,
+`thread-model`, `runtime`, `runtime-unresolved`, and `pairing*`). It checks
+claims in ordinary fenced text, blockquotes, same-line backtick spans such as
+`` ```nvcc``` `` (not a fence opener under CommonMark because the info string
+contains a backtick), and prose mixed into probe output.
 
-The checker recognizes `no <tool>` and `<tool> (is|was|were)? <status>`,
-where the status can be `not installed`, `not found`, `missing`,
-`unavailable`, or `absent`. The same tool vocabulary applies to
-`without <tool>` when the line also says `on this host`, `here`, or
-`locally`. It includes every probe name below and the aliases `cuda toolkit`,
-`oneapi`, `rocm`, and `hip cc`.
+`scripts/ci/check-toolchain-claims.sh` splits each checked line into clauses at
+`;` and at sentence ends (`.`, `!`, or `?` followed by whitespace) and takes
+claimed tools only from the clause carrying the claim. It recognizes `no <tool>`,
+`(lacks|lacking) <tool>` (with an optional article), and
+`<tool> (is|are|was|were)? <status>`, where `<status>` can be `not installed`,
+`not found`, `not available`, `missing`, `unavailable`, or `absent`. It also
+recognizes `without <tool>` when the clause names this host (`on this host`,
+`this host`, `on the host`, `here`, or `locally`), and compilation claims when
+a tool or backend appears in the same clause as `not compiled`,
+`did not compile`, `did not build`, `(was|were) not built`, or
+`compilation (was|were)? skipped`. One `toolchain_map` vocabulary in
+`scripts/ci/check-toolchain-claims.sh` covers both absence and compilation
+claims: every probe name below plus `cuda`, `cuda toolkit`, `sycl`, `oneapi`,
+`hip`, `hip cc`, `rocm`, and `vulkan`. A hyphen joined to a name is part of the
+word, so `tidy-metal` does not match `metal` while `x86_64-w64-mingw32-gcc`
+matches as one name.
 
-For compilation claims, the checker also recognizes the backend names
-`cuda`, `sycl`, `hip`, and `vulkan`. A backend or toolchain must appear on
-the same line as `not compiled`, `was not built`, `were not built`, or
-`compilation skipped` with optional `was` or `were`. Compilation claims
-require probe results. A `found` row contradicts an absence claim or
-a compilation claim about the build host. For example, the checker accepts
-`nvcc found` as evidence for a line describing a CPU-only build that did
-not compile CUDA.
+Both absence and compilation claims require probe results from
+`scripts/dev/toolchain-probe.sh`. An absence claim is a host claim unless the
+clause or line names a `CI`, `runner`, `image`, `container`, or `golden-build`
+(`golden build`) scope without naming this host (`on this host`, `this host`,
+`on the host`, `here`, or `locally`). A compilation claim is a host claim only
+when its clause names this host. A `found` row contradicts host claims only;
+for example, `scripts/ci/check-toolchain-claims.sh` accepts `nvcc found` as
+evidence for a CI runner or CPU-only build line that did not compile CUDA and
+does not name this host.
 
-The checker uses the same mapping for required results and contradictions.
-If a claim line names compilers explicitly, only those probe rows apply.
-Otherwise the checker uses the backend aliases.
+`scripts/ci/check-toolchain-claims.sh` uses `toolchain_map` for both required
+results and contradictions. Explicit compiler names take precedence over
+backend aliases per family (`icpx`/`icx` over `sycl`/`oneapi`, `nvcc` over
+`cuda`/`cuda toolkit`, `hipcc`/`hip cc` over `hip`/`rocm`, and
+`glslc`/`glslangValidator` over `vulkan`), not globally across families.
 
 | Probe result name | Claim words mapped to it |
 | --- | --- |

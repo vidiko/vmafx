@@ -405,7 +405,113 @@ expect_body "an ordinary fence still checks claims" 1 "${fence}text
 no nvcc
 ${fence}"
 expect_body "a blockquote still checks claims" 1 '> no nvcc'
-expect_body "explicitly empty PR_BODY passes" 0 ''
+
+empty_env_rc=0
+PR_BODY="" "${gate}" >/dev/null 2>&1 || empty_env_rc=$?
+if [ "${empty_env_rc}" -eq 0 ]; then
+  echo "PASS: explicitly empty PR_BODY passes (exit=0)"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: explicitly empty PR_BODY failed (got exit=${empty_env_rc}, expected 0)"
+  fail_count=$((fail_count + 1))
+fi
+
+empty_pipe_rc=0
+true | env -u PR_BODY "${gate}" >/dev/null 2>&1 || empty_pipe_rc=$?
+if [ "${empty_pipe_rc}" -eq 2 ]; then
+  echo "PASS: empty stdin pipe fails closed (exit=2)"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: empty stdin pipe did not exit 2 (got exit=${empty_pipe_rc})"
+  fail_count=$((fail_count + 1))
+fi
+
+# ---------- Round-2 isolating regression cases (F1-F5, S1-S9) ----------
+expect_body "S1: CI runner scope with nvcc found is not contradicted" 0 "Hosted Ubuntu CI runner has no nvcc
+
+${fence}text
+${header}
+${found_nvcc}
+${fence}"
+expect_body "S1b: CI runner scope without probe still fails" 1 'Hosted Ubuntu CI runner has no nvcc'
+expect_body "S2: backend alias CUDA counts as absence word" 1 'No CUDA on this host'
+expect_body "S3: not available phrasing counts as absence claim" 1 'nvcc is not available'
+expect_body "S4: lacks phrasing counts as absence claim" 1 'host lacks nvcc'
+expect_body "S4b: lacking phrasing counts as absence claim" 1 'host is lacking hipcc'
+expect_body "S5: did not compile locally requires probe" 1 'did not compile CUDA locally'
+expect_body "S5b: did not build locally requires probe" 1 'did not build HIP locally'
+expect_body "S6: tools taken only from claim clause across semicolon" 0 "icx build passed; no nvcc on this host
+
+${fence}text
+${header}
+${absent_nvcc}
+toolchain-probe: icx found /opt/intel/oneapi/bin/icx 2026.0
+${fence}"
+expect_body "S6b: tools taken only from claim clause across sentence end" 0 "icx build passed. No nvcc on this host
+
+${fence}text
+${header}
+${absent_nvcc}
+toolchain-probe: icx found /opt/intel/oneapi/bin/icx 2026.0
+${fence}"
+expect_body "S7: hyphenated tidy-metal does not match metal" 0 'tidy-metal is missing'
+expect_body "S8: unfenced probe-shaped line without header is checked as prose" 1 \
+  'toolchain-probe: icpx found /opt/intel/oneapi/bin/icpx - no nvcc on this host'
+expect_body "S9: trailing prose on absent row is rejected even after header" 1 "${fence}text
+${header}
+toolchain-probe: icpx absent searched=PATH no nvcc
+${fence}"
+expect_body "header missing date= with valid absent row fails" 1 "No nvcc on this host
+
+${fence}text
+toolchain-probe v1 host=test-box os=Linux
+${absent_nvcc}
+${fence}"
+expect_body "Vulkan family: explicit glslangValidator overrides vulkan alias when absent" 0 \
+  "Vulkan was not compiled locally: no glslangValidator
+
+${fence}text
+${header}
+toolchain-probe: glslc found /usr/bin/glslc 2026.1
+toolchain-probe: glslangValidator absent searched=PATH
+${fence}"
+expect_body "Vulkan family: explicit glslangValidator contradicted when found" 1 \
+  "Vulkan was not compiled locally: no glslangValidator
+
+${fence}text
+${header}
+toolchain-probe: glslc found /usr/bin/glslc 2026.1
+toolchain-probe: glslangValidator found /usr/bin/glslangValidator 15.0
+${fence}"
+expect_body "per-family precedence checks hipcc even when nvcc is explicit" 1 \
+  "CUDA and HIP were not compiled locally (no nvcc)
+
+${fence}text
+${header}
+${absent_nvcc}
+toolchain-probe: hipcc found /opt/rocm/bin/hipcc 7.2.0
+${fence}"
+expect_body "F1: same-line backtick span is not a fence opener" 0 "${fence}nvcc${fence}
+${fence}
+${header}
+
+${absent_nvcc}
+${fence}
+No nvcc on this host"
+expect_body "F1b: same-line backtick span carrying claim is checked" 1 "${fence}no nvcc${fence}"
+expect_body "MinGW detail rows inside header block are accepted" 0 "No nvcc on this host
+
+${fence}text
+${header}
+${absent_nvcc}
+toolchain-probe: x86_64-w64-mingw32-gcc found /usr/bin/x86_64-w64-mingw32-gcc 13-win32
+toolchain-probe: x86_64-w64-mingw32-gcc dumpversion 13-win32
+toolchain-probe: x86_64-w64-mingw32-gcc thread-model win32
+toolchain-probe: x86_64-w64-mingw32-gcc runtime libstdc++-6.dll=/usr/lib/gcc/x86_64-w64-mingw32/13-win32/libstdc++-6.dll
+toolchain-probe: x86_64-w64-mingw32-gcc runtime libgcc_s_seh-1.dll=/usr/lib/gcc/x86_64-w64-mingw32/13-win32/libgcc_s_seh-1.dll
+toolchain-probe: x86_64-w64-mingw32-gcc runtime libwinpthread-1.dll unresolved (evidence only; not every flavour ships it)
+toolchain-probe: x86_64-w64-mingw32-gcc pairing ok thread-model win32, libstdc++-6.dll imports no libwinpthread
+${fence}"
 
 expect_body "bare header and absent row lack required fields" 1 'No nvcc
 toolchain-probe v1

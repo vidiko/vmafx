@@ -29,11 +29,13 @@ _check_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -n "${PR_BODY+x}" ]; then
   body_text="${PR_BODY}"
+  body_src="env"
 else
   pr_body_classify_stdin
   if [ "${PR_BODY_STDIN_KIND}" = "stream" ]; then
     body_text="$(pr_body_read_stdin)"
     pr_body_close_stdin
+    body_src="stdin"
   else
     echo "check-toolchain-claims: no PR body supplied — $(pr_body_stdin_reason)" >&2
     echo "  Set PR_BODY env var, OR pipe body on stdin." >&2
@@ -41,62 +43,91 @@ else
   fi
 fi
 
-# Empty or blank body: no claims to evaluate.
+# An open stdin stream carrying no bytes fails closed (producer sent nothing);
+# an explicitly set blank $PR_BODY makes no claims and exits 0.
 if [ -z "$(printf '%s' "${body_text}" | tr -d '[:space:]')" ]; then
+  if [ "${body_src}" = "stdin" ]; then
+    echo "check-toolchain-claims: nothing arrived on stdin." >&2
+    echo "  The pipe was open and carried no bytes." >&2
+    echo "  Set PR_BODY env var, OR pipe body on stdin." >&2
+    exit 2
+  fi
   exit 0
 fi
 
-# Probe name; explicit compiler aliases; other absence aliases; compile-only aliases.
-# Use this map for claim vocabulary, accepted probe names and evidence lookup.
+# Family; probe name; explicit compiler aliases; backend aliases.
+# Single source for claim vocabulary, accepted probe names and evidence lookup.
 toolchain_map=(
-  "icpx;;oneapi;sycl"
-  "icx;;;"
-  "nvcc;;cuda[[:space:]]+toolkit;cuda"
-  "hipcc;hip[[:space:]]+cc;rocm;hip"
-  "glslc;;;vulkan"
-  "glslangValidator;;;"
-  "metal;;;"
-  "x86_64-w64-mingw32-gcc;;;"
+  "sycl;icpx;;oneapi|sycl"
+  "sycl;icx;;"
+  "cuda;nvcc;;cuda[[:space:]]+toolkit|cuda"
+  "hip;hipcc;hip[[:space:]]+cc;rocm|hip"
+  "vulkan;glslc;;vulkan"
+  "vulkan;glslangValidator;;"
+  "metal;metal;;"
+  "mingw;x86_64-w64-mingw32-gcc;;"
 )
 
-wb_l='(^|[^a-zA-Z0-9_])'
-wb_r='([^a-zA-Z0-9_]|$)'
+wb_l='(^|[^a-zA-Z0-9_-])'
+wb_r='([^a-zA-Z0-9_-]|$)'
+wb_tok_l='(^|[^a-zA-Z0-9_`-])'
+wb_tok_r='([^a-zA-Z0-9_`-]|$)'
 claim_words=''
-compile_words=''
 probe_names=''
 for spec in "${toolchain_map[@]}"; do
-  IFS=';' read -r name compiler_alias absence_alias compile_alias <<<"${spec}"
+  IFS=';' read -r _family name compiler_alias backend_alias <<<"${spec}"
   probe_names+="${probe_names:+|}${name}"
-  claim_words+="${claim_words:+|}${name}${compiler_alias:+|${compiler_alias}}${absence_alias:+|${absence_alias}}"
-  compile_words+="${compile_alias:+|${compile_alias}}"
+  claim_words+="${claim_words:+|}${name}${compiler_alias:+|${compiler_alias}}${backend_alias:+|${backend_alias}}"
 done
-compile_words="${claim_words}${compile_words}"
 
 space='[[:space:]]+'
 token='[^[:space:]]+'
+# Accepted scripts/dev/toolchain-probe.sh stdout shapes:
+#   - line 74: `toolchain-probe v1 host=<token> os=<token> date=<token>`
+#   - lines 144,157,167,198,206,217,236,244,255,274,281,304,310,317,488:
+#     `toolchain-probe: <name> found <path>[ <version>]`
+#   - lines 175,227,265,290,320,484: `toolchain-probe: <name> absent searched=<dirs>`
+#   - line 295: `toolchain-probe: metal absent searched=none os=<os>`
+#   - lines 403,421,425,430,434,438,490,493,500,505,517,519,524:
+#     `x86_64-w64-mingw32-gcc` detail rows (`dumpversion`, `thread-model`,
+#     `runtime`, `runtime-unresolved`, `pairing ok`, `pairing-mismatch`,
+#     `pairing-unverified`).
 probe_header="^[[:space:]]*toolchain-probe v1 host=${token} os=${token} date=${token}[[:space:]]*$"
-probe_result="^[[:space:]]*toolchain-probe: (${probe_names}) (found ${token}|absent searched=${token})(${space}.*)?$"
-fence_open='^[[:space:]]*(`{3,}|~{3,})'
+probe_found="^[[:space:]]*toolchain-probe: (${probe_names}) found ${token}(${space}.*)?$"
+probe_absent="^[[:space:]]*toolchain-probe: ((${probe_names}) absent searched=${token}|metal absent searched=none os=${token})[[:space:]]*$"
+mingw_name='x86_64-w64-mingw32-gcc'
+mingw_rt_unres='\(gcc -print-file-name answered no absolute path; refusing instead of staging green\)'
+mingw_opt_unres='unresolved \(evidence only; not every flavour ships it\)'
+mingw_pair_ok="pairing ok thread-model (win32, ${token} imports no libwinpthread|posix, ${token} imports libwinpthread)"
+mingw_pair_bad="pairing-mismatch thread-model (win32 but ${token} imports libwinpthread \(B24: a posix runtime next to a win32-model driver deadlocks on the target\)|posix but ${token} imports no libwinpthread \(B24 inverse: a win32 runtime next to a posix-model driver\))"
+mingw_pair_unv="pairing-unverified (${token}: objdump -p exited [0-9]+|thread-model unknown \(${token} imports (libwinpthread|none)\); refusing instead of guessing a flavour|no objdump found \(target-prefixed or plain\); refusing to pass an unasserted stage)"
+probe_mingw_detail="^[[:space:]]*toolchain-probe: ${mingw_name} (dumpversion ${token}|thread-model ${token}|runtime (libstdc\+\+-6\.dll|libgcc_s_seh-1\.dll|libwinpthread-1\.dll)=${token}|runtime libwinpthread-1\.dll ${mingw_opt_unres}|runtime-unresolved ${token} ${mingw_rt_unres}|${mingw_pair_ok}|${mingw_pair_bad}|${mingw_pair_unv})[[:space:]]*$"
+tick='`'
+fence_tick="^[[:space:]]*(${tick}{3,})[^${tick}]*\$"
+fence_tilde='^[[:space:]]*(~{3,})'
 blank='^[[:space:]]*$'
 
-# Probe lines store the opening fence's line number, or zero for raw output
-# and fence markers. Only fences with a strict header exempt their probe rows.
-declare -a lines=() probe_lines=() fence_headers=()
+# Only fence markers, valid headers, and probe rows inside a strict header
+# block (`after_header=1`) are exempt from prose claim checking.
+declare -a lines=() exempt_lines=()
 declare -A probed_tools=() found_tools=()
 fence_start=0
 fence_close=''
 after_header=0
 has_probe_header=0
 
-# Opening and closing fences reset the evidence scope. A shorter or
-# different fence marker inside a block is content.
+# Opening and closing fences reset the evidence scope. Under CommonMark, a
+# backtick fence info string cannot contain a backtick (same-line spans pass).
 is_fence_marker() {
   local line="$1" idx="$2" marker
   if [ "${fence_start}" -eq 0 ]; then
-    [[ "${line}" =~ ${fence_open} ]] || return 1
-    marker="${BASH_REMATCH[1]}"
-    fence_start="${idx}"
-    fence_close="^[[:space:]]*${marker:0:1}{${#marker},}[[:space:]]*$"
+    if [[ "${line}" =~ ${fence_tick} || "${line}" =~ ${fence_tilde} ]]; then
+      marker="${BASH_REMATCH[1]}"
+      fence_start="${idx}"
+      fence_close="^[[:space:]]*${marker:0:1}{${#marker},}[[:space:]]*$"
+    else
+      return 1
+    fi
   else
     [[ "${line}" =~ ${fence_close} ]] || return 1
     fence_start=0
@@ -104,10 +135,26 @@ is_fence_marker() {
   after_header=0
 }
 
+record_probe_row() {
+  local line="$1" idx="$2" name
+  if [[ "${line}" =~ ${probe_found} ]]; then
+    name="${BASH_REMATCH[1]}"
+    probed_tools["${name}"]=1
+    found_tools["${name}"]=1
+    exempt_lines[idx]=1
+  elif [[ "${line}" =~ ${probe_absent} ]]; then
+    name="${BASH_REMATCH[2]:-metal}"
+    probed_tools["${name}"]=1
+    exempt_lines[idx]=1
+  elif [[ "${line}" =~ ${probe_mingw_detail} ]]; then
+    exempt_lines[idx]=1
+  fi
+}
+
 read_probe_line() {
-  local line="$1" idx="$2" name status
+  local line="$1" idx="$2"
   if is_fence_marker "${line}" "${idx}"; then
-    probe_lines[idx]=0
+    exempt_lines[idx]=1
   elif [[ "${line}" =~ ${blank} ]]; then
     if [ "${fence_start}" -eq 0 ]; then
       after_header=0
@@ -115,18 +162,9 @@ read_probe_line() {
   elif [[ "${line}" =~ ${probe_header} ]]; then
     has_probe_header=1
     after_header=1
-    fence_headers[fence_start]=1
-    probe_lines[idx]="${fence_start}"
-  elif [[ "${line}" =~ ${probe_result} ]]; then
-    name="${BASH_REMATCH[1]}"
-    status="${BASH_REMATCH[2]}"
-    probe_lines[idx]="${fence_start}"
-    if [ "${after_header}" -eq 1 ]; then
-      probed_tools["${name}"]=1
-      if [[ "${status}" == 'found '* ]]; then
-        found_tools["${name}"]=1
-      fi
-    fi
+    exempt_lines[idx]=1
+  elif [ "${after_header}" -eq 1 ]; then
+    record_probe_row "${line}" "${idx}"
   fi
 }
 
@@ -137,92 +175,135 @@ while IFS= read -r line; do
   read_probe_line "${line}" "${idx}"
 done <<<"${body_text}"
 
-p_no="${wb_l}no${space}\`?(${claim_words})\`?${wb_r}"
-p_status="${wb_l}\`?(${claim_words})\`?(${space}(is|was|were))?${space}(not${space}(installed|found)|missing|unavailable|absent)${wb_r}"
-p_without="${wb_l}without${space}\`?(${claim_words})\`?${wb_r}"
-p_host="${wb_l}(on${space}this${space}host|here|locally)${wb_r}"
-p_compile="${wb_l}(not${space}compiled|(was|were)${space}not${space}built|compilation(${space}(was|were))?${space}skipped)${wb_r}"
+p_no="${wb_l}no${space}\`*(${claim_words})\`*${wb_tok_r}"
+p_lacks="${wb_l}(lacks|lacking)${space}((a|an|the)${space})?\`*(${claim_words})\`*${wb_tok_r}"
+p_status="${wb_tok_l}\`*(${claim_words})\`*(${space}(is|are|was|were))?${space}(not${space}(installed|found|available)|missing|unavailable|absent)${wb_r}"
+p_absence="(${p_no}|${p_lacks}|${p_status})"
+p_without="${wb_l}without${space}\`*(${claim_words})\`*${wb_tok_r}"
+p_host="${wb_l}(on${space}(this|the)${space}host|this${space}host|here|locally)${wb_r}"
+p_nonhost="${wb_l}(ci|runners?|images?|containers?|golden(${space}|-)builds?)${wb_r}"
+p_compile="${wb_l}(not${space}compiled|(was|were)${space}not${space}built|did${space}not${space}(compile|build)|compilation(${space}(was|were))?${space}skipped)${wb_r}"
+p_any_tool="${wb_tok_l}\`*(${claim_words})\`*${wb_tok_r}"
+
+split_clauses() {
+  local s="$1"
+  s="${s//;/$'\n'}"
+  s="${s//.[[:space:]]/$'\n'}"
+  s="${s//![[:space:]]/$'\n'}"
+  s="${s//\?[[:space:]]/$'\n'}"
+  printf '%s\n' "${s}"
+}
+
+is_nonhost_scope() {
+  local clause="$1" line="$2"
+  [[ "${clause}" =~ ${p_host} ]] && return 1
+  [[ "${clause}" =~ ${p_nonhost} ]] && return 0
+  [[ "${line}" =~ ${p_nonhost} && ! "${line}" =~ ${p_host} ]]
+}
 
 classify_claim() {
-  local line="$1"
+  local clause="$1" line="$2"
   host_claim=0
-  if [[ "${line}" =~ ${p_no} || "${line}" =~ ${p_status} ]] ||
-    [[ "${line}" =~ ${p_without} && "${line}" =~ ${p_host} ]]; then
-    host_claim=1
-  elif [[ "${line}" =~ ${p_compile} && "${line}" =~ ${wb_l}(${compile_words})${wb_r} ]]; then
-    # A compilation claim can describe a build configuration. Toolchain
-    # presence contradicts it only if it describes the build host.
-    if [[ "${line}" =~ ${p_host} || "${line}" =~ ${wb_l}(this${space}host|on${space}the${space}host)${wb_r} ]]; then
-      host_claim=1
-    fi
-  else
-    return 1
+  if [[ "${clause}" =~ ${p_absence} ]] ||
+    [[ "${clause}" =~ ${p_without} && "${clause}" =~ ${p_host} ]]; then
+    is_nonhost_scope "${clause}" "${line}" || host_claim=1
+    return 0
   fi
+  if [[ "${clause}" =~ ${p_compile} && "${clause}" =~ ${p_any_tool} ]]; then
+    [[ "${clause}" =~ ${p_host} ]] && host_claim=1
+    return 0
+  fi
+  return 1
 }
 
 claim_tools() {
-  local line="$1" spec name compiler_alias absence_alias compile_alias aliases
-  local -a explicit=() backends=()
+  local clause="$1" spec family name compiler_alias backend_alias
+  local -A family_explicit=()
+  local -a tools=()
   for spec in "${toolchain_map[@]}"; do
-    IFS=';' read -r name compiler_alias absence_alias compile_alias <<<"${spec}"
-    aliases="${absence_alias}${compile_alias:+${absence_alias:+|}${compile_alias}}"
-    if [[ "${line}" =~ ${wb_l}(${name}${compiler_alias:+|${compiler_alias}})${wb_r} ]]; then
-      explicit+=("${name}")
-    elif [ -n "${aliases}" ] && [[ "${line}" =~ ${wb_l}(${aliases})${wb_r} ]]; then
-      backends+=("${name}")
+    IFS=';' read -r family name compiler_alias _ <<<"${spec}"
+    if [[ "${clause}" =~ ${wb_tok_l}\`*(${name}${compiler_alias:+|${compiler_alias}})\`*${wb_tok_r} ]]; then
+      family_explicit["${family}"]=1
+      tools+=("${name}")
     fi
   done
-  if [ "${#explicit[@]}" -gt 0 ]; then
-    printf '%s\n' "${explicit[@]}"
-  else
-    printf '%s\n' "${backends[@]}"
+  for spec in "${toolchain_map[@]}"; do
+    IFS=';' read -r family name _ backend_alias <<<"${spec}"
+    if [ -n "${backend_alias}" ] && [ "${family_explicit[${family}]:-0}" -eq 0 ] &&
+      [[ "${clause}" =~ ${wb_tok_l}\`*(${backend_alias})\`*${wb_tok_r} ]]; then
+      tools+=("${name}")
+    fi
+  done
+  if [ "${#tools[@]}" -gt 0 ]; then
+    printf '%s\n' "${tools[@]}"
   fi
 }
 
-check_claim() {
-  local idx="$1" line="$2" tool missing='' contradicted=''
-  if [ "${has_probe_header}" -eq 0 ]; then
-    echo "::error file=PR_BODY,line=${idx},title=Missing toolchain probe::no 'toolchain-probe v1' block" >&2
-    echo "check-toolchain-claims: line ${idx}: missing-toolchain claim without 'toolchain-probe v1' block in PR body:" >&2
-    echo "  ${line}" >&2
-    echo "  Hint: run scripts/dev/toolchain-probe.sh on the build host and paste its fenced output into the PR description." >&2
-    return 1
-  fi
+emit_missing_probe() {
+  local idx="$1" line="$2"
+  echo "::error file=PR_BODY,line=${idx},title=Missing toolchain probe::no 'toolchain-probe v1' block" >&2
+  echo "check-toolchain-claims: line ${idx}: missing-toolchain claim without 'toolchain-probe v1' block in PR body:" >&2
+  echo "  ${line}" >&2
+  echo "  Hint: run scripts/dev/toolchain-probe.sh on the build host and paste its fenced output into the PR description." >&2
+}
 
-  while IFS= read -r tool; do
-    if [ "${probed_tools[${tool}]:-0}" -eq 0 ]; then
-      missing="${missing:+${missing}, }${tool}"
-    elif [ "${host_claim}" -eq 1 ] && [ "${found_tools[${tool}]:-0}" -eq 1 ]; then
-      contradicted="${contradicted:+${contradicted}, }${tool}"
-    fi
-  done < <(claim_tools "${line}")
-
+emit_claim_errors() {
+  local idx="$1" line="$2" missing="$3" contradicted="$4" rc=0
   if [ -n "${missing}" ]; then
     echo "::error file=PR_BODY,line=${idx},title=Missing toolchain probe results::missing probe results for claimed toolchains: ${missing}" >&2
     echo "check-toolchain-claims: line ${idx}: missing probe results for claimed toolchains: ${missing}" >&2
     echo "  ${line}" >&2
     echo "  Hint: paste complete output from scripts/dev/toolchain-probe.sh into the PR description covering every claimed toolchain." >&2
-    return 1
+    rc=1
   fi
   if [ -n "${contradicted}" ]; then
     echo "::error file=PR_BODY,line=${idx},title=Contradicted toolchain claim::line ${idx} claims '${contradicted}' is missing/not compiled, but probe reports it found on host:" >&2
     echo "check-toolchain-claims: line ${idx}: PR body claims '${contradicted}' is missing/not compiled, but probe reports it found on host:" >&2
     echo "  ${line}" >&2
-    return 1
+    rc=1
   fi
+  return "${rc}"
+}
+
+check_clause_tools() {
+  local clause="$1" tool
+  while IFS= read -r tool; do
+    if [ "${probed_tools[${tool}]:-0}" -eq 0 ]; then
+      if [ "${seen_miss[${tool}]:-0}" -eq 0 ]; then
+        missing="${missing:+${missing}, }${tool}"
+        seen_miss["${tool}"]=1
+      fi
+    elif [ "${host_claim}" -eq 1 ] && [ "${found_tools[${tool}]:-0}" -eq 1 ]; then
+      if [ "${seen_contra[${tool}]:-0}" -eq 0 ]; then
+        contradicted="${contradicted:+${contradicted}, }${tool}"
+        seen_contra["${tool}"]=1
+      fi
+    fi
+  done < <(claim_tools "${clause}")
+}
+
+check_claim() {
+  local idx="$1" line="$2" clause missing='' contradicted=''
+  local -A seen_miss=() seen_contra=()
+  while IFS= read -r clause; do
+    classify_claim "${clause}" "${line}" || continue
+    if [ "${has_probe_header}" -eq 0 ]; then
+      emit_missing_probe "${idx}" "${line}"
+      return 1
+    fi
+    check_clause_tools "${clause}"
+  done < <(split_clauses "${line}")
+  emit_claim_errors "${idx}" "${line}" "${missing}" "${contradicted}"
 }
 
 # Check claims after collecting evidence from the entire description.
 shopt -s nocasematch
 fail=0
 for idx in "${!lines[@]}"; do
-  scope="${probe_lines[idx]:-}"
-  if [[ "${scope}" == 0 ]] || [[ -n "${scope}" && "${fence_headers[scope]:-0}" == 1 ]]; then
+  if [ "${exempt_lines[idx]:-0}" -eq 1 ]; then
     continue
   fi
-  if classify_claim "${lines[idx]}"; then
-    check_claim "${idx}" "${lines[idx]}" || fail=1
-  fi
+  check_claim "${idx}" "${lines[idx]}" || fail=1
 done
 
 if [ "${fail}" -ne 0 ]; then

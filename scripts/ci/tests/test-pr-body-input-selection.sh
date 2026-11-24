@@ -310,6 +310,14 @@ run_case 2 "toolchain-claims: </dev/null is a usage error" \
 expect_output "toolchain-claims: the /dev/null message names the descriptor" \
   'not a readable stream'
 
+run_case 2 "toolchain-claims: an open pipe carrying no bytes fails closed" \
+  "true | bash '${toolchain_claims}'"
+expect_output "toolchain-claims: the empty-pipe message names the producer" \
+  'carried no bytes'
+
+run_case 0 "toolchain-claims: a blank PR_BODY passes with no claims" \
+  "PR_BODY='' bash '${toolchain_claims}'"
+
 if python3 -c 'import pty' >/dev/null 2>&1; then
   run_case 2 "toolchain-claims: tty stdin is a usage error" \
     "python3 -c 'import pty, subprocess, sys; m, s = pty.openpty(); sys.exit(subprocess.run([\"bash\", \"${toolchain_claims}\"], stdin=s).returncode)'"
