@@ -23,10 +23,12 @@ On `merge_group`, the Docs job fetches full history and passes the event base
 SHA through the environment to `check_render_on_master.py --group-base`.
 The check finds the last first-parent commit that touches a rendered path in
 `<base-sha>..HEAD` and runs `make docs-render-check` on that commit's own tree.
-A group without a render passes. An inexact render fails with its commit ID
-and instructions to re-render after the preceding changes land. The age bound
-applies to the master push check. The render opener treats an inexact last
-render as due immediately when the master tip needs a render.
+The base must be a full commit ID that is an ancestor of the group head,
+otherwise the check fails. A group without a render passes. An inexact render
+fails with its commit ID and instructions to re-render after the preceding
+changes land. The age bound applies to the master push check. The render
+opener treats an inexact last render as due immediately when the master tip
+needs a render.
 
 ## Alternatives considered
 

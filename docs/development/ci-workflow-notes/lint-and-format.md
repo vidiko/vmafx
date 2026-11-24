@@ -381,8 +381,10 @@ build itself passes with zero warnings; locally it takes about
 3m20s. Sibling jobs in this file already sit at 25 and 30 minutes.
 The master push and merge group need full history for the render check
 (ADR-2197, ADR-3627). Merge groups also need the event base SHA to limit
-the search for a render commit. The fetch-depth expression puts the 0
-in the fallback branch because 0 is falsy in GitHub Actions expressions.
+the search for a render commit. The base must be a full commit ID that
+is an ancestor of the group head, otherwise the check fails. The
+fetch-depth expression puts the 0 in the fallback branch because 0 is
+falsy in GitHub Actions expressions.
 make docs-fragments-check validates docs/hardware-reports against
 their schema (jsonschema, check-hardware-reports.py) and reads
 docs/credits.yaml (PyYAML, scripts/docs/credits_lib.py, ADR-2485).

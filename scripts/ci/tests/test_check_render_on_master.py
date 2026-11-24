@@ -29,7 +29,9 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.ci import ci_expressions as gx  # noqa: E402
 
-CHECK = ROOT / "scripts" / "ci" / "check_render_on_master.py"
+CHECK = Path(
+    os.environ.get("CHECK_RENDER_SCRIPT") or ROOT / "scripts" / "ci" / "check_render_on_master.py"
+)
 WORKFLOW = ROOT / ".github" / "workflows" / "lint-and-format.yml"
 RENDER_PR_WORKFLOW = ROOT / ".github" / "workflows" / "docs-render-pr.yml"
 RENDER_PR_SCRIPT = ROOT / "scripts" / "ci" / "open-render-pr.sh"
@@ -206,6 +208,60 @@ class RenderOnMasterTest(unittest.TestCase):
     def test_merge_group_without_a_base_fails(self) -> None:
         """Reject an empty CI base, which Git would read as HEAD."""
         self.assert_status(self.check("--group-base", ""), 1, "missing merge-group base SHA")
+
+    def test_merge_group_base_not_a_commit_id_fails(self) -> None:
+        """Reject non-IDs, option-like values, uppercase hex and abbreviated SHAs cleanly."""
+        head = self.git("rev-parse", "HEAD").strip()
+        for invalid in ("not-a-sha", "--output=x", head[:12], head.upper()):
+            with self.subTest(invalid=invalid):
+                res = self.check("--group-base", invalid)
+                self.assert_status(res, 1, f"merge-group base {invalid!r} is not a full commit ID")
+                self.assertEqual(res.stderr, "")
+                self.assertNotIn("Traceback", res.stdout + res.stderr)
+
+    def test_merge_group_base_not_an_ancestor_fails(self) -> None:
+        """Reject a base commit on a diverged branch."""
+        self.git("checkout", "-q", "-b", "side")
+        self.commit({"changelog.d/fixed/side.md": "- side\n"}, age_h=2)
+        side = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", "master")
+        self.commit({"changelog.d/fixed/main.md": "- main\n"}, age_h=1)
+
+        self.assert_status(
+            self.check("--group-base", side),
+            1,
+            f"merge-group base {side[:12]} is not an ancestor of HEAD",
+        )
+
+    def test_merge_group_base_descendant_fails(self) -> None:
+        """Reject a base commit that descends from HEAD instead of passing an empty range."""
+        self.commit({"changelog.d/fixed/b.md": "- fixed b\n"}, age_h=1)
+        descendant = self.git("rev-parse", "HEAD").strip()
+        self.git("reset", "--hard", "-q", "HEAD~1")
+
+        self.assert_status(
+            self.check("--group-base", descendant),
+            1,
+            f"merge-group base {descendant[:12]} is not an ancestor of HEAD",
+        )
+
+    def test_merge_group_base_equal_to_head_passes(self) -> None:
+        """Allow an empty merge group where the base commit equals HEAD."""
+        head = self.git("rev-parse", "HEAD").strip()
+        self.assert_status(
+            self.check("--group-base", head), 0, "no render commit in the merge group"
+        )
+
+    def test_merge_group_unknown_base_commit_fails(self) -> None:
+        """Report git's status and stderr line when a full commit ID is missing from the repo."""
+        unknown = "0" * 40
+        res = self.check("--group-base", unknown)
+        self.assert_status(
+            res, 1, "::error title=ADR-3295 rendered docs::git merge-base --is-ancestor failed"
+        )
+        self.assertIn("(rc 128)", res.stdout)
+        self.assertIn(unknown[:12], res.stdout)
+        self.assertEqual(res.stderr, "")
 
     # --- the scheduled render pull request (ADR-3373) --------------------
 
