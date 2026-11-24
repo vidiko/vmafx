@@ -253,9 +253,13 @@ def ci_text_paths(root: Path) -> list[Path]:
     return sorted(paths)
 
 
-def _logical_ci_lines(text: str) -> list[tuple[int, str, bool]]:
-    """Join bash backslash-continued lines (no blank after escape) up to MAX_CONTINUATION_LINES."""
-    return _join_continued_lines(list(enumerate(text.splitlines(), 1)), blank_after_escape=False)
+def _logical_ci_lines(
+    text: str, *, blank_after_escape: bool = False
+) -> list[tuple[int, str, bool]]:
+    """Join backslash continuations (default False: bash rule; True: BuildKit rule)."""
+    return _join_continued_lines(
+        list(enumerate(text.splitlines(), 1)), blank_after_escape=blank_after_escape
+    )
 
 
 def _join_continued_lines(
@@ -831,7 +835,9 @@ def apt_update_problems(path: Path, text: str) -> list[str]:
     container_file = _is_containerfile_path(path)
     if hosted_surface:
         problems.extend(_hosted_yaml_run_problems(path, text))
-    for line_number, logical_line, overflowed in _logical_ci_lines(text):
+    for line_number, logical_line, overflowed in _logical_ci_lines(
+        text, blank_after_escape=container_file
+    ):
         if overflowed:
             problems.append(f"{path.as_posix()}:{line_number}: {APT_CONTINUATION_MESSAGE}")
             continue
@@ -1881,6 +1887,41 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
             apt_update_contract_problems(self.root),
             [f"split.sh:1: {APT_CONTINUATION_MESSAGE}"],
         )
+
+    def test_dockerfile_update_split_blank_after_continuation(self) -> None:
+        """Join BuildKit trailing-blank continuations in containerfiles, not in shell files."""
+        cases: tuple[tuple[str, Path, str, list[str]], ...] = (
+            (
+                "positive-space",
+                Path("Dockerfile"),
+                "FROM ubuntu:24.04\nRUN apt-get \\ \n  update\n",
+                [f"Dockerfile:2: {APT_UPDATE_MESSAGE}"],
+            ),
+            (
+                "positive-tab",
+                Path("Containerfile"),
+                "FROM ubuntu:24.04\nRUN apt-get \\\t\n  update\n",
+                [f"Containerfile:2: {APT_UPDATE_MESSAGE}"],
+            ),
+            (
+                "boundary-compliant",
+                Path("Dockerfile"),
+                (
+                    "FROM ubuntu:24.04\n"
+                    "RUN apt-get --error-on=any -o Acquire::Retries=3 \\ \n  update\n"
+                ),
+                [],
+            ),
+            (
+                "negative-shell",
+                Path("ci/split.sh"),
+                "apt-get -qq \\ \n  update\n",
+                [],
+            ),
+        )
+        for label, path, text, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(apt_update_problems(path, text), expected)
 
     def test_logical_ci_lines_continuation_requires_adjacent_newline(self) -> None:
         """Join bash `\\`+newline continuations, not `\\` followed by spaces or tabs."""
