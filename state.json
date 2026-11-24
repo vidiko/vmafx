@@ -2,58 +2,51 @@
   "badges": {
     "best-practices": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "passing"
     },
     "builds": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "passing"
-    },
-    "codacy": {
-      "color": "#6e7781",
-      "fetched_at": "2026-11-19T21:47:05Z",
-      "message": "stale"
     },
     "ffmpeg": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "passing"
     },
     "go": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "passing"
     },
     "lint": {
       "color": "#cf222e",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "failing"
     },
     "rust": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "passing"
     },
     "scorecard": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "8.9 / 10"
     },
     "security": {
       "color": "#1f883d",
-      "fetched_at": "2026-11-24T10:04:52Z",
+      "fetched_at": "2026-11-24T18:18:44Z",
       "message": "passing"
     },
     "tests": {
-      "color": "#cf222e",
-      "fetched_at": "2026-11-24T10:04:52Z",
-      "message": "failing"
+      "color": "#1f883d",
+      "fetched_at": "2026-11-24T18:18:44Z",
+      "message": "passing"
     }
   },
-  "failures": [
-    "codacy: HTTP Error 404: Not Found"
-  ],
-  "generated_at": "2026-11-24T10:04:52Z",
+  "failures": [],
+  "generated_at": "2026-11-24T18:18:44Z",
   "version": 1
 }
