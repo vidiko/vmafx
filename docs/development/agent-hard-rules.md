@@ -78,7 +78,9 @@ line budget. Changing a rule here changes it for every agent.
    (d) reproducer / smoke-test command
    in the PR description; (e) CHANGELOG fragment file under
    `changelog.d/<section>/<topic>.md` — `CHANGELOG.md` itself is rendered
-   at landing (ADR-0221, ADR-2197) and a PR does not carry it;
+   at landing (ADR-0221, ADR-2197) and a PR does not carry it, except the
+   render-only PR, the one PR that carries it
+   ([ADR-3295](../adr/3295-render-only-pull-request.md));
    (f) a rebase note as one fragment file `docs/rebase-notes.d/<slug>.md`
    (starting with its `## <title> (<date>)` heading on line 1, with no
    blank first or last line; `docs/rebase-notes.md` is rendered from them,

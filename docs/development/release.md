@@ -962,6 +962,8 @@ fragments so existing release-train history is preserved.
   Markdown bullet under `changelog.d/<section>/<topic>.md`. The fragment is
   the source of truth; the rendered `CHANGELOG.md` is a build artefact that a
   pull request does not carry ([ADR-2197](../adr/2197-render-generated-docs-at-landing.md)).
+  The render-only pull request is the one pull request that carries it
+  ([ADR-3295](../adr/3295-render-only-pull-request.md)).
 - **Filename convention:** lowercase kebab-case, optionally prefixed with the
   task ID (`T7-39-foo.md`) or ADR number (`adr-0312-deferral-retired.md`)
   for implicit lexical ordering within the section.
