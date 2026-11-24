@@ -154,13 +154,15 @@ in the same shell so `jq` reads the same
 `"$work/u2netp_mirror_v1.onnx.bundle"` copy:
 
 ```bash
-jq -r '.verificationMaterial.certificate.rawBytes' "$work/u2netp_mirror_v1.onnx.bundle" | base64 -d \
+set -o pipefail
+jq -er '.verificationMaterial.certificate.rawBytes' "$work/u2netp_mirror_v1.onnx.bundle" | base64 -d \
   | openssl x509 -inform DER -noout -text \
   | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
-  && echo "owner ID OK" || echo "owner ID mismatch: do not load"
+  && echo "owner ID OK" || { echo "owner ID mismatch: do not load" >&2; false; }
 ```
 
-Any output other than `owner ID OK` means the bundle was not signed from
+The command exits with a nonzero status via `false` on a mismatch. Any nonzero
+status or output other than `owner ID OK` means the bundle was not signed from
 the `vidiko` account. Do not load the model. libvmaf's `--tiny-model-verify`
 runs both checks itself for a model listed with its `sigstore_bundle` in a
 `registry.json` next to the model; the download in step 4 has no such entry

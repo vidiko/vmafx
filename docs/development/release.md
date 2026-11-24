@@ -866,11 +866,14 @@ repository owner identifier). Run it in the same shell so `jq` reads the copy
 in `$work`:
 
 ```bash
-jq -r '.verificationMaterial.certificate.rawBytes' "$work/vmaf.bundle" | base64 -d \
+set -o pipefail
+jq -er '.verificationMaterial.certificate.rawBytes' "$work/vmaf.bundle" | base64 -d \
   | openssl x509 -inform DER -noout -text \
   | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
-  && echo "owner ID OK" || echo "owner ID mismatch"
+  && echo "owner ID OK" || { echo "owner ID mismatch" >&2; false; }
 ```
+
+The command exits with a nonzero status via `false` on a mismatch.
 
 For tiny-model bundles, libvmaf runs this check itself before verification
 ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
