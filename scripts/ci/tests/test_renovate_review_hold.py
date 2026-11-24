@@ -93,16 +93,18 @@ def may_overlap(a: list[str], b: list[str]) -> bool:
 
 
 def co_match(r1: Rule, r2: Rule) -> bool:
-    """Rules can co-match unless a shared dimension proves them disjoint."""
+    """Rules co-match unless a shared dimension besides matchFileNames proves them disjoint."""
     return all(
         may_overlap(values(r1[key]), values(r2[key]))
         for key in DIMENSIONS
-        if key in r1 and key in r2
+        if key != "matchFileNames" and key in r1 and key in r2
     )
 
 
 def covers(k: Rule, r: Rule) -> bool:
-    """Prove k is a superset of r across all dimensions constrained by k."""
+    """Prove k covers r across DIMENSIONS with no other match or exclude keys on k."""
+    if any(key.startswith(("match", "exclude")) and key not in DIMENSIONS for key in k):
+        return False
     for key in DIMENSIONS:
         if key not in k:
             continue
@@ -323,6 +325,37 @@ class ReviewedRulesCarryHold(unittest.TestCase):
         self.assertEqual(
             findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
         )
+
+    def test_disjoint_file_names_still_co_match(self) -> None:
+        rules: list[Rule] = [
+            {"matchFileNames": ["package.json"], "automerge": False, "addLabels": [HOLD]},
+            {"matchFileNames": ["package-lock.json"], "automerge": True},
+        ]
+        self.assertEqual(
+            findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
+        )
+        self.assertTrue(co_match(rules[0], rules[1]))
+        self.assertTrue(covers({"matchFileNames": ["package.json"]}, rules[0]))
+        self.assertFalse(covers({"matchFileNames": ["package-lock.json"]}, rules[0]))
+
+    def test_unmodeled_match_or_exclude_blocks_coverage(self) -> None:
+        rules: list[Rule] = [
+            {"matchPackageNames": ["foo"], "automerge": False, "addLabels": [HOLD]},
+            {"matchManagers": ["custom.regex"], "automerge": True},
+            {
+                "matchPackageNames": ["foo"],
+                "matchNewValue": "/^2\\./",
+                "automerge": False,
+                "addLabels": [HOLD],
+            },
+        ]
+        self.assertEqual(
+            findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
+        )
+        self.assertFalse(
+            covers({"matchPackageNames": ["foo"], "excludePackageNames": ["bar"]}, rules[0])
+        )
+        self.assertTrue(covers(rules[0], rules[2]))
 
 
 if __name__ == "__main__":
