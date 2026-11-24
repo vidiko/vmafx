@@ -115,12 +115,15 @@ FORK_BUILD_CONFIGS=(
 
 tmp_surface_root=""
 head_surface_sha=""
+tmp_docs=""
+tmp_docs_nul=""
 tmp_body=""
 tmp_diff=""
+tmp_patch_tree=""
 tmp_consumed=""
 tmp_diff_syms=""
 tmp_diff_flags=""
-trap '[ -z "$tmp_body" ] || rm -f "$tmp_body"; [ -z "$tmp_diff" ] || rm -f "$tmp_diff"; [ -z "$tmp_consumed" ] || rm -f "$tmp_consumed"; [ -z "$tmp_diff_syms" ] || rm -f "$tmp_diff_syms"; [ -z "$tmp_diff_flags" ] || rm -f "$tmp_diff_flags"; [ -z "$tmp_surface_root" ] || rm -rf "$tmp_surface_root"' EXIT
+trap '[ -z "$tmp_docs" ] || rm -f "$tmp_docs"; [ -z "$tmp_docs_nul" ] || rm -f "$tmp_docs_nul"; [ -z "$tmp_body" ] || rm -f "$tmp_body"; [ -z "$tmp_diff" ] || rm -f "$tmp_diff"; [ -z "$tmp_patch_tree" ] || rm -f "$tmp_patch_tree"; [ -z "$tmp_consumed" ] || rm -f "$tmp_consumed"; [ -z "$tmp_diff_syms" ] || rm -f "$tmp_diff_syms"; [ -z "$tmp_diff_flags" ] || rm -f "$tmp_diff_flags"; [ -z "$tmp_surface_root" ] || rm -rf "$tmp_surface_root"' EXIT
 
 # ---------- 0. Invariant surface checks (Issue #2435, ADR-2166) ----------
 
@@ -261,7 +264,7 @@ scan_single_doc() {
 list_surface_docs() {
   local use_find="${1:-0}"
   if [ "$use_find" -eq 0 ] && git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git -C "${REPO_ROOT}" ls-files "docs/*.md" "docs/**/*.md" "README.md" "ffmpeg-patches/README.md"
+    git -C "${REPO_ROOT}" ls-files -z "docs/*.md" "docs/**/*.md" "README.md" "ffmpeg-patches/README.md"
     return $?
   fi
   if [ "$use_find" -eq 0 ]; then
@@ -283,15 +286,29 @@ check_surface_docs_examples() {
   local use_find="${1:-0}"
   local fail=0
   local all_docs=()
-  local docs_list
-  docs_list="$(list_surface_docs "$use_find")" || {
+  # HISS-02 scalar loop bound: git ls-files -z matches 5,083 doc blobs at
+  # af6ef25d1f; 16384 matches extract_tree_blobs.py DEFAULT_MAX_ENTRIES (>3x).
+  local max_surface_docs=16384
+  tmp_docs="$(mktemp)"
+  list_surface_docs "$use_find" >"$tmp_docs" || {
     echo "ffmpeg-patches-surface-check: [FAIL] cannot list docs" >&2
     return 1
   }
+  if [ "$use_find" -ne 0 ] || ! git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    tmp_docs_nul="$(mktemp)"
+    tr '\n' '\0' <"$tmp_docs" >"$tmp_docs_nul"
+    mv "$tmp_docs_nul" "$tmp_docs"
+  fi
 
-  while IFS= read -r p; do
+  local p doc_records=0
+  while IFS= read -r -d '' p; do
+    doc_records=$((doc_records + 1))
+    if [ "$doc_records" -gt "$max_surface_docs" ]; then
+      echo "ffmpeg-patches-surface-check: [FAIL] doc list exceeds ${max_surface_docs} entries" >&2
+      return 1
+    fi
     [ -n "$p" ] && all_docs+=("$p")
-  done <<<"$docs_list"
+  done <"$tmp_docs"
 
   local relpath
   local doc_count=0
@@ -470,6 +487,7 @@ fi
 
 tmp_body="$(mktemp)"
 tmp_diff="$(mktemp)"
+tmp_patch_tree="$(mktemp)"
 tmp_consumed="$(mktemp)"
 tmp_diff_syms="$(mktemp)"
 tmp_diff_flags="$(mktemp)"
@@ -496,7 +514,10 @@ else
   diff_src="auto (merge-base origin/master..HEAD)"
 fi
 
-git diff --no-relative --name-only "${diff_base}..${diff_head}" >"$tmp_diff"
+if ! git diff -z --no-relative --name-only "${diff_base}..${diff_head}" >"$tmp_diff" 2>/dev/null; then
+  echo "ffmpeg-patches-surface-check: cannot list changed paths ${diff_base}..${diff_head}." >&2
+  exit 2
+fi
 
 echo "ffmpeg-patches-surface-check: PR body from ${body_src}, diff from ${diff_src}"
 
@@ -511,13 +532,23 @@ fi
 
 # Read patches from ${diff_head}, not the checkout, so both sides of the
 # surface intersection come from the same revision.
-if ! patch_tree="$(git ls-tree --full-tree --name-only "${diff_head}" -- ffmpeg-patches/ 2>/dev/null)"; then
+if ! git ls-tree -z --full-tree --name-only "${diff_head}" -- ffmpeg-patches/ >"$tmp_patch_tree" 2>/dev/null; then
   echo "ffmpeg-patches-surface-check: cannot list ffmpeg-patches/ at ${diff_head}." >&2
   exit 2
 fi
 
+# HISS-02 scalar loop bound: ffmpeg-patches/ holds 8 direct tree entries at
+# af6ef25d1f (4 patches, README.md, series.txt, src/, test/); 1024 gives 128x
+# headroom for series growth while bounding NUL-record iteration.
+MAX_PATCH_TREE_RECORDS=1024
 patch_paths=()
-while IFS= read -r patch_path; do
+patch_tree_records=0
+while IFS= read -r -d '' patch_path; do
+  patch_tree_records=$((patch_tree_records + 1))
+  if [ "$patch_tree_records" -gt "$MAX_PATCH_TREE_RECORDS" ]; then
+    echo "ffmpeg-patches-surface-check: ffmpeg-patches/ at ${diff_head} exceeds ${MAX_PATCH_TREE_RECORDS} tree entries." >&2
+    exit 2
+  fi
   case "$patch_path" in
     ffmpeg-patches/*.patch)
       case "${patch_path#ffmpeg-patches/}" in
@@ -526,7 +557,7 @@ while IFS= read -r patch_path; do
       esac
       ;;
   esac
-done <<<"$patch_tree"
+done <"$tmp_patch_tree"
 
 if [ "${#patch_paths[@]}" -eq 0 ]; then
   echo "ffmpeg-patches-surface-check: ffmpeg-patches/*.patch at ${diff_head} missing; nothing to check." >&2
@@ -614,10 +645,24 @@ if [ -n "$meson_diff" ]; then
 fi
 
 # Did the diff touch any ffmpeg-patches/*.patch file?
+# HISS-02 scalar loop bound: full tracked tree is ~5,200 blobs at af6ef25d1f;
+# 65536 bounds changed-path iteration with >12x full-tree headroom.
+MAX_DIFF_PATHS=65536
 patch_touched=0
-if grep -qE '^ffmpeg-patches/.*\.patch$' "$tmp_diff"; then
-  patch_touched=1
-fi
+diff_records=0
+while IFS= read -r -d '' changed_path; do
+  diff_records=$((diff_records + 1))
+  if [ "$diff_records" -gt "$MAX_DIFF_PATHS" ]; then
+    echo "ffmpeg-patches-surface-check: changed-path list ${diff_base}..${diff_head} exceeds ${MAX_DIFF_PATHS} entries." >&2
+    exit 2
+  fi
+  case "$changed_path" in
+    ffmpeg-patches/*.patch)
+      patch_touched=1
+      break
+      ;;
+  esac
+done <"$tmp_diff"
 
 # Compute symbol-level intersections.
 sym_hit_count=0

@@ -1009,5 +1009,221 @@ class HeadRevisionArchiveAttributeTests(_FixtureTree, unittest.TestCase):
             self.assertEqual(len(res.stderr.splitlines()), 1, res.stderr)
 
 
+CAFE_PATCH_REL = "ffmpeg-patches/0001-caf\u00e9.patch"
+CAFE_PROBE_SYMBOL = "vmaf_fixture_cafe_probe"
+SPACE_PATCH_REL = "ffmpeg-patches/0005-with space.patch"
+SPACE_PROBE_SYMBOL = "vmaf_fixture_space_probe"
+QUOTE_PATCH_REL = 'ffmpeg-patches/0006-with"quote.patch'
+QUOTE_PROBE_SYMBOL = "vmaf_fixture_quote_probe"
+NON_ASCII_DOC_REL = "docs/usage/\u00fcbersicht.md"
+PATCH_TREE_RECORD_CAP = 1024
+
+
+class NulDelimitedPathListingTests(_FixtureTree, unittest.TestCase):
+    """Verify NUL-delimited path listings across git ls-tree, git diff, and git ls-files."""
+
+    def _stage_cafe_base(self, td: str) -> tuple[Path, Path, Path, str]:
+        """Stage a base commit where a non-ASCII patch consumes a public header symbol."""
+        tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+        header = tmp / PROBE_HEADER_REL
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text(
+            f"#ifndef VMAF_CAFE_H_\n#define VMAF_CAFE_H_\nint {CAFE_PROBE_SYMBOL}(void);\n#endif\n",
+            encoding="utf-8",
+        )
+        cafe_patch = tmp / CAFE_PATCH_REL
+        cafe_patch.write_text(
+            f"--- a/fftools/ffmpeg.c\n+++ b/fftools/ffmpeg.c\n+    ret = {CAFE_PROBE_SYMBOL}();\n",
+            encoding="utf-8",
+        )
+        _git(tmp, "add", ".")
+        _git(tmp, "commit", "-q", "-m", "base with non-ascii patch")
+        return tmp, header, cafe_patch, _rev_parse(tmp, "HEAD")
+
+    def test_t1_non_ascii_patch_consumed_symbol_change_fails(self) -> None:
+        """T1: changing a symbol consumed by an untouched non-ASCII patch exits 1."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, _cafe_patch, base_sha = self._stage_cafe_base(td)
+            header.write_text(
+                f"#ifndef VMAF_CAFE_H_\n#define VMAF_CAFE_H_\nint {CAFE_PROBE_SYMBOL}(int flags);\n#endif\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", PROBE_HEADER_REL)
+            _git(tmp, "commit", "-q", "-m", "change cafe symbol without updating patch")
+            head_sha = _rev_parse(tmp, "HEAD")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("::error title=Agent hard rule 11::", res.stdout)
+            self.assertIn(CAFE_PROBE_SYMBOL, res.stdout)
+
+    def test_t2_non_ascii_patch_touched_in_pr_passes(self) -> None:
+        """T2: updating both the header symbol and the non-ASCII patch sets patch_touched and passes."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, header, cafe_patch, base_sha = self._stage_cafe_base(td)
+            header.write_text(
+                f"#ifndef VMAF_CAFE_H_\n#define VMAF_CAFE_H_\nint {CAFE_PROBE_SYMBOL}(int flags);\n#endif\n",
+                encoding="utf-8",
+            )
+            cafe_patch.write_text(
+                f"--- a/fftools/ffmpeg.c\n+++ b/fftools/ffmpeg.c\n+    ret = {CAFE_PROBE_SYMBOL}(0);\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", PROBE_HEADER_REL, CAFE_PATCH_REL)
+            _git(tmp, "commit", "-q", "-m", "change cafe symbol and update non-ascii patch")
+            head_sha = _rev_parse(tmp, "HEAD")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn(
+                "at least one ffmpeg-patches/*.patch is in the diff. PASS.",
+                res.stdout,
+            )
+            self.assertIn(CAFE_PROBE_SYMBOL, res.stdout)
+
+    def test_t3_non_ascii_doc_with_retired_filter_fails(self) -> None:
+        """T3: a tracked non-ASCII doc carrying a retired filter fails and names that doc."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td))
+            doc = tmp / NON_ASCII_DOC_REL
+            doc.parent.mkdir(parents=True, exist_ok=True)
+            doc.write_text(
+                "# \u00dcbersicht\n\nPlanted defect: use vmaf_pre in the graph.\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", NON_ASCII_DOC_REL)
+            _git(tmp, "commit", "-q", "-m", "add non-ascii doc with retired filter")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn(
+                f"retired filter/option in doc {NON_ASCII_DOC_REL}:",
+                res.stderr,
+            )
+            self.assertIn("vmaf_pre", res.stderr)
+
+    def test_t4_patch_names_with_space_and_double_quote_reach_selector(self) -> None:
+        """T4: patch names containing spaces and double quotes contribute to the consumed set."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            header = tmp / PROBE_HEADER_REL
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.write_text(
+                f"int {SPACE_PROBE_SYMBOL}(void);\nint {QUOTE_PROBE_SYMBOL}(void);\n",
+                encoding="utf-8",
+            )
+            (tmp / SPACE_PATCH_REL).write_text(
+                f"+    ret = {SPACE_PROBE_SYMBOL}();\n", encoding="utf-8"
+            )
+            quote_oid = _git_stdin(
+                tmp,
+                "hash-object",
+                "-w",
+                "--stdin",
+                data=f"+    ret = {QUOTE_PROBE_SYMBOL}();\n",
+            )
+            _git(tmp, "add", PROBE_HEADER_REL, SPACE_PATCH_REL)
+            _git(
+                tmp, "update-index", "--add", "--cacheinfo", f"100644,{quote_oid},{QUOTE_PATCH_REL}"
+            )
+            _git(tmp, "commit", "-q", "-m", "base with space and quote patch names")
+            base_sha = _rev_parse(tmp, "HEAD")
+            _git(tmp, "update-ref", "refs/remotes/origin/master", base_sha)
+
+            header.write_text("/* declarations removed */\n", encoding="utf-8")
+            _git(tmp, "add", PROBE_HEADER_REL)
+            _git(tmp, "commit", "-q", "-m", "remove space and quote probe symbols")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name, tmp, REPO_ROOT=str(tmp), PR_BODY=""
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn(SPACE_PROBE_SYMBOL, res.stdout)
+            self.assertIn(QUOTE_PROBE_SYMBOL, res.stdout)
+
+    def test_t5_listing_failure_exits_two_with_single_stderr_line(self) -> None:
+        """T5: missing diff base tree (C2) or missing ffmpeg-patches tree (C1) exits 2."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp, _header, _cafe_patch, base_sha = self._stage_cafe_base(td)
+            base_tree = _rev_parse(tmp, "HEAD^{tree}")
+            readme = tmp / "README.md"
+            readme.write_text(f"{readme.read_text(encoding='utf-8')}\nnote\n", encoding="utf-8")
+            _git(tmp, "add", "README.md")
+            _git(tmp, "commit", "-q", "-m", "head readme note")
+            head_sha = _rev_parse(tmp, "HEAD")
+            patches_tree = _rev_parse(tmp, "HEAD:ffmpeg-patches")
+            script = tmp / "scripts" / "ci" / SCRIPT.name
+
+            base_obj = tmp / ".git" / "objects" / base_tree[:2] / base_tree[2:]
+            saved_base = base_obj.read_bytes()
+            with self.subTest(failure="c2_diff_paths"):
+                base_obj.unlink()
+                res = _run_script(
+                    script,
+                    tmp,
+                    REPO_ROOT=str(tmp),
+                    BASE_SHA=base_sha,
+                    HEAD_SHA=head_sha,
+                    PR_BODY="",
+                )
+                self.assertEqual(res.returncode, RC_GATE_ERROR, res.stderr)
+                self.assertEqual(
+                    res.stderr.splitlines(),
+                    [
+                        f"ffmpeg-patches-surface-check: cannot list changed paths {base_sha}..{head_sha}."
+                    ],
+                )
+            base_obj.write_bytes(saved_base)
+
+            with self.subTest(failure="c1_ls_tree"):
+                _git(tmp, "update-ref", "refs/remotes/origin/master", base_sha)
+                (tmp / ".git" / "objects" / patches_tree[:2] / patches_tree[2:]).unlink()
+                res = _run_script(script, tmp, REPO_ROOT=str(tmp), PR_BODY="")
+                self.assertEqual(res.returncode, RC_GATE_ERROR, res.stderr)
+                self.assertEqual(
+                    res.stderr.splitlines(),
+                    ["ffmpeg-patches-surface-check: cannot list ffmpeg-patches/ at HEAD."],
+                )
+
+    def test_patch_tree_record_bound_exceeded_exits_two(self) -> None:
+        """Exceeding MAX_PATCH_TREE_RECORDS in ffmpeg-patches/ exits 2 with one stderr line."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td))
+            oid = _git_stdin(tmp, "hash-object", "-w", "--stdin", data="x\n")
+            entries = "".join(
+                f"100644 {oid}\tffmpeg-patches/extra-{idx:04d}.txt\n"
+                for idx in range(PATCH_TREE_RECORD_CAP + 1)
+            )
+            _git_stdin(tmp, "update-index", "--index-info", data=entries)
+            _git(tmp, "commit", "-q", "-m", "exceed patch tree record cap")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name, tmp, REPO_ROOT=str(tmp), PR_BODY=""
+            )
+            self.assertEqual(res.returncode, RC_GATE_ERROR, res.stderr)
+            err_lines = res.stderr.splitlines()
+            self.assertEqual(len(err_lines), 1, res.stderr)
+            self.assertIn(f"exceeds {PATCH_TREE_RECORD_CAP} tree entries", err_lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()
