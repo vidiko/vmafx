@@ -17,10 +17,14 @@ import yaml  # type: ignore[import-untyped]  # PyYAML ships no stubs in the hook
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
+from scripts.ci import extract_tree_blobs  # noqa: E402
 from scripts.lib.safe_subprocess import TextCommandResult  # noqa: E402
 from scripts.lib.safe_subprocess import run as run_command  # noqa: E402
 
 SCRIPT = ROOT / "scripts" / "ci" / "ffmpeg-patches-surface-check.sh"
+EXTRACTOR = ROOT / "scripts" / "ci" / "extract_tree_blobs.py"
+RC_GATE_ERROR = 2
+SMALL_ENTRY_BOUND = 3
 HOOK_ID = "ffmpeg-patches-surface-docs"
 SURFACE_ONLY_DONE_LINE = "--surface-only: tree checks passed"
 GIT_TIMEOUT_S = 60
@@ -102,61 +106,55 @@ def _run_script(script: Path, cwd: Path, *args: str, **extra: str) -> TextComman
     )
 
 
+FIXTURE_REPO_FILES = (
+    "scripts/__init__.py",
+    "scripts/lib/__init__.py",
+    "scripts/lib/safe_subprocess.py",
+    "scripts/lib/new_scanner_findings.py",
+    "scripts/ci/extract_tree_blobs.py",
+    "scripts/ci/pr-body-input.sh",
+    "scripts/ci/pr-diff-base.sh",
+    "Containerfile.vmafx",
+    "Dockerfile",
+    "Dockerfile.ffmpeg",
+    "dev/Containerfile",
+    "docker/Dockerfile.node",
+    "scripts/test/sycl-dev-container.sh",
+    ".github/workflows/ffmpeg-patch-stack.yml",
+    "scripts/ci/tidy-integrations-build.sh",
+    "README.md",
+    "docs/reference/faq.md",
+    "docs/adr/0000-template.md",
+    "docs/usage/ffmpeg.md",
+    "docs/usage/vmaf-tune-ffmpeg.md",
+    "docs/usage/vmaf-tune-codec-adapters.md",
+    "docs/usage/vmaf-vpl.md",
+    "docs/development/sycl-zerocopy-testing.md",
+    "docs/ai/inference.md",
+    "docs/ai/model-registry.md",
+    "docs/ai/roadmap.md",
+    "docs/ai/models/fastdvdnet_pre.md",
+    "docs/ai/models/learned_filter_v1.md",
+    "docs/api/dnn.md",
+    "docs/api/models-and-features.md",
+)
+
+
 class _FixtureTree:
     """Build the temporary fixture repository both test classes run the script in."""
 
     def _prepare_temp_worktree(self, temp_dir: Path, *, origin_master: bool = True) -> Path:
         """Stage a minimal fixture tree with the three surfaces and script."""
-        # Copy ffmpeg-patches
         shutil.copytree(ROOT / "ffmpeg-patches", temp_dir / "ffmpeg-patches")
-        # Copy scripts/ci needed by script
         (temp_dir / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
         shutil.copy(SCRIPT, temp_dir / "scripts" / "ci" / SCRIPT.name)
-        for helper in ("pr-body-input.sh", "pr-diff-base.sh"):
-            src = ROOT / "scripts" / "ci" / helper
-            if src.is_file():
-                shutil.copy(src, temp_dir / "scripts" / "ci" / helper)
-        # Copy allow-listed build configs
-        for rel in (
-            "Containerfile.vmafx",
-            "Dockerfile",
-            "Dockerfile.ffmpeg",
-            "dev/Containerfile",
-            "docker/Dockerfile.node",
-            "scripts/test/sycl-dev-container.sh",
-            ".github/workflows/ffmpeg-patch-stack.yml",
-            "scripts/ci/tidy-integrations-build.sh",
-        ):
-            src = ROOT / rel
-            if src.is_file():
-                dst = temp_dir / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy(src, dst)
-        # Copy allow-listed doc files
-        for rel in (
-            "README.md",
-            "docs/reference/faq.md",
-            "docs/adr/0000-template.md",
-            "docs/usage/ffmpeg.md",
-            "docs/usage/vmaf-tune-ffmpeg.md",
-            "docs/usage/vmaf-tune-codec-adapters.md",
-            "docs/usage/vmaf-vpl.md",
-            "docs/development/sycl-zerocopy-testing.md",
-            "docs/ai/inference.md",
-            "docs/ai/model-registry.md",
-            "docs/ai/roadmap.md",
-            "docs/ai/models/fastdvdnet_pre.md",
-            "docs/ai/models/learned_filter_v1.md",
-            "docs/api/dnn.md",
-            "docs/api/models-and-features.md",
-        ):
+        for rel in FIXTURE_REPO_FILES:
             src = ROOT / rel
             if src.is_file():
                 dst = temp_dir / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(src, dst)
 
-        # A fixture repository so origin/master exists for diff base resolution.
         _git(temp_dir, "init", "-q", "-b", "master")
         _git(temp_dir, "add", ".")
         _git(temp_dir, "commit", "-q", "-m", "init")
@@ -756,6 +754,259 @@ class HeadRevisionTreeChecksTests(_FixtureTree, unittest.TestCase):
                 "ffmpeg-patches-surface-check: [PASS] docs examples: zero retired filters/options",
                 res.stdout,
             )
+
+
+def _run_extractor(*args: str) -> TextCommandResult:
+    """Run extract_tree_blobs.py via sys.executable with the clean git environment."""
+    return run_command(
+        [sys.executable, str(EXTRACTOR), *args],
+        allowed_executables=(sys.executable,),
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+        timeout_seconds=GIT_TIMEOUT_S,
+    )
+
+
+def _git_blob_bytes(repo: Path, spec: str) -> bytes:
+    """Return raw blob bytes from git cat-file blob."""
+    git = _tool("git")
+    res = run_command(
+        [git, "-C", str(repo), "cat-file", "blob", spec],
+        allowed_executables=(git,),
+        check=True,
+        env=_clean_env(),
+        capture_output=True,
+        text=False,
+        timeout_seconds=GIT_TIMEOUT_S,
+    )
+    return res.stdout
+
+
+def _git_stdin(repo: Path, *args: str, data: str) -> str:
+    """Run git in ``repo`` with text stdin and return stripped stdout."""
+    git = _tool("git")
+    res = run_command(
+        [git, "-C", str(repo), *args],
+        allowed_executables=(git,),
+        check=True,
+        env=_clean_env(),
+        input_data=data,
+        capture_output=True,
+        text=True,
+        timeout_seconds=GIT_TIMEOUT_S,
+    )
+    return res.stdout.strip()
+
+
+class HeadRevisionArchiveAttributeTests(_FixtureTree, unittest.TestCase):
+    """Verify head-tree blob extraction ignores archive attributes and fails closed."""
+
+    def test_t1_export_ignore_on_build_config_still_fails(self) -> None:
+        """T1: export-ignore on Dockerfile.ffmpeg cannot hide --enable-libvmaf at HEAD_SHA."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            cfg = tmp / "Dockerfile.ffmpeg"
+            clean_cfg = cfg.read_text(encoding="utf-8")
+            (tmp / ".gitattributes").write_text(
+                "Dockerfile.ffmpeg export-ignore\n", encoding="utf-8"
+            )
+            cfg.write_text(f"{clean_cfg}\nRUN ./configure --enable-libvmaf\n", encoding="utf-8")
+            _git(tmp, "add", ".gitattributes", "Dockerfile.ffmpeg")
+            _git(tmp, "commit", "-q", "-m", "hide broken Dockerfile.ffmpeg via export-ignore")
+            head_sha = _rev_parse(tmp, "HEAD")
+            cfg.write_text(clean_cfg, encoding="utf-8")
+            (tmp / ".gitattributes").unlink()
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("Dockerfile.ffmpeg", res.stderr)
+
+    def test_t2_export_ignore_on_doc_with_retired_filter_fails(self) -> None:
+        """T2: export-ignore on a doc under docs/ cannot hide a retired filter reference."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            faq = tmp / "docs" / "reference" / "faq.md"
+            clean_faq = faq.read_text(encoding="utf-8")
+            (tmp / ".gitattributes").write_text(
+                "docs/reference/faq.md export-ignore\n", encoding="utf-8"
+            )
+            faq.write_text(
+                f"{clean_faq}\nPlanted retired filter: libvmaf_tune.\n", encoding="utf-8"
+            )
+            _git(tmp, "add", ".gitattributes", "docs/reference/faq.md")
+            _git(tmp, "commit", "-q", "-m", "hide retired doc via export-ignore")
+            head_sha = _rev_parse(tmp, "HEAD")
+            faq.write_text(clean_faq, encoding="utf-8")
+            (tmp / ".gitattributes").unlink()
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+            self.assertIn("docs/reference/faq.md", res.stderr)
+
+    def test_t3_export_subst_keeps_blob_bytes_unchanged_and_passes(self) -> None:
+        """T3: export-subst on a doc leaves $Format:%H$ unexpanded and gate passes."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            faq = tmp / "docs" / "reference" / "faq.md"
+            (tmp / ".gitattributes").write_text(
+                "docs/reference/faq.md export-subst\n", encoding="utf-8"
+            )
+            faq.write_text(
+                f"{faq.read_text(encoding='utf-8')}\nCommit format token: $Format:%H$\n",
+                encoding="utf-8",
+            )
+            _git(tmp, "add", ".gitattributes", "docs/reference/faq.md")
+            _git(tmp, "commit", "-q", "-m", "add export-subst placeholder")
+            head_sha = _rev_parse(tmp, "HEAD")
+
+            extracted = Path(td) / "extracted"
+            ext = _run_extractor(
+                "--repo",
+                str(tmp),
+                "--rev",
+                head_sha,
+                "--dest",
+                str(extracted),
+                "--",
+                "docs/reference/faq.md",
+            )
+            self.assertEqual(ext.returncode, 0, ext.stderr)
+            expected = _git_blob_bytes(tmp, f"{head_sha}:docs/reference/faq.md")
+            self.assertIn(b"$Format:%H$", expected)
+            self.assertEqual((extracted / "docs" / "reference" / "faq.md").read_bytes(), expected)
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+
+    def test_t4_entry_bound_exact_passes_and_plus_one_fails(self) -> None:
+        """T4: exact entry bound passes (keeping 100755 executable); bound + 1 fails cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            _git(repo, "init", "-q", "-b", "master")
+            for idx in range(SMALL_ENTRY_BOUND):
+                path = repo / "sub" / f"f{idx}.sh"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"#!/bin/sh\necho {idx}\n", encoding="utf-8")
+            _git(repo, "add", ".")
+            _git(repo, "update-index", "--chmod=+x", "sub/f0.sh")
+            _git(repo, "commit", "-q", "-m", "exact bound")
+            exact_sha = _rev_parse(repo, "HEAD")
+
+            out_ok = Path(td) / "out-ok"
+            ok = _run_extractor(
+                "--repo",
+                str(repo),
+                "--rev",
+                exact_sha,
+                "--dest",
+                str(out_ok),
+                "--max-entries",
+                str(SMALL_ENTRY_BOUND),
+                "--",
+                "sub",
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertEqual(ok.stderr, "")
+            self.assertTrue(os.access(out_ok / "sub" / "f0.sh", os.X_OK))
+
+            (repo / "sub" / "extra.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            _git(repo, "add", "sub/extra.sh")
+            _git(repo, "commit", "-q", "-m", "bound plus one")
+            over_sha = _rev_parse(repo, "HEAD")
+            bad = _run_extractor(
+                "--repo",
+                str(repo),
+                "--rev",
+                over_sha,
+                "--dest",
+                str(Path(td) / "out-over"),
+                "--max-entries",
+                str(SMALL_ENTRY_BOUND),
+                "--",
+                "sub",
+            )
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertEqual(len(bad.stderr.splitlines()), 1, bad.stderr)
+
+    def test_t5_symlink_entry_under_docs_exits_two(self) -> None:
+        """T5: a 120000 symlink entry under docs/ at HEAD_SHA exits 2 with one stderr line."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = self._prepare_temp_worktree(Path(td), origin_master=False)
+            base_sha = _rev_parse(tmp, "HEAD")
+            oid = _git_stdin(tmp, "hash-object", "-w", "--stdin", data="faq.md")
+            _git(tmp, "update-index", "--add", "--cacheinfo", f"120000,{oid},docs/link.md")
+            _git(tmp, "commit", "-q", "-m", "add symlink under docs")
+            head_sha = _rev_parse(tmp, "HEAD")
+
+            res = _run_script(
+                tmp / "scripts" / "ci" / SCRIPT.name,
+                tmp,
+                REPO_ROOT=str(tmp),
+                BASE_SHA=base_sha,
+                HEAD_SHA=head_sha,
+                PR_BODY="",
+            )
+            self.assertEqual(
+                res.returncode, RC_GATE_ERROR, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+            )
+            err_lines = res.stderr.splitlines()
+            self.assertEqual(len(err_lines), 1, f"stderr:\n{res.stderr}")
+            self.assertTrue(err_lines[0].startswith("ffmpeg-patches-surface-check:"))
+            self.assertIn("cannot extract surface inputs at", err_lines[0])
+
+    def test_extractor_rejects_gitlink_bad_paths_batch_errors_and_write_errors(self) -> None:
+        """Helper fails closed on gitlinks, unsafe paths, malformed batch output, and write errors."""
+        oid = "a" * 40
+        for bad_mode in ("120000", "160000"):
+            with self.assertRaises(extract_tree_blobs.ExtractError):
+                extract_tree_blobs._select_regular_blobs({"docs/x.md": (bad_mode, oid)}, 10)
+        for bad_path in ("/abs.md", "docs//x.md", "docs/./x.md", "docs/../x.md", "docs/.git/x"):
+            with self.assertRaises(extract_tree_blobs.ExtractError):
+                extract_tree_blobs._validate_relpath(bad_path)
+        spec = ("docs/x.md", ("docs", "x.md"), "100644", oid)
+        for bad_raw in (
+            f"{oid} missing\n".encode(),
+            f"{oid} tree 2\nhi\n".encode(),
+            f"{oid} blob 5\nhi\n".encode(),
+            b"truncated",
+        ):
+            with self.assertRaises(extract_tree_blobs.ExtractError):
+                extract_tree_blobs._parse_batch_stream(bad_raw, [spec])
+        with tempfile.TemporaryDirectory() as td:
+            file_dest = Path(td) / "not-a-dir"
+            file_dest.write_text("occupied\n", encoding="utf-8")
+            res = _run_extractor(
+                "--repo", str(ROOT), "--rev", "HEAD", "--dest", str(file_dest), "--", "README.md"
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertEqual(len(res.stderr.splitlines()), 1, res.stderr)
 
 
 if __name__ == "__main__":

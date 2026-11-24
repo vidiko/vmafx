@@ -8,7 +8,8 @@ literally without `make` or shell expansion, and `PR` must be a positive
 decimal number. PR mode diffs the PR's base and head revisions, fetching them
 from `origin` when missing, and fails when it cannot. In PR mode, the FFmpeg
 surface gate also runs its tree checks against the PR head tree rather than the
-local checkout. `make pr-check` runs the
+local checkout; the head-tree check reads raw blobs, so archive attributes in
+the PR cannot hide or rewrite inputs. `make pr-check` runs the
 deliverables, `docs/state.md`
 touch and `ffmpeg-patches` surface gates (`scripts/ci/pr-body-gates.sh`),
 while the pre-push hook runs the deliverables parser, catching a malformed

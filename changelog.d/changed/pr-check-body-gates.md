@@ -8,6 +8,7 @@
   empty. `make pr-check PR=<num>` now checks the PR's own base and head
   revisions, fetching missing commits from `origin` and failing if they cannot
   be obtained. In PR mode, the FFmpeg surface gate's tree checks also read the
-  PR head tree rather than the local checkout. `TITLE` and `BODY` are passed to
-  the gates literally without `make` or shell expansion, and `PR` must be a
-  positive decimal number.
+  PR head tree rather than the local checkout, reading raw blobs so archive
+  attributes in the PR cannot hide or rewrite inputs. `TITLE` and `BODY` are
+  passed to the gates literally without `make` or shell expansion, and `PR`
+  must be a positive decimal number.

@@ -9,10 +9,11 @@
 #
 # Mirrors the deliverables-check.sh / ffmpeg-patches-check.sh
 # convention so a contributor can run the same gate locally before
-# `gh pr create`. Section 0's tree checks read the $HEAD_SHA tree when
-# $HEAD_SHA is non-empty (and the checkout otherwise). The pull request
-# gate reads the PR body for an opt-out line, computes the diff from the
-# merge base of BASE_SHA and HEAD_SHA to HEAD_SHA (or merge-base
+# `gh pr create`. Section 0's tree checks read raw regular blobs from
+# the $HEAD_SHA tree when $HEAD_SHA is non-empty (ignoring archive
+# attributes and filters, and reading the checkout otherwise). The pull
+# request gate reads the PR body for an opt-out line, computes the diff
+# from the merge base of BASE_SHA and HEAD_SHA to HEAD_SHA (or merge-base
 # origin/master..HEAD), and intersects the diff against a "consumed set"
 # read from ffmpeg-patches/*.patch at that same diff head revision, not
 # from the checkout.
@@ -44,8 +45,10 @@
 #       surface still fails. Classification lives in
 #       scripts/ci/pr-body-input.sh — see it for why `[ ! -t 0 ]` is
 #       the wrong test.
-#       Section 0's tree checks read the $HEAD_SHA tree when $HEAD_SHA
-#       is non-empty, or the checkout when $HEAD_SHA is unset or empty.
+#       Section 0's tree checks read raw regular blobs from the
+#       $HEAD_SHA tree when $HEAD_SHA is non-empty (without archive
+#       attributes or filters), or the checkout when $HEAD_SHA is unset
+#       or empty.
 #       Diff is computed from the merge base of $BASE_SHA and $HEAD_SHA
 #       up to $HEAD_SHA, or falls back to
 #       $(git merge-base origin/master HEAD)..HEAD; the consumed patch
@@ -96,6 +99,7 @@ nomatch_ok() {
 
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 PATCHES_DIR="${REPO_ROOT}/ffmpeg-patches"
+_ffmpeg_surface_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 FORK_BUILD_CONFIGS=(
   "Containerfile.vmafx"
@@ -381,26 +385,25 @@ prepare_head_surface_tree() {
     echo "ffmpeg-patches-surface-check: cannot resolve HEAD_SHA '${HEAD_SHA}' to a commit." >&2
     exit 2
   fi
-  local surface_tree
-  if ! surface_tree="$(git -C "${checkout_root}" ls-tree --full-tree --name-only "${head_surface_sha}" -- ffmpeg-patches docs README.md "${FORK_BUILD_CONFIGS[@]}" 2>/dev/null)"; then
-    echo "ffmpeg-patches-surface-check: cannot list surface inputs at ${HEAD_SHA}." >&2
-    exit 2
-  fi
   if ! tmp_surface_root="$(mktemp -d 2>/dev/null)"; then
     echo "ffmpeg-patches-surface-check: cannot create temporary directory for ${HEAD_SHA}." >&2
     exit 2
   fi
-  local surface_paths=()
-  local p
-  while IFS= read -r p; do
-    [ -n "$p" ] && surface_paths+=("$p")
-  done <<<"$surface_tree"
-  if [ "${#surface_paths[@]}" -gt 0 ]; then
-    if ! git -C "${checkout_root}" archive --format=tar "${head_surface_sha}" -- "${surface_paths[@]}" 2>/dev/null |
-      tar -x -C "${tmp_surface_root}" 2>/dev/null; then
-      echo "ffmpeg-patches-surface-check: cannot extract surface inputs at ${HEAD_SHA}." >&2
-      exit 2
+  local extract_err extract_rc=0
+  extract_err="$(python3 "${_ffmpeg_surface_dir}/extract_tree_blobs.py" \
+    --repo "${checkout_root}" \
+    --rev "${head_surface_sha}" \
+    --dest "${tmp_surface_root}" \
+    -- ffmpeg-patches docs README.md "${FORK_BUILD_CONFIGS[@]}" 2>&1 >/dev/null)" || extract_rc=$?
+  if [ "$extract_rc" -ne 0 ]; then
+    extract_err="$(printf '%s' "$extract_err" | tr '\r\n' '  ')"
+    extract_err="${extract_err#extract_tree_blobs: }"
+    if [ "$extract_rc" -eq 3 ]; then
+      echo "ffmpeg-patches-surface-check: cannot list surface inputs at ${HEAD_SHA}.${extract_err:+ ${extract_err}}" >&2
+    else
+      echo "ffmpeg-patches-surface-check: cannot extract surface inputs at ${HEAD_SHA}.${extract_err:+ ${extract_err}}" >&2
     fi
+    exit 2
   fi
 }
 
@@ -437,7 +440,6 @@ fi
 # different question from whether anybody piped a body, and `PR_BODY="$(cat)"`
 # on a closed fd 0 does not fail — it deadlocks. See
 # scripts/ci/pr-body-input.sh.
-_ffmpeg_surface_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/ci/pr-body-input.sh
 . "${_ffmpeg_surface_dir}/pr-body-input.sh"
 # shellcheck source=scripts/ci/pr-diff-base.sh
