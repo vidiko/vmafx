@@ -51,15 +51,16 @@ and follows the structure in [0000-template.md](0000-template.md):
   `Superseded by ADR-MMMM`. The status line and References section may be
   edited, keeping the `## References` heading and adding no undated heading;
   dated `## Status update YYYY-MM-DD` or `### Status update YYYY-MM-DD`
-  sections and a supersession note below the status may be added. Markdown link
+  sections may be appended at the end, and a supersession note may be added
+  below the status. Markdown link
   targets may be repaired; link text and titles stay unchanged. Whole-line
   markdownlint directives may be edited anywhere. Headings inside code fences
   are content, not sections. Blank lines may be added or removed anywhere.
   Prose outside code fences may be rewrapped or respaced without changing its
   words, including table spacing. A commit trailer `ADR-Body-Edit: <reason>`
-  of at least 20 characters permits other body edits in the ADRs whose
-  `ADR-NNNN` id the reason names, and only in those; a reason that names no
-  ADR id is refused.
+  of at least 20 characters permits other edits or renames in the ADRs whose
+  base `ADR-NNNN` id the reason names, and only in those; a reason that names
+  no ADR id is refused.
   Carry the trailer into the squash commit body so the reason remains in master
   history.
   `scripts/ci/check-adr-body-freeze.py` enforces this rule.

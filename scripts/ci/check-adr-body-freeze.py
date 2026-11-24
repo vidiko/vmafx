@@ -58,7 +58,10 @@ REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(" + LIN
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MESSAGE = (
     "body of an Accepted, Superseded or Deprecated ADR is frozen (docs/adr/README.md); "
-    'add a dated "### Status update YYYY-MM-DD" section or supersede it with a new ADR'
+    'append a dated "### Status update YYYY-MM-DD" section or supersede it with a new ADR'
+)
+RENAME_MESSAGE = (
+    "Accepted, Superseded or Deprecated ADR cannot be renumbered or moved out of docs/adr/NNNN-*.md"
 )
 
 
@@ -114,14 +117,28 @@ def fenced_lines(lines: list[str]) -> list[bool]:
 
 
 def in_references(lines: list[str], index: int) -> bool:
-    """Return whether a line belongs to a level-two References section."""
+    """Return whether a line lies in References before any peer or dated-update heading."""
     current = False
     for line, fenced in zip(lines[: index + 1], fenced_lines(lines), strict=False):
         if not fenced:
             match = HEADING.match(line)
-            if match and len(match.group(1)) <= SECTION_LEVEL:
+            if match and (len(match.group(1)) <= SECTION_LEVEL or UPDATE.match(line)):
                 current = line.strip() == "## References"
     return current
+
+
+def content_lines(
+    lines: list[str], fenced: list[bool], start: int, end: int
+) -> list[tuple[int, str]]:
+    """Keep fenced lines and unfenced non-directive lines in a slice."""
+    return [
+        (i, lines[i]) for i in range(start, end) if fenced[i] or not DIRECTIVE.fullmatch(lines[i])
+    ]
+
+
+def appended(old: list[str], fenced: list[bool], pos: int) -> bool:
+    """Return whether only blank lines or unfenced directives follow pos."""
+    return not any(line.strip() for _, line in content_lines(old, fenced, pos, len(old)))
 
 
 def allowed_update(lines: list[str], start: int, end: int) -> bool:
@@ -186,11 +203,11 @@ def formatting_only(tag: str, before: list[str], after: list[str], fenced: bool)
     )
 
 
-def references_tail(lines: list[str], start: int, end: int) -> bool:
-    """Accept References content, optionally followed by dated update sections."""
+def references_tail(lines: list[str], start: int, end: int, at_end: bool) -> bool:
+    """Accept References content, optionally followed by appended dated update sections."""
     fenced = fenced_lines(lines)
     heading = next((i for i in range(start, end) if not fenced[i] and HEADING.match(lines[i])), end)
-    return heading == end or allowed_update(lines, heading, end)
+    return heading == end or (at_end and allowed_update(lines, heading, end))
 
 
 def references_edit(old: list[str], start: int, end: int) -> bool:
@@ -209,10 +226,7 @@ def allowed_replace(
     status: int,
     fenced: tuple[list[bool], list[bool]],
 ) -> bool:
-    """Allow status changes with a note, or linewise status and link repairs.
-
-    Exemptions are by position and never apply to fenced lines.
-    """
+    """Allow status changes with a note, or unfenced linewise status and link repairs."""
     if (
         len(before) == 1
         and len(after) > 1
@@ -228,6 +242,15 @@ def allowed_replace(
     )
 
 
+def allowed_insert(
+    old: list[str], new: list[str], a: int, c: int, d: int, status: int, at_end: bool
+) -> bool:
+    """Accept inserted References lines, appended dated updates, or status notes."""
+    if in_references(old, max(0, a - 1)) and references_tail(new, c, d, at_end):
+        return True
+    return (at_end and allowed_update(new, c, d)) or allowed_note(old, a, new[c:d], status)
+
+
 def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]]:
     """Return the location and section of each disallowed diff hunk."""
     failures: list[tuple[int, str]] = []
@@ -235,22 +258,15 @@ def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]
     for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
-        before = [
-            (i, old[i]) for i in range(a, b) if old_fenced[i] or not DIRECTIVE.fullmatch(old[i])
-        ]
-        after = [
-            (j, new[j]) for j in range(c, d) if new_fenced[j] or not DIRECTIVE.fullmatch(new[j])
-        ]
+        before = content_lines(old, old_fenced, a, b)
+        after = content_lines(new, new_fenced, c, d)
         fenced = any(old_fenced[a:b]) or any(new_fenced[c:d])
+        at_end = appended(old, old_fenced, b)
         if formatting_only(tag, [line for _, line in before], [line for _, line in after], fenced):
             continue
-        if tag == "insert" and (
-            (in_references(old, max(0, a - 1)) and references_tail(new, c, d))
-            or allowed_update(new, c, d)
-            or allowed_note(old, a, new[c:d], status)
-        ):
+        if tag == "insert" and allowed_insert(old, new, a, c, d, status, at_end):
             continue
-        if tag != "insert" and references_edit(old, a, b) and references_tail(new, c, d):
+        if tag != "insert" and references_edit(old, a, b) and references_tail(new, c, d, at_end):
             continue
         if tag == "replace" and allowed_replace(
             before, after, old, status, (old_fenced, new_fenced)
@@ -260,8 +276,10 @@ def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]
     return failures
 
 
-def file_problems(base: str, head: str, kind: str, path: str, target: str) -> list[tuple[int, str]]:
-    """Compare one existing ADR with its destination."""
+def file_problems(
+    base: str, head: str, kind: str, path: str, target: str
+) -> list[tuple[int, str, str]]:
+    """Compare one existing ADR and its destination path against freeze rules."""
     old_text = git("show", f"{base}:{path}")
     new_text = "" if kind == "D" else git("show", f"{head}:{target}")
     old = old_text.splitlines()
@@ -272,7 +290,15 @@ def file_problems(base: str, head: str, kind: str, path: str, target: str) -> li
         "deprecated",
     }:
         return []
-    return refused(old, new_text.splitlines(), status)
+    rename = (
+        [(1, path, RENAME_MESSAGE)]
+        if target != path
+        and (not ADR.fullmatch(target) or Path(target).name[:4] != Path(path).name[:4])
+        else []
+    )
+    return rename + [
+        (line, heading, MESSAGE) for line, heading in refused(old, new_text.splitlines(), status)
+    ]
 
 
 class InvalidReason(Exception):
@@ -281,7 +307,9 @@ class InvalidReason(Exception):
 
 def override(base: str, head: str) -> dict[str, tuple[str, str]]:
     """Map each ADR number a trailer in the checked range names to its commit and reason."""
-    output = git("log", "--format=%H%x00%(trailers:key=ADR-Body-Edit)%x00", f"{base}..{head}")
+    output = git(
+        "log", "--format=%H%x00%(trailers:key=ADR-Body-Edit,unfold=true)%x00", f"{base}..{head}"
+    )
     fields = output.split("\0")
     waivers: dict[str, tuple[str, str]] = {}
     for index in range(0, len(fields) - 1, 2):
@@ -305,13 +333,11 @@ def check(base: str, head: str) -> int:
     merge_base = git("merge-base", base, head).strip()
     if not merge_base:
         raise RuntimeError(f"no merge base for {base} and {head}")
-    fields = git("diff", "--name-status", "-z", "-M", merge_base, head, "--", "docs/adr/").split(
-        "\0"
-    )
+    fields = git("diff", "--name-status", "-z", "-M", merge_base, head).split("\0")
     waivers = override(base, head)
     failures: list[tuple[str, str]] = []
     cursor = 0
-    while cursor < len(fields) - 1:
+    while cursor < len(fields) - 1:  # HISS-02 bound: len(fields)
         kind, path = fields[cursor : cursor + 2]
         cursor += 2
         target = path
@@ -320,9 +346,9 @@ def check(base: str, head: str) -> int:
             cursor += 1
         if not ADR.fullmatch(path) or path.endswith("/0000-template.md") or kind == "A":
             continue
-        number = Path(target).name[:4]
-        for line, heading in file_problems(merge_base, head, kind, path, target):
-            failures.append((number, f"{target}:{line}: {heading}: {MESSAGE}"))
+        number = Path(path).name[:4]
+        for line, heading, message in file_problems(merge_base, head, kind, path, target):
+            failures.append((number, f"{target}:{line}: {heading}: {message}"))
     return report(failures, waivers)
 
 
@@ -341,6 +367,7 @@ def report(failures: list[tuple[str, str]], waivers: dict[str, tuple[str, str]])
 
 
 def main() -> int:
+    """Parse CLI arguments and run the ADR body freeze check."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", required=True)

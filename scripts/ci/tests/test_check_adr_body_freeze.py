@@ -629,6 +629,108 @@ class FreezeTests(unittest.TestCase):
     def test_bad_revision(self) -> None:
         self.assertEqual(self.run_check("missing-revision").returncode, 2)
 
+    def test_accepted_flipped_to_proposed_stays_frozen(self) -> None:
+        self.check_change(
+            BASE.replace("Accepted", "Proposed").replace("Old context.", "New context."),
+            1,
+            "## Context",
+        )
+
+    def test_deleted_accepted_adr_is_refused(self) -> None:
+        self.git("rm", "-q", ADR)
+        self.commit()
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/adr/1234-example.md:1:", result.stdout)
+
+    def test_dated_update_must_be_appended(self) -> None:
+        cases = (
+            BASE.replace("## Decision", "## Status update 2026-11-20\nOverride.\n\n## Decision"),
+            BASE.replace(
+                "Old decision.", "### Status update 2026-11-20\nOverride.\n\nOld decision."
+            ),
+            BASE.replace(
+                "[Source](old.md)", "## Status update 2026-11-20\nInserted.\n\n[Source](old.md)"
+            ),
+        )
+        for content in cases:
+            with self.subTest(content=content):
+                self.check_change(content, 1)
+        directive = "<!-- markdownlint-enable MD013 -->\n"
+        self.write(ADR, BASE + "\n" + directive)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(BASE + "\n### Status update 2026-11-20\nAppended.\n\n" + directive, 0)
+
+    def test_references_replace_update_before_trailing_reference_is_refused(self) -> None:
+        original = BASE + "[Second](two.md)\n"
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(
+            original.replace(
+                "[Source](old.md)", "New ref.\n\n## Status update 2026-11-20\nInserted."
+            ),
+            1,
+        )
+
+    def test_committed_status_update_after_references_is_frozen(self) -> None:
+        original = BASE + "\n### Status update 2026-11-01\nFrozen update.\n"
+        self.write(ADR, original)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.check_change(
+            original.replace("Frozen update.", "Changed update."),
+            1,
+            "### Status update 2026-11-01",
+        )
+        self.check_change(original.replace("[Source](old.md)", "Updated references."), 0)
+
+    def test_wrapped_override_trailer(self) -> None:
+        self.write(ADR, BASE.replace("Old consequence.", "New consequence."))
+        self.commit(
+            "edit\n\nADR-Body-Edit: ADR-1234 redact a development host name\n"
+            "  from the accepted record"
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "ADR-1234 redact a development host name from the accepted record", result.stdout
+        )
+
+    def test_renumber_or_move_out_of_adr_dir_is_refused(self) -> None:
+        for target in (
+            "docs/adr/9999-example.md",
+            "docs/adr/archive/1234-example.md",
+            "moved/1234-example.md",
+        ):
+            with self.subTest(target=target):
+                (self.repo / target).parent.mkdir(parents=True, exist_ok=True)
+                self.git("mv", ADR, target)
+                self.commit()
+                result = self.run_check()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(
+                    "cannot be renumbered or moved out of docs/adr/NNNN-*.md", result.stdout
+                )
+                self.git("mv", target, ADR)
+                self.commit()
+
+    def test_renumber_waiver_uses_base_adr_number(self) -> None:
+        target = "docs/adr/9999-example.md"
+        self.git("mv", ADR, target)
+        self.write(target, BASE.replace("Old consequence.", "New consequence."))
+        self.commit("edit\n\nADR-Body-Edit: ADR-9999 redact a development host name")
+        wrong = self.run_check()
+        self.assertEqual(wrong.returncode, 1, wrong.stdout + wrong.stderr)
+        self.git("reset", "-q", "--hard", self.base)
+        self.git("mv", ADR, target)
+        self.write(target, BASE.replace("Old consequence.", "New consequence."))
+        self.commit("edit\n\nADR-Body-Edit: ADR-1234 redact a development host name")
+        waived = self.run_check()
+        self.assertEqual(waived.returncode, 0, waived.stdout + waived.stderr)
+        self.assertIn("ADR-1234: 2 hunk(s) accepted", waived.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
