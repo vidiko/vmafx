@@ -509,16 +509,46 @@ class FreezeTests(unittest.TestCase):
     def test_split_heading(self) -> None:
         self.check_change(BASE.replace("## References", "##\nReferences"), 1)
 
+    fallback_line = "ADR body freeze: PRE_COMMIT_TO_REF unset (not a push); checking HEAD\n"
+
     def test_pushed_revision(self) -> None:
         self.env["PRE_COMMIT_TO_REF"] = self.base
         self.write(ADR, BASE.replace("Old context.", "Changed."))
         self.commit()
         result = self.run_check(head_args=("--head-from-env",))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        del self.env["PRE_COMMIT_TO_REF"]
-        missing = self.run_check(head_args=("--head-from-env",))
-        self.assertEqual(missing.returncode, 2)
-        self.assertIn("PRE_COMMIT_TO_REF", missing.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_fallback_checks_frozen_decision(self) -> None:
+        self.write(ADR, BASE.replace("Old decision.", "Changed decision."))
+        self.commit()
+        for ref in (None, ""):
+            with self.subTest(ref=ref):
+                if ref is None:
+                    self.env.pop("PRE_COMMIT_TO_REF", None)
+                else:
+                    self.env["PRE_COMMIT_TO_REF"] = ref
+                result = self.run_check(head_args=("--head-from-env",))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(
+                    "## Decision: body of an Accepted, Superseded or Deprecated ADR is frozen",
+                    result.stdout,
+                )
+                self.assertEqual(result.stderr, self.fallback_line)
+
+    def test_fallback_checks_clean_head(self) -> None:
+        self.env.pop("PRE_COMMIT_TO_REF", None)
+        result = self.run_check(head_args=("--head-from-env",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, self.fallback_line)
+
+    def test_explicit_head_wins_over_pushed_revision(self) -> None:
+        self.write(ADR, BASE.replace("Old decision.", "Changed decision."))
+        self.commit()
+        self.env["PRE_COMMIT_TO_REF"] = "HEAD"
+        result = self.run_check(head_args=("--head", self.base))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_hook_always_runs(self) -> None:
         with (SCRIPT.parents[2] / ".pre-commit-config.yaml").open("rb") as stream:

@@ -599,13 +599,21 @@ def main() -> int:
     revision = parser.add_mutually_exclusive_group(required=True)
     revision.add_argument("--head")
     revision.add_argument(
-        "--head-from-env", action="store_true", help="check the pushed PRE_COMMIT_TO_REF revision"
+        "--head-from-env",
+        action="store_true",
+        help="check the pushed PRE_COMMIT_TO_REF revision, falling back to HEAD outside a push",
     )
     args = parser.parse_args()
     try:
-        head = os.environ.get("PRE_COMMIT_TO_REF") if args.head_from_env else args.head
-        if not head:
-            parser.error("--head-from-env requires PRE_COMMIT_TO_REF")
+        head = args.head
+        if args.head_from_env:
+            head = os.environ.get("PRE_COMMIT_TO_REF")
+            if not head:
+                head = "HEAD"
+                print(
+                    "ADR body freeze: PRE_COMMIT_TO_REF unset (not a push); checking HEAD",
+                    file=sys.stderr,
+                )
         return check(args.base, head)
     except InvalidReason as exc:
         print(f"ADR body freeze: {exc}", file=sys.stderr)
