@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # Copyright 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Check physical workflow lines that mention apt-install-cached.
-
-Plain configure and install calls pass. Lists naming a driver-recommending package
-require --no-install-recommends. Other forms and missing lists produce findings.
-Workflow bytes, list bytes and accepted install calls have inclusive bounds.
-A variable, concatenation or folded YAML scalar that splits the script name can
-avoid writing apt-install-cached on any one line. Such calls go unseen.
-Anchors and merge keys need no expansion: aliases reuse lines already checked.
+"""Check plain bash scripts/ci/apt-install-cached.sh calls at literal run block indentation.
+Allow configure, refresh, or install .github/apt/<list>.txt [--no-install-recommends].
+Driver-recommending packages require the flag. Only column-zero # starts a list comment.
+Tokens match [a-z0-9][a-z0-9+.-]* with one optional suffix drawn from
+:[a-z0-9]+, =[A-Za-z0-9.+~:-]+ or /[a-z0-9.-]+.
+Caps cover YAML file count, workflow and list bytes, and install calls per workflow.
+Calls that never write apt-install-cached on one line go unseen. Inside a literal block,
+a form in a Bash quoted string, heredoc or continued command passes with the arguments shown.
+A more-indented literal line fails closed.
 """
 
 from __future__ import annotations
@@ -17,8 +18,10 @@ import os
 import re
 import tempfile
 import unittest
+from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 from io import StringIO
+from itertools import chain, islice
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -31,16 +34,21 @@ MAX_LIST_BYTES = 16_384
 # git grep -c 'apt-install-cached.sh install' -- .github/workflows/ counts 8 calls.
 MAX_INSTALL_CALLS = 64
 
+# Measured 55 workflows + 7 composite actions. Allow growth up to twice that total.
+MAX_YAML_FILES = 124
+
 APT_QUALIFIER_RE = re.compile(r"[:=/]")
-COMMAND_PREFIX = r"[ \t]*(?:- run: |run: )?bash scripts/ci/apt-install-cached\.sh "
-CONFIGURE_FORM = re.compile(COMMAND_PREFIX + r"configure *")
+PACKAGE_TOKEN = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+|=[A-Za-z0-9.+~:-]+|/[a-z0-9.-]+)?")
+LITERAL_HEADER = re.compile(r" *(?:- )?(?P<key>run): \|[-+]?[ \t]*")
+COMMAND_PREFIX = r"bash scripts/ci/apt-install-cached\.sh "
+NO_INSTALL_FORM = re.compile(COMMAND_PREFIX + r"(?:configure|refresh)[ \t]*")
 INSTALL_FORM = re.compile(
     COMMAND_PREFIX + r"install (?P<list_path>\.github/apt/[a-z0-9][a-z0-9-]*\.txt)"
-    r"(?P<flag> --no-install-recommends)? *"
+    r"(?P<flag> --no-install-recommends)?[ \t]*"
 )
 UNSUPPORTED_FORM = (
-    "unsupported apt-install-cached.sh form; write it as one plain line "
-    "(see scripts/ci/tests/test_apt_install_recommends.py)"
+    "unsupported apt-install-cached.sh form; write a plain command at literal run block "
+    "indentation (see scripts/ci/tests/test_apt_install_recommends.py)"
 )
 
 
@@ -67,35 +75,61 @@ def _apt_package_base(token: str) -> str:
     return head.removesuffix("+")
 
 
-def read_package_list(path: Path) -> set[str] | str:
-    """Read package names from a bounded apt list file, or return an oversize finding."""
+def read_package_list(path: Path) -> tuple[set[str], list[str]]:
+    """Read a bounded apt list, reporting unsupported tokens at their source lines."""
     text, err = read_bounded_utf8(path, MAX_LIST_BYTES)
     if text is None:
         assert err is not None
-        return err
+        return set(), [err]
     packages: set[str] = set()
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if stripped and not stripped.startswith("#"):
-            packages.update(stripped.split())
-    return packages
+    problems: list[str] = []
+    for lineno, raw in enumerate(StringIO(text), start=1):
+        if raw.startswith("#"):
+            continue
+        for token in raw.split():
+            if not PACKAGE_TOKEN.fullmatch(token):
+                problems.append(f"{path}:{lineno}: invalid package token {token!r}")
+            else:
+                packages.add(token)
+    return packages, problems
 
 
-def _install_problem(
+def _install_problems(
     install: re.Match[str], repo_root: Path, driver_recommending: AbstractSet[str]
-) -> str | None:
+) -> list[str]:
     list_path = install["list_path"]
     try:
-        packages = read_package_list(repo_root / list_path)
+        packages, problems = read_package_list(repo_root / list_path)
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-        return f"missing apt list {list_path}"
-    if isinstance(packages, str):
-        return packages
+        return [f"missing apt list {list_path}"]
     if install["flag"] is None:
         drivers = sorted(pkg for pkg in packages if _apt_package_base(pkg) in driver_recommending)
         if drivers:
-            return f"{list_path} names {', '.join(drivers)} without --no-install-recommends"
-    return None
+            problems.append(
+                f"{list_path} names {', '.join(drivers)} without --no-install-recommends"
+            )
+    return problems
+
+
+def _mentioned_commands(text: str) -> Iterator[tuple[int, str, bool]]:
+    """Yield each mention and whether it starts at a literal run block's body indentation."""
+    header_indent: int | None = None
+    body_indent: int | None = None
+    # The caller bounds the text by MAX_WORKFLOW_BYTES before this pass.
+    for lineno, raw in enumerate(StringIO(text.replace("\r\n", "\n")), start=1):
+        line = raw.removesuffix("\n")
+        if not line.strip(" \t"):
+            continue
+        command = line.lstrip(" ")
+        indent = len(line) - len(command)
+        if header_indent is None or indent <= header_indent:
+            header = LITERAL_HEADER.fullmatch(line)
+            header_indent = header.start("key") if header else None
+            body_indent = None
+        elif body_indent is None:
+            body_indent = indent
+        if "apt-install-cached" in command:
+            yield lineno, command, indent == body_indent
 
 
 def check_workflow_text(
@@ -104,18 +138,16 @@ def check_workflow_text(
     source_name: str = ".github/workflows/tests-and-quality-gates.yml",
     driver_recommending: AbstractSet[str] = DRIVER_RECOMMENDING,
 ) -> list[str]:
-    """Check workflow or shell text one physical line at a time."""
+    """Check apt installer mentions in one bounded workflow or composite action."""
     if len(text.encode("utf-8")) > MAX_WORKFLOW_BYTES:
         return [f"{source_name}: exceeds {MAX_WORKFLOW_BYTES} bytes"]
     findings: list[str] = []
     install_count = 0
-    # Each physical line consumes at least one byte, so at most MAX_WORKFLOW_BYTES lines.
-    for lineno, raw in enumerate(StringIO(text.replace("\r\n", "\n")), start=1):
-        line = raw.removesuffix("\n")
-        if "apt-install-cached" not in line or CONFIGURE_FORM.fullmatch(line):
+    for lineno, command, at_block_indent in _mentioned_commands(text):
+        if at_block_indent and NO_INSTALL_FORM.fullmatch(command):
             continue
         location = f"{source_name}:{lineno}"
-        install = INSTALL_FORM.fullmatch(line)
+        install = INSTALL_FORM.fullmatch(command) if at_block_indent else None
         if install is None:
             findings.append(f"{location}: {UNSUPPORTED_FORM}")
             continue
@@ -123,9 +155,8 @@ def check_workflow_text(
         if install_count > MAX_INSTALL_CALLS:
             findings.append(f"{location}: exceeds {MAX_INSTALL_CALLS} install calls")
             break
-        problem = _install_problem(install, repo_root, driver_recommending)
-        if problem is not None:
-            findings.append(f"{location}: {problem}")
+        problems = _install_problems(install, repo_root, driver_recommending)
+        findings.extend(f"{location}: {problem}" for problem in problems)
     return findings
 
 
@@ -139,11 +170,22 @@ def check_workflow(workflow_path: Path | None = None, repo_root: Path = REPO_ROO
     return check_workflow_text(text, repo_root=repo_root, source_name=str(target))
 
 
+def check_yaml_files(repo_root: Path) -> list[str]:
+    """Check workflow and composite action files in path order, up to the shared limit."""
+    github = repo_root / ".github"
+    paths = chain(github.glob("workflows/*.yml"), github.glob("actions/*/action.yml"))
+    files = sorted(islice(paths, MAX_YAML_FILES + 1))
+    if len(files) > MAX_YAML_FILES:
+        return [f"exceeds {MAX_YAML_FILES} YAML files"]
+    return [finding for path in files for finding in check_workflow(path, repo_root)]
+
+
 class AptInstallRecommendsTest(unittest.TestCase):
     install = "bash scripts/ci/apt-install-cached.sh install"
     list_rel = ".github/apt/cov-12.txt"
     call = f"{install} {list_rel}"
     configure = "bash scripts/ci/apt-install-cached.sh configure"
+    refresh = "bash scripts/ci/apt-install-cached.sh refresh"
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -173,19 +215,79 @@ class AptInstallRecommendsTest(unittest.TestCase):
                     ],
                 )
 
-    def test_flagged_install_and_run_prefixes_pass(self) -> None:
-        for prefix in ("", "  run: ", "  - run: "):
-            with self.subTest(prefix=prefix):
-                self.assertEqual(
-                    self.check(f"{prefix}{self.call} --no-install-recommends  \r\n"), []
-                )
+    def test_accepted_literal_forms(self) -> None:
+        self.list_path.write_text("pkg:arm64 pkg=1:2.3~rc1-4+A pkg/stable-1.0", encoding="utf-8")
+        for header in ("run: |", "run: |-", "run: |+", "- run: |"):
+            for call in (
+                self.call,
+                self.call + " --no-install-recommends",
+                self.configure,
+                self.refresh,
+            ):
+                with self.subTest(header=header, call=call):
+                    self.assertEqual(self.check(f"  {header}\r\n\n      {call} \t\r\n"), [])
 
     def test_list_without_driver_passes_without_flag(self) -> None:
         self.list_path.write_text("# libcudart12\n\nninja-build libcudart12-\n", encoding="utf-8")
-        self.assertEqual(self.check(self.call), [])
+        self.assertEqual(self.check(f"run: |\n  {self.call}"), [])
 
-    def test_configure_passes(self) -> None:
-        self.assertEqual(self.check(f"  - run: {self.configure}"), [])
+    def test_invalid_package_token_reports_both_lines(self) -> None:
+        for entry, token in (
+            ('"libcudart12"', '"libcudart12"'),
+            ("libcudart12\\", "libcudart12\\"),
+            ("$PKG", "$PKG"),
+            ("Libcudart12", "Libcudart12"),
+            ("  # indented comment", "#"),
+            ("pkg:amd64/stable", "pkg:amd64/stable"),
+        ):
+            with self.subTest(entry=entry):
+                self.list_path.write_text(f"# comment\nninja-build\n{entry}\n", encoding="utf-8")
+                self.assertEqual(
+                    self.check(f"run: |\n  {self.call} --no-install-recommends"),
+                    [f"fixture.yml:2: {self.list_path}:3: invalid package token {token!r}"],
+                )
+
+    def test_all_invalid_tokens_reported(self) -> None:
+        self.list_path.write_text("ok BAD\n# ignored\npkg:s390x $PKG", encoding="utf-8")
+        self.assertEqual(
+            self.check(f"run: |\n  {self.call}"),
+            [
+                f"fixture.yml:2: {self.list_path}:1: invalid package token 'BAD'",
+                f"fixture.yml:2: {self.list_path}:3: invalid package token '$PKG'",
+            ],
+        )
+
+    def test_unsupported_context_reports_source_line(self) -> None:
+        for lineno, text in (
+            (1, f"- run: {self.call} --no-install-recommends"),
+            (2, f"steps:\n  run: {self.call} --no-install-recommends\n    --install-recommends"),
+            (2, f"run: >\n  {self.call} --no-install-recommends\n  --install-recommends"),
+            (4, f"- run: |\n    {self.configure}\n  name: next\n    {self.refresh}"),
+            (2, f"- run: |\n  {self.configure}"),
+            (2, f"run: |\n  \t{self.configure}"),
+            (3, f"run: |\n  true\n    {self.configure}"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.check(text), [f"fixture.yml:{lineno}: {UNSUPPORTED_FORM}"])
+
+    def test_adjacent_literal_headers(self) -> None:
+        self.assertEqual(
+            self.check(f"- run: |\n    {self.refresh}\n- run: |-\n    {self.configure}"), []
+        )
+
+    def test_tracked_workflows_and_actions(self) -> None:
+        self.assertEqual(check_yaml_files(REPO_ROOT), [])
+
+    def test_yaml_file_cap(self) -> None:
+        workflows = self.root / ".github/workflows"
+        workflows.mkdir()
+        for index in range(MAX_YAML_FILES):
+            (workflows / f"{index}.yml").touch()
+        self.assertEqual(check_yaml_files(self.root), [])
+        action = self.root / ".github/actions/extra/action.yml"
+        action.parent.mkdir(parents=True)
+        action.touch()
+        self.assertEqual(check_yaml_files(self.root), [f"exceeds {MAX_YAML_FILES} YAML files"])
 
     def test_unsupported_forms_report_source_line(self) -> None:
         for line in (
@@ -210,17 +312,17 @@ class AptInstallRecommendsTest(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertEqual(
-                    self.check(f"steps:\n{line}\n"), [f"fixture.yml:2: {UNSUPPORTED_FORM}"]
+                    self.check(f"run: |\n  {line}\n"), [f"fixture.yml:2: {UNSUPPORTED_FORM}"]
                 )
 
     def test_workflow_byte_cap(self) -> None:
         path = self.root / "workflow.yml"
-        prefix = f"{self.call}\n#é".encode()
+        prefix = f"run: |\n  {self.call}\n#é".encode()
         exact = prefix.ljust(MAX_WORKFLOW_BYTES, b" ")
         path.write_bytes(exact)
         self.assertEqual(
             check_workflow(path, self.root),
-            [f"{path}:1: {self.list_rel} names libcudart12 without --no-install-recommends"],
+            [f"{path}:2: {self.list_rel} names libcudart12 without --no-install-recommends"],
         )
         path.write_bytes(exact + b" ")
         self.assertEqual(
@@ -234,40 +336,41 @@ class AptInstallRecommendsTest(unittest.TestCase):
         exact = b"libcudart12\n#".ljust(MAX_LIST_BYTES, b" ")
         self.list_path.write_bytes(exact)
         self.assertEqual(
-            self.check(self.call),
-            [f"fixture.yml:1: {self.list_rel} names libcudart12 without --no-install-recommends"],
+            self.check(f"run: |\n  {self.call}"),
+            [f"fixture.yml:2: {self.list_rel} names libcudart12 without --no-install-recommends"],
         )
         self.list_path.write_bytes(exact + b" ")
         self.assertEqual(
-            self.check(self.call + " --no-install-recommends"),
-            [f"fixture.yml:1: {self.list_path}: exceeds {MAX_LIST_BYTES} bytes"],
+            self.check(f"run: |\n  {self.call} --no-install-recommends"),
+            [f"fixture.yml:2: {self.list_path}: exceeds {MAX_LIST_BYTES} bytes"],
         )
 
     def test_install_cap_stops_at_first_excess_line(self) -> None:
-        exact = (self.call + " --no-install-recommends\n") * MAX_INSTALL_CALLS
-        self.assertEqual(self.check(exact), [])
-        prefix = f"{self.configure}\n# apt-install-cached\n{self.call}\n"
+        exact = ("  " + self.call + " --no-install-recommends\n") * MAX_INSTALL_CALLS
+        self.assertEqual(self.check("run: |\n" + exact), [])
+        prefix = f"run: |\n  {self.configure}\n  # apt-install-cached\n  {self.call}\n"
         self.assertEqual(
             self.check(prefix + exact + "# apt-install-cached"),
             [
-                f"fixture.yml:2: {UNSUPPORTED_FORM}",
-                f"fixture.yml:3: {self.list_rel} names libcudart12 without --no-install-recommends",
-                f"fixture.yml:{MAX_INSTALL_CALLS + 3}: exceeds {MAX_INSTALL_CALLS} install calls",
+                f"fixture.yml:3: {UNSUPPORTED_FORM}",
+                f"fixture.yml:4: {self.list_rel} names libcudart12 without --no-install-recommends",
+                f"fixture.yml:{MAX_INSTALL_CALLS + 4}: exceeds {MAX_INSTALL_CALLS} install calls",
             ],
         )
 
     def test_missing_list(self) -> None:
         missing = ".github/apt/missing.txt"
         self.assertEqual(
-            self.check(f"{self.install} {missing} --no-install-recommends"),
-            [f"fixture.yml:1: missing apt list {missing}"],
+            self.check(f"run: |\n  {self.install} {missing} --no-install-recommends"),
+            [f"fixture.yml:2: missing apt list {missing}"],
         )
 
     def test_script_name_built_from_variable_goes_unseen(self) -> None:
         # Documented gap: no physical line spells the script name.
         self.assertEqual(
             self.check(
-                'name=apt-install\nbash scripts/ci/"${name}-cached.sh" install ' + self.list_rel
+                'run: |\n  name=apt-install\n  bash scripts/ci/"${name}-cached.sh" install '
+                + self.list_rel
             ),
             [],
         )
