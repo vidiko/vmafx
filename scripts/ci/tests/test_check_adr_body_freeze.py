@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import importlib
 import os
+import runpy
+import shlex
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 run = importlib.import_module("scripts.lib.safe_subprocess").run
@@ -24,6 +27,7 @@ if TYPE_CHECKING:
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check-adr-body-freeze.py"
 ADR = "docs/adr/1234-example.md"
+NOTE = "> [!NOTE]\n> Superseded by [ADR-9999](9999-successor.md)\n"
 BASE = (
     "# ADR-1234: Example\n\n- **Status**: Accepted\n\n## Context\nOld context.\n\n"
     "## Decision\nOld decision.\n\n## Consequences\nOld consequence.\n\n"
@@ -47,6 +51,7 @@ class FreezeTests(unittest.TestCase):
         )
         self.git("init", "-q")
         self.write(ADR, BASE)
+        self.write("docs/adr/9999-successor.md", BASE)
         self.write("docs/adr/0000-template.md", BASE)
         self.commit()
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -92,7 +97,7 @@ class FreezeTests(unittest.TestCase):
             self.assertRegex(result.stdout, r"docs/adr/1234-example\.md:\d+: " + section)
 
     def test_status_line(self) -> None:
-        self.check_change(BASE.replace("Accepted", "Superseded"), 0)
+        self.check_change(BASE.replace("Accepted", "Superseded"), 1)
 
     def test_dated_updates(self) -> None:
         for heading in ("##", "###"):
@@ -101,9 +106,7 @@ class FreezeTests(unittest.TestCase):
 
     def test_supersession_note(self) -> None:
         self.check_change(
-            BASE.replace(
-                "Accepted\n", "Accepted\n\n> [!NOTE]\n> **Superseded by [ADR-9999](x.md)**\n"
-            ),
+            BASE.replace("Accepted\n", "Superseded\n\n" + NOTE),
             0,
         )
 
@@ -114,8 +117,7 @@ class FreezeTests(unittest.TestCase):
         self.check_change(
             BASE.replace(
                 "Accepted\n",
-                "Superseded\n- **Date**: 2026-01-01\n\n"
-                "> [!NOTE]\n> **Superseded by [ADR-9999](x.md)**\n",
+                "Superseded\n- **Date**: 2026-01-01\n\n" + NOTE,
             ),
             0,
         )
@@ -174,11 +176,13 @@ class FreezeTests(unittest.TestCase):
         self.commit()
         self.assertEqual(self.run_check().returncode, 0)
 
-    def run_check(self, base: str | None = None) -> TextCommandResult:
+    def run_check(
+        self, base: str | None = None, head_args: tuple[str, ...] = ("--head", "HEAD")
+    ) -> TextCommandResult:
         return cast(
             "TextCommandResult",
             run(
-                [sys.executable, str(SCRIPT), "--base", base or self.base, "--head", "HEAD"],
+                [sys.executable, str(SCRIPT), "--base", base or self.base, *head_args],
                 allowed_executables=(sys.executable,),
                 cwd=self.repo,
                 env=self.env,
@@ -329,6 +333,7 @@ class FreezeTests(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("at least 20 characters", result.stderr)
+        self.assertIn(self.git("rev-parse", "HEAD").strip(), result.stderr)
 
     def test_override_outside_range(self) -> None:
         self.commit("fixture\n\nADR-Body-Edit: ADR-1234 redact a development host name")
@@ -351,8 +356,175 @@ class FreezeTests(unittest.TestCase):
         self.commit()
         self.assertEqual(self.run_check().returncode, 1)
 
+    def given(self, content: str) -> None:
+        self.write(ADR, content)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+    def test_frozen_at_fork(self) -> None:
+        self.git("checkout", "-qb", "topic")
+        self.write(ADR, BASE.replace("Old decision.", "Changed."))
+        self.commit()
+        self.git("checkout", "-qb", "base-tip", self.base)
+        self.given(BASE.replace("Accepted", "Proposed"))
+        self.git("checkout", "-q", "topic")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("## Decision", result.stdout)
+
+    def test_deprecated_note(self) -> None:
+        note = NOTE + "> Deprecated: The successor replaces this decision.\n"
+        changed = BASE.replace("Accepted\n", "Deprecated\n" + note)
+        self.check_change(changed, 0)
+        self.check_change(changed.replace("decision.", "decision. Extra policy.", 1), 1)
+        self.check_change(changed.replace("> [!NOTE]", "> [!NOTE]\n> Status"), 1)
+
+    def test_multiline_code_link_is_literal(self) -> None:
+        original = BASE.replace("Old context.", "Use ``\n[mode](deny)\n`` here.")
+        self.given(original)
+        self.check_change(original.replace("(deny)", "(allow)"), 1)
+
+    def test_code_in_link_label(self) -> None:
+        original = BASE.replace("Old context.", "See [the `x  y` flag](old(v1).md).")
+        self.given(original)
+        self.check_change(original.replace("old(v1).md", "new.md"), 0)
+        self.check_change(original.replace("x  y", "x y"), 1)
+
+    def test_retained_references_in_order(self) -> None:
+        original = BASE + "[Second](two.md)\n"
+        self.given(original)
+        update = "### Status update 2026-11-23\nUpdate.\n"
+        reordered = original.replace(
+            "[Source](old.md)\n[Second](two.md)", "[Second](changed.md)\n[Source](updated.md)"
+        )
+        self.check_change(reordered + update, 1)
+        self.check_change(original.replace("[Source](old.md)", "[Source](new.md)") + update, 0)
+
+    def test_git_errors_name_operation_and_revision(self) -> None:
+        checker = runpy.run_path(str(SCRIPT))
+        errors = (TimeoutError("command timed out"), RuntimeError("output limit"))
+        for error in errors:
+            with (
+                self.subTest(error=error),
+                mock.patch.dict(checker["git"].__globals__, {"run": mock.Mock(side_effect=error)}),
+                self.assertRaisesRegex(RuntimeError, "git show HEAD:docs/adr/"),
+            ):
+                checker["git"]("show", f"HEAD:{ADR}")
+
+    def test_status_downgrade(self) -> None:
+        self.check_change(BASE.replace("Accepted", "Proposed"), 1)
+        self.assertIn("transition", self.run_check().stdout)
+
+    def test_fenced_preamble_status(self) -> None:
+        original = BASE.replace("- **Status**", "```md\n- **Status**: Proposed\n```\n- **Status**")
+        self.given(original)
+        self.check_change(original.replace("Old decision.", "Changed."), 1)
+
+    def test_accepted_on_base_after_fork(self) -> None:
+        proposed = BASE.replace("Accepted", "Proposed")
+        self.given(proposed)
+        self.git("checkout", "-qb", "topic")
+        self.write(ADR, proposed.replace("Old decision.", "Changed."))
+        self.commit()
+        self.git("checkout", "-qb", "base-tip", self.base)
+        self.given(BASE)
+        self.git("checkout", "-q", "topic")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("## Decision", result.stdout)
+
+    def test_conflicting_adr_names_path(self) -> None:
+        self.git("checkout", "-qb", "topic")
+        self.write(ADR, BASE.replace("[Source](old.md)", "Topic source."))
+        self.commit()
+        self.git("checkout", "-qb", "base-tip", self.base)
+        self.given(BASE.replace("[Source](old.md)", "Base source."))
+        self.git("checkout", "-q", "topic")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(ADR, result.stdout)
+        self.assertIn("conflict", result.stdout)
+
+    def test_indented_and_setext_headings(self) -> None:
+        for heading in ("  ## Decision", "Decision\n-------", "> ## Decision", "> Decision\n> ==="):
+            with self.subTest(heading=heading):
+                self.check_change(BASE + "\n" + heading + "\nChanged.\n", 1)
+
+    def test_references_cannot_swallow_update(self) -> None:
+        update = "### Status update 2026-11-22\nFrozen.\n"
+        self.given(BASE + "\n" + update)
+        self.check_change(BASE + "\n```text\n" + update, 1)
+
+    def test_update_before_repaired_reference(self) -> None:
+        self.check_change(
+            BASE.replace(
+                "[Source](old.md)", "### Status update 2026-11-22\nUpdate.\n\n[Source](fixed.md)"
+            ),
+            1,
+        )
+
+    def test_quoted_fence_spacing(self) -> None:
+        original = BASE.replace("Old context.", "> > ~~~\n> > x  y\n> > ~~~")
+        self.given(original)
+        self.check_change(original.replace("x  y", "x y"), 1)
+
+    def test_fence_closer_ascii_only(self) -> None:
+        original = BASE.replace("Old context.", "````\n````\u00a0\nx  y\n````")
+        self.given(original)
+        self.check_change(original.replace("x  y", "x y"), 1)
+
+    def test_shorter_fence_closer(self) -> None:
+        original = BASE.replace("Old context.", "~~~~\n~~~\nx  y\n~~~~")
+        self.given(original)
+        self.check_change(original.replace("x  y", "x y"), 1)
+
+    def test_fenced_blank_is_content(self) -> None:
+        original = BASE.replace("Old context.", "```\nx\n\ny\n```")
+        self.given(original)
+        self.check_change(original.replace("x\n\ny", "x\ny"), 1)
+
+    def test_note_with_policy(self) -> None:
+        extra = NOTE + "> ## Decision\n> Override policy.\n"
+        self.check_change(BASE.replace("Accepted\n", "Superseded\n" + extra), 1)
+
+    def test_note_requires_successor(self) -> None:
+        note = NOTE.replace("9999-successor.md", "9999-absent.md")
+        self.check_change(BASE.replace("Accepted\n", "Superseded\n" + note), 1)
+
+    def test_inline_code_link_is_literal(self) -> None:
+        original = BASE.replace("Old context.", "Use ``[mode](deny)``.")
+        self.given(original)
+        self.check_change(original.replace("(deny)", "(allow)"), 1)
+
+    def test_balanced_link_destination(self) -> None:
+        original = BASE.replace("Old context.", "See [source](old(v1).md).")
+        self.given(original)
+        self.check_change(original.replace("old(v1).md", "new.md"), 0)
+
+    def test_code_span_spacing(self) -> None:
+        original = BASE.replace("Old context.", "Run `x  y`.")
+        self.given(original)
+        self.check_change(original.replace("x  y", "x y"), 1)
+
+    def test_split_heading(self) -> None:
+        self.check_change(BASE.replace("## References", "##\nReferences"), 1)
+
+    def test_pushed_revision(self) -> None:
+        self.env["PRE_COMMIT_TO_REF"] = self.base
+        self.write(ADR, BASE.replace("Old context.", "Changed."))
+        self.commit()
+        result = self.run_check(head_args=("--head-from-env",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        del self.env["PRE_COMMIT_TO_REF"]
+        missing = self.run_check(head_args=("--head-from-env",))
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("PRE_COMMIT_TO_REF", missing.stderr)
+
     def test_hook_always_runs(self) -> None:
-        config = yaml.safe_load((SCRIPT.parents[2] / ".pre-commit-config.yaml").read_text())
+        with (SCRIPT.parents[2] / ".pre-commit-config.yaml").open("rb") as stream:
+            content = stream.read(256 * 1024)
+        self.assertLess(len(content), 256 * 1024)
+        config = yaml.safe_load(content)
         hook = next(
             h
             for repo in config["repos"]
@@ -361,6 +533,18 @@ class FreezeTests(unittest.TestCase):
         )
         self.assertIs(hook.get("always_run"), True)
         self.assertIs(hook.get("pass_filenames"), False)
+        self.assertEqual(hook.get("stages"), ["pre-push"])
+        self.assertEqual(
+            shlex.split(hook["entry"]),
+            [
+                "python3",
+                "-B",
+                "scripts/ci/check-adr-body-freeze.py",
+                "--base",
+                "origin/master",
+                "--head-from-env",
+            ],
+        )
 
     def test_fenced_references_heading(self) -> None:
         original = BASE.replace("Old context.", "```markdown\n## References\n```\nOld context.")
@@ -413,7 +597,7 @@ class FreezeTests(unittest.TestCase):
         self.check_change(original.replace("[s]: old.md", "[t]: new.md"), 1)
 
     def test_status_with_note_and_context_change(self) -> None:
-        changed = BASE.replace("Accepted\n", "Superseded\n> [!NOTE]\n> Superseded by ADR-9999\n")
+        changed = BASE.replace("Accepted\n", "Superseded\n" + NOTE)
         self.check_change(changed, 0)
         self.check_change(changed.replace("Old context.", "Changed context."), 1)
 
@@ -546,7 +730,7 @@ class FreezeTests(unittest.TestCase):
             1,
             "## Context",
         )
-        self.check_change(original.replace("Accepted", "Superseded", 1), 0)
+        self.check_change(original.replace("Accepted", "Superseded", 1), 1)
 
     def test_fenced_directive_is_content(self) -> None:
         fence = "```markdown\n<!-- markdownlint-disable MD013 -->\n```\n"

@@ -49,16 +49,25 @@ and follows the structure in [0000-template.md](0000-template.md):
 - **Immutable once Accepted**: the body is frozen. To change a decision, write
   a new ADR with `Status: Supersedes ADR-NNNN` and flip the old one to
   `Superseded by ADR-MMMM`. The status line and References section may be
-  edited, keeping the `## References` heading and adding no undated heading;
-  dated `## Status update YYYY-MM-DD` or `### Status update YYYY-MM-DD`
-  sections may be appended at the end, and a supersession note may be added
-  below the status. Markdown link
-  targets may be repaired; link text and titles stay unchanged. Whole-line
-  markdownlint directives may be edited anywhere. Headings inside code fences
-  are content, not sections. Blank lines may be added or removed anywhere.
-  Prose outside code fences may be rewrapped or respaced without changing its
-  words, including table spacing. A commit trailer `ADR-Body-Edit: <reason>`
-  of at least 20 characters permits other edits or renames in the ADRs whose
+  edited under these rules. A frozen status may change to Superseded or
+  Deprecated with a blockquote immediately below the metadata. Use
+  `> [!NOTE]` followed by `> Superseded by [ADR-NNNN](NNNN-title.md)`.
+  The linked successor must exist on the proposed branch. A Deprecated note
+  may also contain one final `> Deprecated: <one sentence>` line.
+  Keep the References heading. Append dated `## Status update YYYY-MM-DD`
+  or `### Status update YYYY-MM-DD` sections after the last reference.
+  When editing references and appending an update together, keep retained
+  entries first, in their original order. Link targets may be repaired
+  while preserving link text and titles. Whole-line markdownlint directives,
+  prose reflow, table spacing and blank lines may change outside code.
+  Code spans and fenced examples preserve literal spacing.
+  The check compares the base tip with the proposed merge and protects ADRs
+  frozen on either the base tip or the common ancestor. The pre-push hook
+  uses `--head-from-env` to check the pushed revision in `PRE_COMMIT_TO_REF`.
+  A missing revision is an error. For a manual check, pass `--base` and
+  `--head` explicitly.
+  A commit trailer `ADR-Body-Edit: <reason>` of at least 20 characters
+  permits other edits or renames in the ADRs whose
   base `ADR-NNNN` id the reason names, and only in those; a reason that names
   no ADR id is refused.
   Carry the trailer into the squash commit body so the reason remains in master

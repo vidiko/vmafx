@@ -8,7 +8,7 @@ new supersession notes directly below the status block, link target repairs,
 whole-line markdownlint directives, and whitespace-only reflow. An ADR-Body-Edit
 trailer of at least 20 characters on a commit in the range overrides refusals only in
 the ADRs whose ADR-NNNN id its reason names; a reason that names no ADR id is refused.
-Compare ADR changes from the merge base of the supplied revisions.
+Compare the base tip with the proposed merge tree.
 """
 
 from __future__ import annotations
@@ -17,16 +17,20 @@ import argparse
 import difflib
 import importlib
 import importlib.util
+import os
 import re
 import shutil
 import sys
+from bisect import bisect_right
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 run = importlib.import_module("scripts.lib.safe_subprocess").run
 GIT = shutil.which("git") or "git"
 SECTION_LEVEL = 2
-NOTE_MIN_LINES = 2
+FROZEN = {"accepted", "superseded", "deprecated"}
 REASON_MIN_LENGTH = 20
 
 spec = importlib.util.spec_from_file_location(
@@ -39,25 +43,27 @@ spec.loader.exec_module(status_module)
 STATUS_RE = status_module.STATUS_RE
 ADR = re.compile(r"^docs/adr/[0-9]{4}-[^/]*\.md$")
 ADR_ID = re.compile(r"\bADR-([0-9]{4})\b")
-HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-UPDATE = re.compile(r"^#{2,3} Status update \d{4}-\d{2}-\d{2}(?:\b|$)")
+# CommonMark 0.31.2 §4.2: ATX marker, ASCII separator and optional closing sequence.
+ATX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*)|$)")
+# CommonMark 0.31.2 §4.3: a setext underline follows a paragraph in its container.
+SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+UPDATE = re.compile(r"^Status update \d{4}-\d{2}-\d{2}(?:\b|$)")
+QUOTE = re.compile(r" {0,3}>[ ]?")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+SUCCESSOR = re.compile(r"> Superseded by \[ADR-([0-9]{4})\]\((\1-[a-z0-9]+(?:-[a-z0-9]+)*\.md)\)")
+DEPRECATION = re.compile(r"> Deprecated: [^.!?\s][^.!?]*[.!?]")
 DIRECTIVE = re.compile(
     r"^<!--\s*markdownlint-"
     r"(?:disable|enable|disable-line|disable-next-line|capture|restore)\b[^>]*-->\s*$"
 )
-# CommonMark allows spaces or tabs between '(' and the destination; they stay in
-# the preserved prefix so only the destination token is normalized.
-# After the destination only an optional title and the closing parenthesis (or the
-# line end of a definition) may follow, so link-like prose stays unnormalized.
-# A title may contain its closing delimiter when backslash-escaped (CommonMark 0.31.2).
 LINK_TITLE = (
     r"""(?:[ \t]+(?:"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|\((?:[^()\\\n]|\\.)*\)))?[ \t]*"""
 )
-LINK = re.compile(r"(\[[^\]\n]*\]\([ \t]*)(?:<[^>\n]*>|[^\s)\n]*)(" + LINK_TITLE + r"\))")
-REFERENCE_LINK = re.compile(r"^( {0,3}\[[^\]\n]+\]:\s*)(?:<[^>\n]*>|\S+)(" + LINK_TITLE + r")$")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+LINK_END = re.compile(LINK_TITLE + r"\)")
+DEFINITION_END = re.compile(LINK_TITLE + r"$")
+DEFINITION = re.compile(r"^ {0,3}\[(?:\\.|[^\]\\])+\]:[ \t]*")
 MESSAGE = (
-    "body of an Accepted, Superseded or Deprecated ADR is frozen (docs/adr/README.md); "
+    "body of an Accepted, Superseded or Deprecated ADR is frozen (docs/adr/_index_fragments/_header.md); "
     'append a dated "### Status update YYYY-MM-DD" section or supersede it with a new ADR'
 )
 RENAME_MESSAGE = (
@@ -65,240 +71,443 @@ RENAME_MESSAGE = (
 )
 
 
-def git(*args: str) -> str:
-    """Run a read-only Git command or report its failure."""
-    result = run(
-        [GIT, *args],
-        allowed_executables=(GIT,),
-        capture_output=True,
-        text=True,
-        timeout_seconds=120,
-        check=False,
-    )
-    if result.returncode:
-        raise RuntimeError(f"git {' '.join(args)}: {result.stderr.strip()}")
+def git(*args: str, accepted: tuple[int, ...] = (0,)) -> str:
+    """Keep the operation and revisions in every bounded Git failure."""
+    operation = "git " + " ".join(args)
+    try:
+        result = run(
+            [GIT, *args],
+            allowed_executables=(GIT,),
+            capture_output=True,
+            text=True,
+            timeout_seconds=120,
+            check=False,
+        )
+    except (TimeoutError, RuntimeError) as exc:
+        raise RuntimeError(f"{operation}: {exc}") from exc
+    if result.returncode not in accepted:
+        raise RuntimeError(f"{operation}: {result.stderr.strip()}")
     return str(result.stdout)
 
 
-def status_index(lines: list[str]) -> int | None:
-    """Find the first recognized status line."""
-    return next((i for i, line in enumerate(lines) if STATUS_RE.match(line)), None)
+@dataclass
+class Line:
+    text: str
+    depth: int
+    kind: str = "prose"
+    level: int = 0
+    title: str = ""
+    references: bool = False
+    literal: list[tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def update(self) -> bool:
+        return self.depth == 0 and self.level in (2, 3) and bool(UPDATE.match(self.title))
+
+    @property
+    def ignored(self) -> bool:
+        return self.kind == "prose" and (
+            not self.text.strip(" \t") or DIRECTIVE.fullmatch(self.text) is not None
+        )
 
 
-def section(lines: list[str], index: int) -> str:
-    """Find the nearest section heading outside code fences at a line or insertion point."""
-    fenced = fenced_lines(lines)
-    return next(
-        (
-            lines[i]
-            for i in range(min(index, len(lines) - 1), -1, -1)
-            if not fenced[i] and HEADING.match(lines[i])
-        ),
-        "(preamble)",
+def container(text: str, limit: int) -> tuple[int, str]:
+    # CommonMark 0.31.2 §5.1: each explicit marker opens one quote container.
+    text = text.expandtabs(4)  # CommonMark 0.31.2 §2.2: block indentation uses tab stops.
+    pos = depth = 0
+    for _ in range(min(limit, len(text))):
+        match = QUOTE.match(text, pos)
+        if not match:
+            break
+        pos = match.end()
+        depth += 1
+    return depth, text[pos:]
+
+
+def fence_line(body: str, fence: str) -> tuple[bool, str]:
+    # CommonMark 0.31.2 §4.5: only ASCII blanks may follow a matching closer.
+    match = FENCE.match(body)
+    if not match:
+        return bool(fence), fence
+    marker, tail = match.groups()
+    if fence:
+        closes = marker.startswith(fence) and not tail.strip(" \t")
+        return True, "" if closes else fence
+    if marker.startswith("`") and "`" in tail:
+        return False, ""
+    return True, marker
+
+
+def mark_heading(line: Line, level: int, title: str) -> None:
+    line.kind = "heading"
+    line.level = level
+    line.title = title
+
+
+def classify(text: str) -> list[Line]:
+    lines: list[Line] = []
+    fence = ""
+    depth = 0
+    paragraph = 0
+    for i, source in enumerate(text.removesuffix("\n").split("\n") if text else []):
+        raw = source.removesuffix("\r")
+        current, body = container(raw, depth if fence else len(raw))
+        if current != depth:
+            paragraph = i
+            if fence:
+                fence = ""
+                current, body = container(raw, len(raw))
+        depth = current
+        line = Line(raw, depth)
+        lines.append(line)
+        code, fence = fence_line(body, fence)
+        heading = ATX.match(body)
+        underline = SETEXT.fullmatch(body)
+        if code:
+            line.kind = "fence"
+        elif heading:
+            title = re.sub(r"(?:^|[ \t]+)#+[ \t]*$", "", heading[2] or "").strip(" \t")
+            mark_heading(line, len(heading[1]), title)
+        elif underline and paragraph < i:
+            level = 1 if underline[1].startswith("=") else 2
+            title = " ".join(container(item.text, depth)[1].strip() for item in lines[paragraph:i])
+            for item in lines[paragraph:]:
+                mark_heading(item, level, title)
+        elif body.strip(" \t") and not line.ignored and not body.startswith(("    ", "\t")):
+            continue
+        paragraph = i + 1
+    annotate(lines)
+    return lines
+
+
+def code_spans(text: str) -> Iterator[tuple[int, int]]:
+    # CommonMark 0.31.2 §6.1: the first equal-length run closes a code span.
+    runs = list(re.finditer(r"`+", text))
+    following: dict[int, int] = {}
+    spans = []
+    for i in reversed(range(len(runs))):
+        length = len(runs[i][0])
+        # A backslash before an opener escapes just the first backtick.
+        skip = int(escaped(text, runs[i].start()))
+        closer = following.get(length - skip)
+        if closer is not None:
+            spans.append((runs[i].start() + skip, runs[closer].end()))
+        following[length] = i
+    end = 0
+    for left, right in reversed(spans):
+        if left >= end:
+            yield left, right
+            end = right
+
+
+def escaped(text: str, pos: int) -> bool:
+    start = pos
+    for i in range(pos - 1, -1, -1):
+        if text[i] != "\\":
+            break
+        start = i
+    return (pos - start) % 2 == 1
+
+
+def mark_spans(lines: list[Line]) -> None:
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line.text) + 1)
+    for left, right in code_spans("\n".join(line.text for line in lines)):
+        first = bisect_right(starts, left) - 1
+        last = bisect_right(starts, right - 1) - 1
+        for i in range(first, last + 1):
+            line = lines[i]
+            line.literal.append((max(0, left - starts[i]), min(len(line.text), right - starts[i])))
+
+
+def annotate(lines: list[Line]) -> None:
+    references = False
+    paragraph = 0
+    for i, line in enumerate(lines):
+        if line.level and not line.depth and (line.level <= SECTION_LEVEL or line.update):
+            references = line.level == SECTION_LEVEL and line.title == "References"
+        line.references = references
+        boundary = line.kind != "prose" or line.ignored
+        if boundary or (i and lines[i - 1].depth != line.depth):
+            mark_spans(lines[paragraph:i])
+            if line.kind == "heading":
+                mark_spans([line])
+            paragraph = i + int(boundary)
+    mark_spans(lines[paragraph:])
+
+
+def metadata(lines: list[Line]) -> tuple[int, str]:
+    for i, line in enumerate(lines):
+        if line.level == SECTION_LEVEL and not line.depth:
+            break
+        match = STATUS_RE.match(line.text) if line.kind == "prose" and not line.depth else None
+        if match:
+            return i, match[1].lower()
+    return -1, ""
+
+
+def destination_end(text: str, start: int) -> int | None:
+    # CommonMark 0.31.2 §6.3: bracketed or balanced unbracketed destinations.
+    angle = text.startswith("<", start)
+    depth = 0
+    for token in re.finditer(r"\\[!-/:-@\[-`{-~]|.", text[start + int(angle) :]):
+        char = token[0]
+        pos = start + int(angle) + token.start()
+        if angle:
+            if char == ">":
+                return pos + 1
+            if char == "<":
+                return None
+        elif char in " \t" or char[0] < " " or (char == ")" and not depth):
+            return None if depth else pos
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+    return None if angle or depth else len(text)
+
+
+@dataclass(frozen=True)
+class Link:
+    start: int
+    end: int
+    target: int
+    target_end: int
+
+
+def parsed_link(text: str, start: int, target: int, suffix: re.Pattern[str]) -> Link | None:
+    target_end = destination_end(text, target)
+    if target_end is None:
+        return None
+    match = suffix.match(text, target_end)
+    return Link(start, match.end(), target, target_end) if match else None
+
+
+def links(line: Line) -> Iterator[Link]:
+    text = line.text
+    # Mask code spans in the bracket scan, including code inside a link label.
+    masked = list(text)
+    for a, b in line.literal:
+        masked[a:b] = "x" * (b - a)
+    syntax = "".join(masked)
+    # §4.7: preserve the existing single-line link reference definition repair.
+    definition = DEFINITION.match(text)
+    if definition and DEFINITION.match(syntax):
+        link = parsed_link(text, 0, definition.end(), DEFINITION_END)
+        if link and link.target < link.target_end:
+            yield link
+            return
+    stack: list[int] = []
+    consumed = 0
+    for match in re.finditer(r"\[|\](?:\([ \t]*)?", syntax):
+        if match.start() < consumed or escaped(text, match.start()):
+            continue
+        if match[0] == "[":
+            stack.append(match.start())
+        elif stack:
+            start = stack.pop()
+            if match[0] != "]":
+                link = parsed_link(text, start, match.end(), LINK_END)
+                if link:
+                    yield link
+                    consumed = link.end
+                    stack.clear()
+
+
+def repair_key(line: Line) -> tuple[str, ...]:
+    """Remove only parsed destinations. Keep all literal text, titles and delimiters."""
+    parts = []
+    start = 0
+    for link in links(line):
+        parts.append(line.text[start : link.target])
+        start = link.target_end
+    return (*parts, line.text[start:])
+
+
+def words(lines: list[Line]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for line in lines:
+        pos = 0
+        protected = sorted([*line.literal, *((link.start, link.end) for link in links(line))])
+        for a, b in [*protected, (len(line.text), len(line.text))]:
+            if a < pos:
+                continue
+            part = line.text[pos:a]
+            if line.text.strip().startswith("|"):
+                part = re.sub(r"\s*\|\s*", "|", part)
+                if re.fullmatch(r"[|:-]+", part):
+                    part = re.sub(r"-+", "-", part)
+            result.extend(("word", word) for word in part.split())
+            if b > a:
+                result.append(("literal", line.text[a:b]))
+            pos = b
+    return result
+
+
+def formatting(before: list[Line], after: list[Line]) -> bool:
+    if all(line.kind == "prose" for line in before + after) and words(before) == words(after):
+        return True
+    return len(before) == len(after) and all(
+        a.kind == b.kind
+        and a.kind != "fence"
+        and a.level == b.level
+        and repair_key(a) == repair_key(b)
+        for a, b in zip(before, after, strict=True)
     )
 
 
-def fenced_lines(lines: list[str]) -> list[bool]:
-    """Mark fence delimiters and lines inside fenced blocks."""
-    fence = ""
-    fenced = []
-    for line in lines:
-        marker = FENCE.match(line)
-        if marker and not fence and marker.group(1)[0] == "`" and "`" in marker.group(2):
-            marker = None
-        fenced.append(bool(fence) or marker is not None)
-        if marker:
-            token, tail = marker.groups()
-            if not fence:
-                fence = token
-            elif token[0] == fence[0] and len(token) >= len(fence) and not tail.strip():
-                fence = ""
-    return fenced
+def note_range(lines: list[Line], status: int, state: str, head: str) -> range:
+    """Check the entire new blockquote immediately after the metadata."""
+    for start in range(status + 1, len(lines)):
+        text = lines[start].text
+        if text.strip() and not re.match(r"^- \*\*[^*]+\*\*:", text):
+            break
+    else:
+        return range(0)
+    if text != "> [!NOTE]" or start + 1 >= len(lines):
+        return range(0)
+    successor = SUCCESSOR.fullmatch(lines[start + 1].text)
+    if not successor:
+        return range(0)
+    end = start + 2
+    if state == "deprecated" and end < len(lines) and DEPRECATION.fullmatch(lines[end].text):
+        end += 1
+    # §5.1: an unquoted paragraph continuation can still belong to the quote.
+    if end < len(lines) and (
+        lines[end].depth or (lines[end].text.strip() and lines[end].kind == "prose")
+    ):
+        return range(0)
+    path = "docs/adr/" + successor[2]
+    entry = git("ls-tree", head, "--", path)
+    if not entry.startswith(("100644 blob ", "100755 blob ")):
+        return range(0)
+    return range(start, end)
 
 
-def in_references(lines: list[str], index: int) -> bool:
-    """Return whether a line lies in References before any peer or dated-update heading."""
-    current = False
-    for line, fenced in zip(lines[: index + 1], fenced_lines(lines), strict=False):
-        if not fenced:
-            match = HEADING.match(line)
-            if match and (len(match.group(1)) <= SECTION_LEVEL or UPDATE.match(line)):
-                current = line.strip() == "## References"
-    return current
-
-
-def content_lines(
-    lines: list[str], fenced: list[bool], start: int, end: int
-) -> list[tuple[int, str]]:
-    """Keep fenced lines and unfenced non-directive lines in a slice."""
-    return [
-        (i, lines[i]) for i in range(start, end) if fenced[i] or not DIRECTIVE.fullmatch(lines[i])
-    ]
-
-
-def appended(old: list[str], fenced: list[bool], pos: int) -> bool:
-    """Return whether only blank lines or unfenced directives follow pos."""
-    return not any(line.strip() for _, line in content_lines(old, fenced, pos, len(old)))
-
-
-def allowed_update(lines: list[str], start: int, end: int) -> bool:
-    """Accept inserted dated sections, including their subordinate content."""
+def updates(lines: list[Line]) -> bool:
     level = 0
-    fenced = fenced_lines(lines)
-    for index in range(start, end):
-        line = lines[index]
-        match = None if fenced[index] else HEADING.match(line)
-        if match and UPDATE.match(line):
-            heading_level = len(match.group(1))
-            if not level or heading_level <= level:
-                level = heading_level
-        elif match and level and len(match.group(1)) <= level:
-            level = 0
-        if not level and line.strip():
+    for line in lines:
+        if line.update and (not level or line.level <= level):
+            level = line.level
+        elif not level or (line.level and line.level <= level):
             return False
     return bool(level)
 
 
-def allowed_note(old: list[str], pos: int, added: list[str], status: int) -> bool:
-    """Accept a newly inserted note immediately after the status block."""
-    if pos <= status or any(
-        line.strip() and not re.match(r"^- \*\*[^*]+\*\*:", line) for line in old[status + 1 : pos]
-    ):
+def reference(line: Line) -> bool:
+    return line.references and not line.level
+
+
+def retained_prefix(old: list[Line], new: list[Line], update: int) -> bool:
+    """Retained entries precede the appended update, in their original order."""
+    entries = [repair_key(line) for line in old if reference(line) and not line.ignored]
+    identities = set(entries)
+    tail = [repair_key(line) for line in new[update:] if not line.ignored]
+    if any(key in identities for key in tail):
         return False
-    content = [line for line in added if line.strip()]
-    return (
-        len(content) >= NOTE_MIN_LINES
-        and content[0].strip() == "> [!NOTE]"
-        and re.match(r"^>\s*(?:\*\*)?(?:Superseded by|Status)\b", content[1]) is not None
-        and all(line.startswith(">") for line in content)
-    )
+    prefix = [repair_key(line) for line in new[:update] if reference(line) and not line.ignored]
+    kept = [key for key in prefix if key in identities]
+    candidates = iter(entries)
+    return kept == prefix[: len(kept)] and all(key in candidates for key in kept)
 
 
-def link_repair(before: str, after: str) -> bool:
-    """Permit only changes to Markdown link destinations."""
-
-    def normalize(line: str) -> str:
-        return REFERENCE_LINK.sub(r"\1DEST\2", LINK.sub(r"\1DEST\2", line))
-
-    return before != after and normalize(before) == normalize(after)
-
-
-def normalized_words(lines: list[str]) -> list[str]:
-    """Normalize table spacing before comparing words."""
-    normalized = []
-    for original in lines:
-        line = original
-        if line.strip().startswith("|"):
-            line = re.sub(r"\s*\|\s*", "|", line.strip())
-            if re.fullmatch(r"[|:-]+", line):
-                line = re.sub(r"-+", "-", line)
-        normalized.append(line)
-    return " ".join(normalized).split()
-
-
-def formatting_only(tag: str, before: list[str], after: list[str], fenced: bool) -> bool:
-    """Accept blank-only hunks and word-preserving prose replacements outside fences."""
-    return all(not line.strip() for line in before + after) or (
-        tag == "replace" and not fenced and normalized_words(before) == normalized_words(after)
-    )
-
-
-def references_tail(lines: list[str], start: int, end: int, at_end: bool) -> bool:
-    """Accept References content, optionally followed by appended dated update sections."""
-    fenced = fenced_lines(lines)
-    heading = next((i for i in range(start, end) if not fenced[i] and HEADING.match(lines[i])), end)
-    return heading == end or (at_end and allowed_update(lines, heading, end))
-
-
-def references_edit(old: list[str], start: int, end: int) -> bool:
-    """Return whether a changed range lies inside References and keeps its heading."""
-    fenced = fenced_lines(old)
-    return all(
-        in_references(old, i) and (fenced[i] or old[i].strip() != "## References")
-        for i in range(start, end)
-    )
-
-
-def allowed_replace(
-    before: list[tuple[int, str]],
-    after: list[tuple[int, str]],
-    old: list[str],
-    status: int,
-    fenced: tuple[list[bool], list[bool]],
-) -> bool:
-    """Allow status changes with a note, or unfenced linewise status and link repairs."""
-    if (
-        len(before) == 1
-        and len(after) > 1
-        and before[0][0] == status
-        and STATUS_RE.match(after[0][1])
-        and allowed_note(old, status + 1, [line for _, line in after[1:]], status)
-    ):
+def permitted(old: list[Line], new: list[Line], a: int, b: int, c: int, d: int) -> bool:
+    before = [line for line in old[a:b] if not line.ignored]
+    after = [line for line in new[c:d] if not line.ignored]
+    if formatting(before, after):
         return True
-    return len(before) == len(after) and all(
-        (i == status and STATUS_RE.match(new_line))
-        or (not fenced[0][i] and not fenced[1][j] and link_repair(old_line, new_line))
-        for (i, old_line), (j, new_line) in zip(before, after, strict=True)
+    ref_edit = (
+        all(reference(line) for line in before) if before else bool(a and old[a - 1].references)
+    )
+    if ref_edit and all(reference(line) for line in after):
+        return True
+    if (before and not ref_edit) or any(not line.ignored for line in old[b:]):
+        return False
+    update = next((i for i in range(c, d) if new[i].update), d)
+    prefix = [line for line in new[c:update] if not line.ignored]
+    return (not prefix or (ref_edit and all(reference(line) for line in prefix))) and (
+        updates([line for line in new[update:d] if not line.ignored])
+        and retained_prefix(old, new, update)
     )
 
 
-def allowed_insert(
-    old: list[str], new: list[str], a: int, c: int, d: int, status: int, at_end: bool
-) -> bool:
-    """Accept inserted References lines, appended dated updates, or status notes."""
-    if in_references(old, max(0, a - 1)) and references_tail(new, c, d, at_end):
-        return True
-    return (at_end and allowed_update(new, c, d)) or allowed_note(old, a, new[c:d], status)
+def classification(line: Line) -> tuple[object, ...]:
+    return line.kind, line.depth, line.level, line.references and not line.ignored, line.literal
 
 
-def refused(old: list[str], new: list[str], status: int) -> list[tuple[int, str]]:
-    """Return the location and section of each disallowed diff hunk."""
-    failures: list[tuple[int, str]] = []
-    old_fenced, new_fenced = fenced_lines(old), fenced_lines(new)
-    for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+def refused(old: list[Line], new: list[Line]) -> Iterator[tuple[int, str, str]]:
+    diff = difflib.SequenceMatcher(
+        None, [x.text for x in old], [x.text for x in new], autojunk=False
+    )
+    for tag, a, b, c, d in diff.get_opcodes():
         if tag == "equal":
+            if all(
+                classification(x) == classification(y)
+                for x, y in zip(old[a:b], new[c:d], strict=True)
+            ):
+                continue
+        elif permitted(old, new, a, b, c, d):
             continue
-        before = content_lines(old, old_fenced, a, b)
-        after = content_lines(new, new_fenced, c, d)
-        fenced = any(old_fenced[a:b]) or any(new_fenced[c:d])
-        at_end = appended(old, old_fenced, b)
-        if formatting_only(tag, [line for _, line in before], [line for _, line in after], fenced):
-            continue
-        if tag == "insert" and allowed_insert(old, new, a, c, d, status, at_end):
-            continue
-        if tag != "insert" and references_edit(old, a, b) and references_tail(new, c, d, at_end):
-            continue
-        if tag == "replace" and allowed_replace(
-            before, after, old, status, (old_fenced, new_fenced)
-        ):
-            continue
-        failures.append((max(1, c + 1), section(old, a)))
-    return failures
+        heading = next(
+            (line.text for line in reversed(old[: a + 1]) if line.level and not line.depth),
+            "(preamble)",
+        )
+        yield c + 1, heading, MESSAGE
+
+
+def body_problems(old: list[Line], new: list[Line], head: str) -> Iterator[tuple[int, str, str]]:
+    a, previous = metadata(old)
+    b, current = metadata(new)
+    note = note_range(new, b, current, head) if b >= 0 else range(0)
+    if previous != current:
+        if current not in {"superseded", "deprecated"} or not note:
+            transition = f"{previous} -> {current or '(missing)'}"
+            message = f"refused status transition {transition}; supersession note required"
+            yield max(1, b + 1), "Status", message
+        elif a >= 0:
+            new[b] = old[a]
+    if note:
+        # Compare the note in place if it already belonged to the frozen record.
+        old_note = note_range(old, a, previous, head)
+        if not old_note:
+            new = new[: note.start] + new[note.stop :]
+    yield from refused(old, new)
+
+
+def changes(base: str, tree: str) -> Iterator[tuple[str, str, str]]:
+    fields = git("diff", "--name-status", "-z", "-M", base, tree).split("\0")
+    cursor = 0
+    while cursor < len(fields) - 1:
+        kind, path = fields[cursor : cursor + 2]
+        cursor += 2
+        target = path
+        if kind.startswith(("R", "C")):
+            target = fields[cursor]
+            cursor += 1
+        yield kind, path, target
+
+
+def frozen_at(tree: str, path: str) -> bool:
+    if not git("ls-tree", tree, "--", path):
+        return False
+    return metadata(classify(git("show", f"{tree}:{path}")))[1] in FROZEN
 
 
 def file_problems(
-    base: str, head: str, kind: str, path: str, target: str
-) -> list[tuple[int, str, str]]:
-    """Compare one existing ADR and its destination path against freeze rules."""
-    old_text = git("show", f"{base}:{path}")
-    new_text = "" if kind == "D" else git("show", f"{head}:{target}")
-    old = old_text.splitlines()
-    status = status_index(old)
-    if status is None or STATUS_RE.match(old[status]).group(1).lower() not in {
-        "accepted",
-        "superseded",
-        "deprecated",
-    }:
-        return []
-    rename = (
-        [(1, path, RENAME_MESSAGE)]
-        if target != path
-        and (not ADR.fullmatch(target) or Path(target).name[:4] != Path(path).name[:4])
-        else []
-    )
-    return rename + [
-        (line, heading, MESSAGE) for line, heading in refused(old, new_text.splitlines(), status)
-    ]
+    base: str, head: str, tree: str, fork: str, ancestor: str, kind: str, path: str, target: str
+) -> Iterator[tuple[int, str, str]]:
+    old = classify(git("show", f"{base}:{path}"))
+    if metadata(old)[1] not in FROZEN and not frozen_at(fork, ancestor):
+        return
+    if target != path and (
+        not ADR.fullmatch(target) or Path(target).name[:4] != Path(path).name[:4]
+    ):
+        yield 1, path, RENAME_MESSAGE
+    if kind == "D":
+        yield 1, path, MESSAGE
+        return
+    yield from body_problems(old, classify(git("show", f"{tree}:{target}")), head)
 
 
 class InvalidReason(Exception):
@@ -317,10 +526,14 @@ def override(base: str, head: str) -> dict[str, tuple[str, str]]:
         for trailer in trailers.splitlines():
             reason = trailer.partition(":")[2].strip()
             if len(reason) < REASON_MIN_LENGTH:
-                raise InvalidReason("ADR-Body-Edit reason must contain at least 20 characters")
+                raise InvalidReason(
+                    f"{sha}: ADR-Body-Edit reason must contain at least 20 characters"
+                )
             numbers = ADR_ID.findall(reason)
             if not numbers:
-                raise InvalidReason("ADR-Body-Edit reason must name each waived ADR as ADR-NNNN")
+                raise InvalidReason(
+                    f"{sha}: ADR-Body-Edit reason must name each waived ADR as ADR-NNNN"
+                )
             for number in numbers:
                 waivers.setdefault(number, (sha[:10], reason))
     return waivers
@@ -333,21 +546,34 @@ def check(base: str, head: str) -> int:
     merge_base = git("merge-base", base, head).strip()
     if not merge_base:
         raise RuntimeError(f"no merge base for {base} and {head}")
-    fields = git("diff", "--name-status", "-z", "-M", merge_base, head).split("\0")
+    merged = git(
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "--no-messages",
+        "-z",
+        base,
+        head,
+        accepted=(0, 1),
+    ).split("\0")
+    tree = merged[0]
+    conflicts = [path for path in merged[1:] if ADR.fullmatch(path)]
+    if conflicts:
+        for path in conflicts:
+            print(f"{path}: merge conflict between {base} and {head}")
+        return 1
+    ancestors = {
+        target: path for kind, path, target in changes(merge_base, base) if kind.startswith("R")
+    }
     waivers = override(base, head)
     failures: list[tuple[str, str]] = []
-    cursor = 0
-    while cursor < len(fields) - 1:  # HISS-02 bound: len(fields)
-        kind, path = fields[cursor : cursor + 2]
-        cursor += 2
-        target = path
-        if kind.startswith(("R", "C")):
-            target = fields[cursor]
-            cursor += 1
+    for kind, path, target in changes(base, tree):
         if not ADR.fullmatch(path) or path.endswith("/0000-template.md") or kind == "A":
             continue
         number = Path(path).name[:4]
-        for line, heading, message in file_problems(merge_base, head, kind, path, target):
+        for line, heading, message in file_problems(
+            base, head, tree, merge_base, ancestors.get(path, path), kind, path, target
+        ):
             failures.append((number, f"{target}:{line}: {heading}: {message}"))
     return report(failures, waivers)
 
@@ -370,10 +596,17 @@ def main() -> int:
     """Parse CLI arguments and run the ADR body freeze check."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
-    parser.add_argument("--head", required=True)
+    revision = parser.add_mutually_exclusive_group(required=True)
+    revision.add_argument("--head")
+    revision.add_argument(
+        "--head-from-env", action="store_true", help="check the pushed PRE_COMMIT_TO_REF revision"
+    )
     args = parser.parse_args()
     try:
-        return check(args.base, args.head)
+        head = os.environ.get("PRE_COMMIT_TO_REF") if args.head_from_env else args.head
+        if not head:
+            parser.error("--head-from-env requires PRE_COMMIT_TO_REF")
+        return check(args.base, head)
     except InvalidReason as exc:
         print(f"ADR body freeze: {exc}", file=sys.stderr)
         return 1
