@@ -34,6 +34,26 @@ DIMENSIONS = (
     "matchDepTypes",
     "matchCurrentValue",
 )
+# Pin independently of packageRules so deletion or disabling cannot erase the expectation.
+REQUIRED_HOLD_RULES = {
+    "CI Node.js",
+    "Cargo deps (major)",
+    "GitHub Actions (major)",
+    "Go deps (major)",
+    "Intel NEO compute stack (matched set)",
+    "Python (minor)",
+    "ROCm (hip runtime)",
+    "Renovate self-hosted action",
+    "Rust toolchain",
+    "dev-image pinned deps",
+    "numpy (all managers)",
+    "CUDA_VERSION resolves from NVIDIA's official redist HTML index, which exposes versions "
+    "but no release timestamps. Keep the global three-day age policy for timestamped "
+    "dependencies, but permit this manually reviewed source to update instead of leaving "
+    "every CUDA release pending forever.",
+    "Propose seven-day-old Ubuntu archive dates weekly; image rebuild and manual review "
+    "required (ADR-3541).",
+}
 Rule = dict[str, Any]
 
 
@@ -42,6 +62,8 @@ def values(value: str | list[str]) -> list[str]:
     return [value] if isinstance(value, str) else value
 
 
+# https://docs.renovatebot.com/configuration-options/#packagerulesmatchpackagenames
+# https://docs.renovatebot.com/string-pattern-matching/ (regex flags and case-insensitive globs)
 def regex(value: str) -> re.Pattern[str] | None:
     """Compile Renovate's slash-delimited regex, including its optional i flag."""
     if not value.startswith("/"):
@@ -81,9 +103,13 @@ def pair_overlap(left: str, right: str) -> bool:
     for pattern, value in ((left, right), (right, left)):
         expression = regex(pattern)
         if concrete(value) and expression is not None:
-            return (
-                re.search(expression.pattern, value, expression.flags | re.IGNORECASE) is not None
-            )
+            if expression.search(value):
+                return True
+            if expression.flags & re.IGNORECASE or value.lower() == value.upper():
+                return False
+            # A literal anchored prefix rules out every spelling with a different prefix.
+            prefix = re.fullmatch(r"\^([A-Za-z0-9]+)", expression.pattern)
+            return prefix is None or value.casefold().startswith(prefix[1].casefold())
     return True
 
 
@@ -92,31 +118,48 @@ def may_overlap(a: list[str], b: list[str]) -> bool:
     return any(pair_overlap(left, right) for left in a for right in b)
 
 
+def dimension_overlap(key: str, a: list[str], b: list[str]) -> bool:
+    # https://docs.renovatebot.com/configuration-options/#packagerulesmatchdeptypes
+    # https://docs.renovatebot.com/configuration-options/#packagerulesmatchfilenames
+    # An update may carry multiple dep types or involve both a manifest and a lock file.
+    if key in ("matchFileNames", "matchDepTypes"):
+        return True
+    # https://docs.renovatebot.com/configuration-options/#packagerulesmatchupdatetypes
+    # A bump can match both "bump" and its ordinary update type.
+    if key == "matchUpdateTypes" and (may_overlap(a, ["bump"]) or may_overlap(b, ["bump"])):
+        return True
+    return may_overlap(a, b)
+
+
 def co_match(r1: Rule, r2: Rule) -> bool:
-    """Rules co-match unless a shared dimension besides matchFileNames proves them disjoint."""
+    """A single disjoint dimension suffices to rule out a shared update."""
     return all(
-        may_overlap(values(r1[key]), values(r2[key]))
+        dimension_overlap(key, values(r1[key]), values(r2[key]))
         for key in DIMENSIONS
-        if key != "matchFileNames" and key in r1 and key in r2
+        if key in r1 and key in r2
     )
 
 
-def covers(k: Rule, r: Rule) -> bool:
-    """Prove k covers r across DIMENSIONS with no other match or exclude keys on k."""
-    if any(key.startswith(("match", "exclude")) and key not in DIMENSIONS for key in k):
-        return False
-    for key in DIMENSIONS:
-        if key not in k:
-            continue
-        if key not in r:
+def unsupported_selectors(rule: Rule) -> list[str]:
+    return [key for key in rule if key.startswith(("match", "exclude")) and key not in DIMENSIONS]
+
+
+def dimension_covers(patterns: list[str], reviewed: list[str]) -> bool:
+    for value in reviewed:
+        if not concrete(value) or not any(matches(p, value) for p in patterns):
             return False
-        patterns = values(k[key])
-        for value in values(r[key]):
-            if not concrete(value) or not any(matches(p, value) for p in patterns):
-                return False
-            if any(pair_overlap(p[1:], value) for p in patterns if p.startswith("!")):
-                return False
+        if any(pair_overlap(p[1:], value) for p in patterns if p.startswith("!")):
+            return False
     return True
+
+
+def covers(k: Rule, r: Rule) -> bool:
+    """Prove every selector on k covers the reviewed rule r."""
+    return not unsupported_selectors(k) and all(
+        key in r and dimension_covers(values(k[key]), values(r[key]))
+        for key in DIMENSIONS
+        if key in k
+    )
 
 
 def settled(rules: list[Rule], j: int, reviewed: Rule) -> bool:
@@ -145,23 +188,57 @@ def name(rule: Rule, index: int) -> str:
     return str(rule.get("groupName", rule.get("description", index)))
 
 
-def findings(config: dict[str, Any]) -> list[str]:
-    """Reject missing review holds, holds outside review rules, and leaking holds."""
-    errors = []
+def rule_findings(rules: list[Rule], i: int) -> list[str]:
+    rule = rules[i]
+    label = name(rule, i)
+    reviewed = rule.get("automerge") is False
+    errors: list[str] = []
+    if "automerge" in rule:
+        errors.extend(
+            f"unsupported selector {key} on {label}" for key in unsupported_selectors(rule)
+        )
+    # https://docs.renovatebot.com/configuration-options/#labels replaces earlier labels.
+    # https://docs.renovatebot.com/configuration-options/#addlabels accumulates across rules.
+    added = HOLD in rule.get("addLabels", [])
+    held = added or HOLD in rule.get("labels", [])
+    if held and not reviewed:
+        errors.append(f"hold outside a reviewed rule: {label}")
+    if rule.get("enabled") is False:
+        return errors
+    leaking = leaks(rules, i)
+    if reviewed and not leaking and not added:
+        errors.append(f"reviewed rule {label} lacks addLabels hold")
+    if held and leaking:
+        errors.append(f"hold on {label} reaches an automerged update")
+    return errors
+
+
+def policy_findings(config: Rule) -> list[str]:
+    errors = [
+        f"hold in top-level {key}" for key in ("labels", "addLabels") if HOLD in config.get(key, [])
+    ]
     rules = config["packageRules"]
-    for i, rule in enumerate(rules):
-        if rule.get("enabled") is False:
-            continue
-        held = HOLD in rule.get("addLabels", [])
-        reviewed = rule.get("automerge") is False
-        leaking = leaks(rules, i)
-        label = name(rule, i)
-        if reviewed and not leaking and not held:
-            errors.append(f"reviewed rule {label} lacks addLabels hold")
-        if held and not reviewed:
-            errors.append(f"hold outside a reviewed rule: {label}")
-        if held and leaking:
-            errors.append(f"hold on {label} reaches an automerged update")
+    for i in range(len(rules)):
+        errors.extend(rule_findings(rules, i))
+    return errors
+
+
+def findings(config: Rule) -> list[str]:
+    """Check label policy and the repository's inventory of reviewed rules carrying hold."""
+    held = {
+        name(rule, i)
+        for i, rule in enumerate(config["packageRules"])
+        if rule.get("enabled") is not False
+        and rule.get("automerge") is False
+        and HOLD in rule.get("addLabels", [])
+    }
+    errors = policy_findings(config)
+    errors.extend(
+        f"missing reviewed hold rule: {label}" for label in sorted(REQUIRED_HOLD_RULES - held)
+    )
+    errors.extend(
+        f"unexpected reviewed hold rule: {label}" for label in sorted(held - REQUIRED_HOLD_RULES)
+    )
     return errors
 
 
@@ -224,13 +301,59 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             "hold outside a reviewed rule: GitHub Actions (minor + patch)", findings(config)
         )
 
+    def test_regex_negated_range_overlaps_literal(self) -> None:
+        for left, right in (("/^foo[^A-Z]$/", "foob"), ("foob", "/^foo[^A-Z]$/")):
+            with self.subTest(left=left):
+                self.assertTrue(pair_overlap(left, right))
+
+    def test_unknown_selectors_name_the_rule_and_key(self) -> None:
+        for label, key in (
+            ("CI Node.js", "matchNewValue"),
+            ("GitHub Actions (minor + patch)", "excludePackageNames"),
+        ):
+            with self.subTest(label=label, key=key):
+                config = copy.deepcopy(self.config)
+                rule = next(r for r in config["packageRules"] if r.get("groupName") == label)
+                rule[key] = "/^99[.]/" if key == "matchNewValue" else ["foo"]
+                self.assertIn(f"unsupported selector {key} on {label}", findings(config))
+
+    def test_top_level_hold_fails(self) -> None:
+        for key in ("labels", "addLabels"):
+            with self.subTest(key=key):
+                config = {**self.config, key: [HOLD]}
+                self.assertIn(f"hold in top-level {key}", findings(config))
+
+    def test_automerge_labels_hold_fails(self) -> None:
+        config = copy.deepcopy(self.config)
+        label = "GitHub Actions (minor + patch)"
+        rule = next(r for r in config["packageRules"] if r.get("groupName") == label)
+        rule["labels"] = [HOLD]
+        self.assertIn(f"hold outside a reviewed rule: {label}", findings(config))
+
+    def test_bump_overlaps_version_update_types(self) -> None:
+        bump = {"matchUpdateTypes": ["bump"]}
+        for version in ("major", "minor", "patch"):
+            with self.subTest(version=version):
+                update = {"matchUpdateTypes": [version]}
+                self.assertTrue(co_match(bump, update))
+                self.assertTrue(co_match(update, bump))
+
+    def test_distinct_dep_types_can_co_match(self) -> None:
+        self.assertTrue(co_match({"matchDepTypes": ["dependencies"]}, {"matchDepTypes": ["dev"]}))
+
+    def test_missing_reviewed_rule_fails(self) -> None:
+        config = copy.deepcopy(self.config)
+        label = "Renovate self-hosted action"
+        config["packageRules"] = [r for r in config["packageRules"] if r.get("groupName") != label]
+        self.assertIn(f"missing reviewed hold rule: {label}", findings(config))
+
     def test_review_after_automerge_wins(self) -> None:
         rules = [
             {"matchPackageNames": ["foo"], "automerge": True},
             {"matchPackageNames": ["foo"], "automerge": False, "addLabels": [HOLD]},
         ]
         self.assertFalse(leaks(rules, 1))
-        self.assertEqual(findings({"packageRules": rules}), [])
+        self.assertEqual(policy_findings({"packageRules": rules}), [])
 
     def test_later_reviewed_superset_settles_overlap(self) -> None:
         rules = [
@@ -239,7 +362,7 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             {"matchPackageNames": ["foo", "bar"], "automerge": False, "addLabels": [HOLD]},
         ]
         self.assertFalse(leaks(rules, 0))
-        self.assertEqual(findings({"packageRules": rules}), [])
+        self.assertEqual(policy_findings({"packageRules": rules}), [])
 
     def test_disjoint_update_types(self) -> None:
         self.assertFalse(co_match({"matchUpdateTypes": ["major"]}, {"matchUpdateTypes": ["minor"]}))
@@ -248,6 +371,7 @@ class ReviewedRulesCarryHold(unittest.TestCase):
         for pattern, value, expected in (
             ("/^foo/", "foobar", True),
             ("/^foo/", "barfoo", False),
+            ("/^foo/i", "barfoo", False),
             ("/^foo/i", "FOObar", True),
             ("/(?<prefix>foo)/", "foobar", True),
         ):
@@ -278,7 +402,8 @@ class ReviewedRulesCarryHold(unittest.TestCase):
                 ]
                 self.assertTrue(pair_overlap(pattern, value))
                 self.assertIn(
-                    "hold on 0 reaches an automerged update", findings({"packageRules": rules})
+                    "hold on 0 reaches an automerged update",
+                    policy_findings({"packageRules": rules}),
                 )
 
     def test_case_insensitive_exact_overlap_and_coverage(self) -> None:
@@ -288,7 +413,9 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             {"matchPackageNames": ["numpy"], "automerge": False, "addLabels": [HOLD]},
             {"matchPackageNames": ["NumPy"], "automerge": True},
         ]
-        self.assertIn("hold on 0 reaches an automerged update", findings({"packageRules": rules}))
+        self.assertIn(
+            "hold on 0 reaches an automerged update", policy_findings({"packageRules": rules})
+        )
         self.assertFalse(covers({"matchPackageNames": ["/^numpy$/"]}, rules[0]))
         self.assertTrue(covers({"matchPackageNames": ["/^numpy$/i"]}, rules[0]))
         self.assertTrue(covers({"matchPackageNames": ["NumPy"]}, rules[0]))
@@ -299,7 +426,9 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             {"matchManagers": ["custom.regex"], "automerge": True},
             {"matchPackageNames": ["foo", "bar", "!foo"], "automerge": False, "addLabels": [HOLD]},
         ]
-        self.assertIn("hold on 0 reaches an automerged update", findings({"packageRules": rules}))
+        self.assertIn(
+            "hold on 0 reaches an automerged update", policy_findings({"packageRules": rules})
+        )
         rules[2]["matchPackageNames"] = ["foo", "bar", "!baz"]
         self.assertFalse(leaks(rules, 0))
 
@@ -318,12 +447,12 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             {"matchPackageNames": ["foo"], "automerge": False, "addLabels": [HOLD]},
             {"matchPackageNames": ["foo"], "automerge": True, "enabled": False},
         ]
-        self.assertEqual(findings({"packageRules": rules}), [])
+        self.assertEqual(policy_findings({"packageRules": rules}), [])
         rules[1].pop("enabled")
         rules.append({"matchPackageNames": ["foo"], "automerge": False, "enabled": False})
         self.assertTrue(leaks(rules, 0))
         self.assertEqual(
-            findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
+            policy_findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
         )
 
     def test_disjoint_file_names_still_co_match(self) -> None:
@@ -332,7 +461,7 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             {"matchFileNames": ["package-lock.json"], "automerge": True},
         ]
         self.assertEqual(
-            findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
+            policy_findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
         )
         self.assertTrue(co_match(rules[0], rules[1]))
         self.assertTrue(covers({"matchFileNames": ["package.json"]}, rules[0]))
@@ -350,7 +479,8 @@ class ReviewedRulesCarryHold(unittest.TestCase):
             },
         ]
         self.assertEqual(
-            findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
+            policy_findings({"packageRules": rules}),
+            ["hold on 0 reaches an automerged update", "unsupported selector matchNewValue on 2"],
         )
         self.assertFalse(
             covers({"matchPackageNames": ["foo"], "excludePackageNames": ["bar"]}, rules[0])

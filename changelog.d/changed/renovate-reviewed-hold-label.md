@@ -1,1 +1,4 @@
-- Add the `hold` label to Renovate's reviewed package rules, except the catch-all rule that overlaps automerged updates, and add a regression test for missing, misplaced, or leaking hold labels.
+- Reviewed Renovate updates now carry `hold`. The catch-all rule omits the label
+  so automerged updates can land. Regression tests detect missing reviewed rules,
+  missing or misplaced holds, holds that can reach automerged updates, and
+  unsupported selectors on review or automerge rules.

@@ -239,12 +239,14 @@ packaged chart archives are tracked in git.
 
 Reviewed package rules (`automerge: false`) in
 [`renovate.json`](../../renovate.json) add the exact label `hold` through
-`addLabels` in the same rule object. The merge train can land dependency pull
-requests past their minimum release age unless they carry `hold`. Add the
-label once by hand to an already open reviewed pull request: Renovate applies
-labels when it creates or updates a pull request, so changing the configuration
-alone does not immediately protect existing pull requests. See Renovate's
-[label behavior](https://docs.renovatebot.com/configuration-options/#labels).
+`addLabels` in the same rule object. Renovate measures
+[`minimumReleaseAge`](https://docs.renovatebot.com/configuration-options/#minimumreleaseage)
+from the publication of the package version. Once that wait is over, the merge
+train can land the dependency pull request unless it carries `hold`.
+
+Add `hold` by hand to an already open reviewed pull request if the label is
+missing. Renovate applies labels when it creates or updates a pull request.
+See Renovate's [label behavior](https://docs.renovatebot.com/configuration-options/#labels).
 
 Rule 0, `Other dependencies (minor + patch)`, is the exception. It also matches
 updates that later rules automerge, including GitHub Actions minor and patch
@@ -254,11 +256,11 @@ override `automerge`, while
 Putting `hold` on that catch-all would therefore block those automerged updates.
 
 [`test_renovate_review_hold.py`](../../scripts/ci/tests/test_renovate_review_hold.py)
-checks rule overlap and later review coverage. It refuses reviewed rules
-without their own `addLabels: ["hold"]`, holds outside reviewed rules (including
-separate label-only rules), and holds that can reach a later automerged update.
-Only reviewed rules whose hold would leak are exempt from the required label;
-the checked-in configuration must have exactly the rule 0 exception.
+checks that every named review group or ungrouped review rule is present and
+carries its own `addLabels: ["hold"]`. It checks both `labels` and `addLabels`
+for misplaced holds and flags a hold that can reach an automerged update.
+When a review or automerge rule introduces a selector the test cannot model,
+the diagnostic names the rule and selector. Only the catch-all rule is exempt.
 
 The numpy rule names its PyPI managers and datasource so the hold test can prove
 it disjoint from the Go, Cargo and Docker automerge rules.
