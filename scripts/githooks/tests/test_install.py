@@ -554,6 +554,9 @@ STATE_SYNC_PRAETORCTL = (
 
 BRIDGE_STUB = """#!/bin/sh
 printf '%s|%s|%s\\n' "$0" "$*" "$(command -v reuse || echo none)" >> "$BRIDGE_LOG"
+if [ -n "${BRIDGE_ARGV_LOG:-}" ]; then
+    printf '%s\\0' "$#" "$@" >> "$BRIDGE_ARGV_LOG"
+fi
 if [ "$1" = hook-impl ]; then cat >> "$BRIDGE_LOG"; fi
 """
 
@@ -608,10 +611,16 @@ class LefthookBridgeTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.repo = Path(temporary.name)
         self.log = self.repo / "bridge.log"
+        self.argv_log = self.repo / "bridge.argv"
         self.bash = shutil.which("bash") or "/bin/bash"
         self.git = shutil.which("git") or "/usr/bin/git"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        self.env["BRIDGE_LOG"] = str(self.log)
+        self.env.update(
+            BRIDGE_LOG=str(self.log),
+            BRIDGE_ARGV_LOG=str(self.argv_log),
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+        )
         run_command(
             (self.git, "init", "--quiet"),
             allowed_executables=(self.git,),
@@ -650,6 +659,32 @@ class LefthookBridgeTests(unittest.TestCase):
 
     def calls(self) -> list[str]:
         return self.log.read_text(encoding="utf-8").splitlines()
+
+    def argv_calls(self) -> list[list[str]]:
+        # Each call starts with argc so even an empty argument keeps its position.
+        fields = iter(self.argv_log.read_bytes().decode("utf-8").removesuffix("\0").split("\0"))
+        return [[next(fields) for _ in range(int(argc))] for argc in fields]
+
+    def test_hook_dir_follows_core_hooks_path(self) -> None:
+        self.stub(".venv/bin/pre-commit")
+        for hooks_path in ("custom-hooks", (self.repo / "absolute-hooks").as_posix()):
+            with self.subTest(hooks_path=hooks_path):
+                self.log.unlink(missing_ok=True)
+                self.argv_log.unlink(missing_ok=True)
+                run_command(
+                    (self.git, "config", "--local", "core.hooksPath", hooks_path),
+                    allowed_executables=(self.git,),
+                    cwd=self.repo,
+                    env=self.env,
+                    check=True,
+                    timeout_seconds=60,
+                )
+                for args in (("commit-msg", "message"), ("pre-push", "origin", "url")):
+                    result = self.bridge(*args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [args for args in self.argv_calls() if args[0] == "hook-impl"]
+                hook_dirs = [args[args.index("--hook-dir") + 1] for args in calls]
+                self.assertEqual(hook_dirs, [hooks_path, hooks_path])
 
     def test_repository_virtualenv_layouts_win_and_activate_their_tools(self) -> None:
         for layout in (".venv/bin/pre-commit", ".venv/Scripts/pre-commit.exe"):
@@ -707,19 +742,26 @@ class LefthookBridgeTests(unittest.TestCase):
 
     def test_commit_msg_forwards_message_file(self) -> None:
         self.stub(".venv/bin/pre-commit")
-        message = self.repo / ".git/COMMIT_EDITMSG"
+        message = self.repo / "msg dir" / "COMMIT EDITMSG"
+        message.parent.mkdir()
         message.write_text("fix: subject\n", encoding="utf-8")
         result = self.bridge("commit-msg", str(message))
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls()
-        self.assertEqual(calls[0].split("|")[1], "install-hooks")
-        arguments = calls[1].split("|")[1]
         self.assertEqual(
-            arguments,
-            "hook-impl --config=.pre-commit-config.yaml --hook-type=commit-msg "
-            f"--hook-dir .git/hooks -- {message}",
+            self.argv_calls(),
+            [
+                ["install-hooks"],
+                [
+                    "hook-impl",
+                    "--config=.pre-commit-config.yaml",
+                    "--hook-type=commit-msg",
+                    "--hook-dir",
+                    ".git/hooks",
+                    "--",
+                    str(message),
+                ],
+            ],
         )
-        self.assertTrue(arguments.endswith(f" -- {message}"))
 
     def test_commit_msg_requires_message_file_argument(self) -> None:
         self.stub(".venv/bin/pre-commit")
@@ -733,16 +775,26 @@ class LefthookBridgeTests(unittest.TestCase):
     def test_pre_push_forwards_remote_arguments_and_push_refs(self) -> None:
         self.stub(".venv/bin/pre-commit")
         refs = "refs/heads/topic 1111 refs/heads/topic 0000\n"
-        result = self.bridge("pre-push", "origin", "https://example.invalid/x.git", stdin=refs)
+        url = "https://example.invalid/x.git"
+        result = self.bridge("pre-push", "origin", url, stdin=refs)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls()
-        self.assertEqual(calls[0].split("|")[1], "install-hooks")
-        self.assertIn(
-            "hook-impl --config=.pre-commit-config.yaml --hook-type=pre-push "
-            "--hook-dir .git/hooks -- origin https://example.invalid/x.git",
-            calls[1],
+        self.assertEqual(
+            self.argv_calls(),
+            [
+                ["install-hooks"],
+                [
+                    "hook-impl",
+                    "--config=.pre-commit-config.yaml",
+                    "--hook-type=pre-push",
+                    "--hook-dir",
+                    ".git/hooks",
+                    "--",
+                    "origin",
+                    url,
+                ],
+            ],
         )
-        self.assertEqual(calls[2] + "\n", refs)
+        self.assertEqual(self.calls()[2] + "\n", refs)
 
     def test_path_fallback_missing_framework_and_unknown_stage(self) -> None:
         tools = self.repo / "tools"

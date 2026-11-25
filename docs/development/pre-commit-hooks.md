@@ -22,7 +22,8 @@ therefore cannot break hooks in the surviving checkout.
 ## Lefthook and the governance hooks
 
 [`lefthook.yml`](../../lefthook.yml) owns `pre-commit`, `commit-msg`,
-`post-commit` and `pre-push` ([ADR-1249](../adr/1249-praetor-governance-adoption.md)).
+`post-commit` and `pre-push` ([ADR-1249](../adr/1249-praetor-governance-adoption.md)
+and its [`commit-msg` status update](../adr/1249-praetor-governance-adoption.md#status-update-2026-11-25-lefthook-owns-commit-msg)).
 Its `pre-commit`, `commit-msg` and `pre-push` jobs run the corresponding
 pre-commit framework stage through `scripts/git-hooks/framework-hooks.sh`, next
 to the praetor governance checks on `pre-commit` and `pre-push`
