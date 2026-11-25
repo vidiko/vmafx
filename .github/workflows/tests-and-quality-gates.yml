@@ -604,7 +604,10 @@ jobs:
     # required-aggregator
     name: Tooling Tests
     runs-on: ubuntu-26.04
-    timeout-minutes: 35
+    # Merge-group runs on 2026-11-24/25 peaked at 33.9 min among successes.
+    # Run 45506634835 was cancelled at 35.3 min. The 45 min limit is 1.33 x 33.9 min.
+    # Pytest still limits each test to 300 s.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
