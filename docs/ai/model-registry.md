@@ -62,7 +62,7 @@ schema rejects unknown properties (`additionalProperties: false`).
 | `quant_accuracy_budget_plcc` | no | Maximum PLCC drop versus fp32; the CI `ai-quant-accuracy` job fails a quantised model beyond it. Default 0.01. |
 | `license` | schema version 1 | SPDX identifier. Fork-trained models use `BSD-2-Clause-Patent`, matching libvmaf. Upstream-derived models keep the upstream license verbatim (LPIPS-Sq is `BSD-2-Clause`). |
 | `license_url` | no | URL of the license text. |
-| `sigstore_bundle` | no | Path relative to `model/tiny/`, ending in `.sigstore.json`. |
+| `sigstore_bundle` | no | The ONNX file name plus `.sigstore.json`, with no directory component. The bundle lives beside the registry. |
 | `description` | no | One-line summary, distinct from `notes`. |
 | `notes` | no | Free-text provenance and training recipe, at most 512 characters. |
 | `release_url` | no | HTTPS URL of a release attachment holding the ONNX bytes, for a model not tracked in git; `scripts/ai/fetch-tiny-blobs.sh` downloads it and checks `sha256`. No shipped entry sets it, see [tiny-blob-storage.md](tiny-blob-storage.md). |
@@ -122,7 +122,9 @@ The loader runs these steps:
 
 1. Look up the model's basename in `model/tiny/registry.json` (alongside the
    `.onnx` by default).
-2. Read the entry's `sigstore_bundle` path.
+2. Append `.sigstore.json` to the caller's ONNX file name. Require
+   `sigstore_bundle` to match that name exactly (`-EINVAL` on mismatch),
+   then resolve the derived name inside the registry directory.
 3. Require the v0.3 Sigstore bundle format and check its one signing
    certificate: the identity must be the supply-chain workflow on a release
    tag (or `master`) and the owner ID

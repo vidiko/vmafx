@@ -1,4 +1,6 @@
-- **`--tiny-model-verify` accepts only the vidiko signer, by owner ID.** The
+- **`--tiny-model-verify` accepts only the vidiko signer, by owner ID.** A
+  `sigstore_bundle` other than `<onnx file name>.sigstore.json` is now refused
+  with `-EINVAL`. The
   identity expression libvmaf passed to `cosign verify-blob`
   (`https://github.com/VMAFx/vmafx/.github/workflows/.+`) was not anchored:
   cosign searches the identity for it, so an identity with text before or

@@ -787,7 +787,8 @@ repo or in CI secrets.
 
 The OIDC identity is the workflow path inside the repo. The release blobs
 and MCP wheel come from `supply-chain.yml`; the container images come from
-`docker-publish-production.yml`.
+`docker-publish-production.yml`. For the private bundle copy, use a base
+directory you own whose path other users cannot rename or write to.
 
 ```bash
 # The release tag to verify. v1.0.0-rc.1 and v1.0.0-rc.2 use the
@@ -796,7 +797,7 @@ tag=v0.1.0
 
 # Release blob. Every vmaf/libvmaf.so*/libvmafx.so* asset has a matching
 # FILE.bundle. Copy it once into a private directory from mktemp -d.
-work=$(mktemp -d)
+work=$(mktemp -d "${XDG_RUNTIME_DIR:-$HOME}/vmafx-verify.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 cp vmaf.bundle "$work/vmaf.bundle"
 cosign verify-blob --bundle "$work/vmaf.bundle" vmaf \
@@ -869,8 +870,11 @@ gh attestation verify vmaf --repo vidiko/vmafx \
   | jq -e 'length > 0 and all(.[]; .verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier == "340303765")'
 ```
 
-A release published before the move to `vidiko` (v1.0.0-rc.3 or earlier)
-carries `288567244`.
+For release blobs from v1.0.0-rc.3 or earlier, the certificate names the
+original organisation instead of `vidiko`. In `--certificate-identity`, `--repo`
+and `--signer-workflow`, replace `vidiko` with the organisation name in the
+[recorded rc.3 certificate](../research/2985-signer-owner-id-binding.md#findings),
+and use `288567244` in both the attestation and blob certificate owner checks.
 
 This checks the attestation certificate, not the separate cosign blob signature.
 For a cosign bundle (`<artifact>.bundle`), read the owner ID from the bundle's

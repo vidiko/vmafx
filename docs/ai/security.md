@@ -139,14 +139,16 @@ Release artifacts, including models under `model/tiny/`, are signed by
 [`.github/workflows/supply-chain.yml`](../../.github/workflows/supply-chain.yml)
 with Sigstore's keyless flow. The workflow produces a single Sigstore bundle per
 artifact (signature, certificate and Rekor entry in one file), not the legacy
-split `.sig` and `.pem` pair. The registry names a model's bundle
-`<name>.onnx.sigstore.json`, see [model-registry.md](model-registry.md).
+split `.sig` and `.pem` pair. The registry's `sigstore_bundle` must equal the
+ONNX file name plus `.sigstore.json`, including case and without a directory
+component. See [model-registry.md](model-registry.md).
 
 To verify a model by hand before loading it, copy the bundle once into a
-private directory from `mktemp -d`:
+private directory. Use a base directory you own whose path other users cannot
+rename or write to.
 
 ```bash
-work=$(mktemp -d)
+work=$(mktemp -d "${XDG_RUNTIME_DIR:-$HOME}/vmafx-verify.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 cp model/tiny/vmaf_tiny_v2.onnx.sigstore.json "$work/bundle.json"
 cosign verify-blob \
@@ -198,9 +200,9 @@ The `--tiny-model-verify` flag does all of this at load time
 - It is off by default for dev-friendliness and strongly recommended in
   production.
 - It drives `vmaf_dnn_verify_signature()` in
-  [`core/include/libvmaf/dnn.h`](../../core/include/libvmaf/dnn.h), which looks
-  up the model's `sigstore_bundle` field in
-  [`model/tiny/registry.json`](../../model/tiny/registry.json).
+  [`core/include/libvmaf/dnn.h`](../../core/include/libvmaf/dnn.h), which derives
+  the bundle path from the caller's ONNX file name and the registry directory.
+  A different `sigstore_bundle` value returns `-EINVAL` before cosign runs.
 
 ## Reporting
 

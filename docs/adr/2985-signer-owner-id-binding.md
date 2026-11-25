@@ -88,6 +88,11 @@ escape their dots; exact identity options use literal matching. The release
 guide shows an owner-ID check for the separate GitHub provenance attestation.
 Other cosign recipes still rely on the workflow identity alone.
 
+**2026-11-25 clarification.** The verifier derives the bundle name by appending
+`.sigstore.json` to the basename of the caller's ONNX path. It requires the
+registry's `sigstore_bundle` to equal that name byte for byte (`-EINVAL` on
+mismatch), then resolves the derived name within the registry directory.
+
 ## Alternatives considered
 
 | Option | Pros | Cons | Why not chosen |

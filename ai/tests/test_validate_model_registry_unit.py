@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO_ROOT / "ai" / "scripts" / "validate_model_registry.py"
 
 
-def _load_module():
+def _load_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("vmr_under_test", _SCRIPT)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -337,24 +338,27 @@ def test_consistency_check_flags_duplicate_ids(tmp_path: Path) -> None:
     assert any("duplicate model id" in e for e in errs)
 
 
-def test_consistency_check_sigstore_bundle_path_shape(tmp_path: Path) -> None:
-    blob = b"payload"
-    onnx = tmp_path / "x.onnx"
-    onnx.write_bytes(blob)
-    (tmp_path / "x.json").write_text("{}")
-    reg = {
-        "models": [
-            {
-                "id": "x",
-                "kind": "fr",
-                "onnx": "x.onnx",
-                "sha256": _hash_bytes(blob),
-                "sigstore_bundle": "x.bundle.txt",
-            }
+def test_consistency_check_rejects_wrong_bundle_name(tmp_path: Path) -> None:
+    row = _stage_graph(tmp_path, "vmaf_tiny_v2.onnx", "x", None)
+    for value in (
+        "other.onnx.sigstore.json",
+        "sub/x.onnx.sigstore.json",
+        "../x.onnx.sigstore.json",
+        "X.onnx.sigstore.json",
+        "x.sigstore.json",
+    ):
+        row["sigstore_bundle"] = value
+        assert _graph_errors(tmp_path, row) == [
+            f"x: sigstore_bundle {value!r} must equal 'x.onnx.sigstore.json'"
         ]
-    }
-    errs = VMR._consistency_check(reg, tmp_path)
-    assert any("sigstore_bundle must end with .sigstore.json" in e for e in errs)
+
+
+def test_schema_rejects_invalid_bundle_name() -> None:
+    for value in ("sub/x.onnx.sigstore.json", "x.sigstore.json"):
+        errors = VMR._jsonschema_errors(
+            {"schema_version": 1, "models": [_entry(sigstore_bundle=value)]}, _SCHEMA
+        )
+        assert any("sigstore_bundle" in error for error in errors), value
 
 
 def test_consistency_check_accepts_well_formed_entry(tmp_path: Path) -> None:
@@ -369,7 +373,7 @@ def test_consistency_check_accepts_well_formed_entry(tmp_path: Path) -> None:
                 "kind": "fr",
                 "onnx": "x.onnx",
                 "sha256": _hash_bytes(blob),
-                "sigstore_bundle": "x.sigstore.json",
+                "sigstore_bundle": "x.onnx.sigstore.json",
                 "teacher": "none",
             }
         ]

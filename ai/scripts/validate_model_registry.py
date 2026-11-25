@@ -16,8 +16,8 @@ Two validators run in sequence:
 2. **Cross-file consistency** — every ``onnx`` exists, the recorded
    ``sha256`` matches the file on disk, every non-smoke entry has a
    sidecar JSON, ``int8_sha256`` is present iff ``quant_mode`` is not
-   ``fp32``, and ``sigstore_bundle`` paths are well-formed (file presence
-   is *not* required at lint time — bundles are generated at release).
+   ``fp32``, and each ``sigstore_bundle`` equals the ONNX basename plus
+   ``.sigstore.json``. Bundles are generated at release and may be absent at lint time.
 
 Exit status: 0 = pass, 1 = validation failed, 2 = bad invocation.
 """
@@ -327,6 +327,11 @@ def _consistency_check(reg: dict[str, Any], registry_dir: Path) -> list[str]:
         if not onnx_rel:
             continue
         onnx_path = registry_dir / onnx_rel
+        expected_bundle = f"{onnx_path.name}.sigstore.json"
+        if "sigstore_bundle" in m and m["sigstore_bundle"] != expected_bundle:
+            errors.append(
+                f"{mid}: sigstore_bundle {m['sigstore_bundle']!r} must equal {expected_bundle!r}"
+            )
         if not onnx_path.is_file():
             errors.append(f"{mid}: missing ONNX file {onnx_path}")
             continue
@@ -344,11 +349,6 @@ def _consistency_check(reg: dict[str, Any], registry_dir: Path) -> list[str]:
         if got == want:
             _check_graph_metadata(m, mid, onnx_path, errors)
 
-        bundle_rel = m.get("sigstore_bundle")
-        if bundle_rel and not bundle_rel.endswith(".sigstore.json"):
-            errors.append(
-                f"{mid}: sigstore_bundle must end with .sigstore.json (got {bundle_rel!r})"
-            )
     return errors
 
 

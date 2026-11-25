@@ -493,21 +493,24 @@ int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path);
 The function:
 
 1. Reads the registry and finds the entry for the model's basename.
-2. Reads that entry's `sigstore_bundle` field and resolves the bundle path.
-3. Runs `cosign verify-blob` through `posix_spawnp`, pinned to the identity
-   regexp `https://github.com/vidiko/vmafx/.github/workflows/.+` and the
-   issuer `https://token.actions.githubusercontent.com`.
+2. Appends `.sigstore.json` to the basename of `onnx_path` and checks that
+   `sigstore_bundle` equals that name exactly. It resolves the derived name
+   inside the registry directory.
+3. Checks the bundle's certificate for the vidiko owner ID and supply-chain
+   workflow on a release tag or `master`. It passes a private copy of the
+   checked bytes to `cosign verify-blob` with the anchored workflow identity
+   and issuer `https://token.actions.githubusercontent.com`.
 4. Returns `0` only when cosign exits `0`. It fails closed: any error
    stops model load.
 
 | Return | Meaning |
 | --- | --- |
 | `0` | Verification passed. |
-| `-ENOENT` | Registry missing, bundle missing, or no entry for the model. |
+| `-ENOENT` | Registry, model entry, bundle field or bundle file missing. |
 | `-EACCES` | `cosign` is not on `PATH`. |
 | `-EPROTO` | `cosign` exited non-zero (bad or non-matching signature). |
 | `-ENOSYS` | Windows build: the supply-chain path needs POSIX process spawning. |
-| `-EINVAL` | `onnx_path` is `NULL`. This check runs before the platform check. |
+| `-EINVAL` | `onnx_path` is `NULL` (checked on every platform), the bundle name differs, or its resolved path escapes the registry directory. |
 
 There is no error-text out parameter; the CLI prints the negated errno. Any
 cosign diagnostics go to the process's own stderr.

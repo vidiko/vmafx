@@ -1142,7 +1142,7 @@ int vmaf_dnn_validate_onnx(const char *path, size_t max_bytes)
  * Operates on the fork's tiny-model registry (model/tiny/registry.json):
  *   1. Resolve the registry alongside the ONNX (or use the caller path).
  *   2. Find the entry whose `onnx` basename matches the user-supplied
- *      ONNX path and pull `sigstore_bundle`.
+ *      ONNX path and confirm its derived bundle name.
  *   3. Spawn `cosign verify-blob --bundle=<...> <onnx>` via posix_spawnp.
  *
  * Banned-function note (CLAUDE.md §6): system(3) is forbidden. We use
@@ -1184,34 +1184,27 @@ static int json_quoted_after_key(const char *key_pos, int no_colon_err, const ch
     return 0;
 }
 
-static int copy_entry_bundle(const char *after_onnx, char *out, size_t out_sz)
+static int read_entry_bundle_name(const char *after_onnx, const char **name, size_t *len)
 {
     const char *next_onnx = strstr(after_onnx, "\"onnx\"");
     const char *bundle_key = strstr(after_onnx, "\"sigstore_bundle\"");
     if (!bundle_key || (next_onnx && bundle_key > next_onnx))
         return -ENOENT;
-    const char *bp = NULL;
-    size_t blen = 0u;
-    const int err = json_quoted_after_key(bundle_key, -EBADMSG, &bp, &blen);
-    if (err != 0)
-        return err;
-    if (blen + 1u > out_sz)
-        return -ENAMETOOLONG;
-    memcpy(out, bp, blen);
-    out[blen] = '\0';
-    return 0;
+    return json_quoted_after_key(bundle_key, -EBADMSG, name, len);
 }
 
-/* Find the sigstore_bundle path for the model entry whose onnx basename
- * matches `onnx_basename`. Writes a registry-relative path into `out`
- * (size `out_sz`) on success, or returns -ENOENT when no match. */
-static int find_bundle_for_onnx(const char *registry_doc, const char *onnx_basename, char *out,
-                                size_t out_sz)
+/* The returned slice belongs to the registry and is used only for comparison. */
+static int find_bundle_for_onnx(const char *registry_doc, size_t doc_len, const char *onnx_basename,
+                                const char **name, size_t *name_len)
 {
-    if (!registry_doc || !onnx_basename || !out || out_sz == 0u)
-        return -EINVAL;
+    const size_t base_len = strnlen(onnx_basename, PATH_MAX);
+    if (base_len == PATH_MAX)
+        return -ENAMETOOLONG;
     const char *cursor = registry_doc;
-    while ((cursor = strstr(cursor, "\"onnx\"")) != NULL) {
+    for (size_t entry = 0u; entry < doc_len; entry++) {
+        cursor = strstr(cursor, "\"onnx\"");
+        if (!cursor)
+            break;
         const char *p = NULL;
         size_t len = 0u;
         const int err = json_quoted_after_key(cursor, -ENOENT, &p, &len);
@@ -1219,8 +1212,8 @@ static int find_bundle_for_onnx(const char *registry_doc, const char *onnx_basen
             return err;
         // SAFETY: p[len] is the closing quote found by json_quoted_after_key, so p + len + 1u is in bounds.
         const char *after_quote = p + len + 1u;
-        if (strnlen(onnx_basename, PATH_MAX) == len && strncmp(p, onnx_basename, len) == 0)
-            return copy_entry_bundle(after_quote, out, out_sz);
+        if (base_len == len && memcmp(p, onnx_basename, len) == 0)
+            return read_entry_bundle_name(after_quote, name, name_len);
         cursor = after_quote;
     }
     return -ENOENT;
@@ -1361,39 +1354,6 @@ static void copy_n_terminated(char *dst, const char *src, size_t len)
     dst[len] = '\0';
 }
 
-static int bundle_rel_component_allowed(const char *p, size_t clen)
-{
-    if (clen == 0u)
-        return 0;
-    if (clen == 1u && p[0] == '.')
-        return 0;
-    if (clen == 2u && p[0] == '.' && p[1] == '.')
-        return 0;
-    return 1;
-}
-
-/* Return 1 when @p bundle_rel is a non-empty relative path with no '.', '..'
- * or empty components and no backslash, else 0. */
-static int bundle_rel_allowed(const char *bundle_rel)
-{
-    if (!bundle_rel || bundle_rel[0] == '\0' || bundle_rel[0] == '/' ||
-        strchr(bundle_rel, '\\') != NULL)
-        return 0;
-    const char *p = bundle_rel;
-    for (size_t step = 0u; step < PATH_MAX; step++) {
-        const char *slash = strchr(p, '/');
-        // SAFETY: slash was found by strchr starting at p, so p <= slash in bundle_rel.
-        const size_t clen = slash ? (size_t)(slash - p) : strnlen(p, PATH_MAX);
-        if (!bundle_rel_component_allowed(p, clen))
-            return 0;
-        if (!slash)
-            return 1;
-        // SAFETY: slash points to '/' in bundle_rel, so slash + 1 is within bundle_rel.
-        p = slash + 1;
-    }
-    return 0;
-}
-
 static int confine_bundle_path_with_buffers(const char *reg_dir, char *out, size_t out_sz,
                                             char *resolved)
 {
@@ -1436,7 +1396,8 @@ static int confine_bundle_path(const char *reg_path, size_t dlen, int has_slash,
 static int resolve_bundle_abs(const char *reg_path, const char *bundle_rel, char *out,
                               size_t out_sz)
 {
-    if (!bundle_rel_allowed(bundle_rel))
+    /* path_basename() removed POSIX separators; also reject backslashes. */
+    if (strchr(bundle_rel, '\\'))
         return -EINVAL;
     const size_t blen = strlen(bundle_rel);
     const char *reg_slash = strrchr(reg_path, '/');
@@ -1529,7 +1490,17 @@ static int lookup_bundle_abs(const char *onnx_path, const char *registry_path, c
     const char *base = path_basename(onnx_path);
     assert(base != NULL);
     char bundle_rel[PATH_MAX];
-    err = find_bundle_for_onnx(reg_buf, base, bundle_rel, sizeof(bundle_rel));
+    const char *registry_name = NULL;
+    size_t name_len = 0u;
+    err = find_bundle_for_onnx(reg_buf, reg_len, base, &registry_name, &name_len);
+    if (err == 0) {
+        const int n = snprintf(bundle_rel, sizeof(bundle_rel), "%s.sigstore.json", base);
+        if (n < 0 || (size_t)n >= sizeof(bundle_rel)) {
+            err = -ENAMETOOLONG;
+        } else if ((size_t)n != name_len || memcmp(bundle_rel, registry_name, name_len) != 0) {
+            err = -EINVAL;
+        }
+    }
     free(reg_buf);
     if (err != 0)
         return err;

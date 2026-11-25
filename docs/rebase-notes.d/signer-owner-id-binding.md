@@ -1,7 +1,9 @@
 ## Tiny-model signer bound to the vidiko owner ID (2026-10-09)
 
-- `core/src/dnn/model_loader.c::vmaf_dnn_verify_signature()` confines the
-  registry's `sigstore_bundle` path to the registry directory, reads the bundle
+- `core/src/dnn/model_loader.c::vmaf_dnn_verify_signature()` derives
+  `<onnx file name>.sigstore.json` from the caller's path, checks the registry
+  field for exact equality and confines the derived path to the registry
+  directory. It reads the bundle
   once (`slurp_json_file()`), checks it with
   `core/src/dnn/signer_identity.c::vmaf_dnn_signer_check_bundle()`, writes the
   checked bytes into a mode 0700 directory created with `mkdtemp(3)` (opening
