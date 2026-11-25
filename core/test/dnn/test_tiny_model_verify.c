@@ -831,59 +831,92 @@ static char *test_tmpdir_rejects_unprotected_shared_ancestor(void)
 
 static char *test_tmpdir_mode_rule(void)
 {
-    const uid_t me = (uid_t)1000;
-    const uid_t other = (uid_t)1001;
-    const mode_t all = (mode_t)S_IRWXU | (mode_t)S_IRWXG | (mode_t)S_IRWXO;
-    const mode_t shared = all | (mode_t)S_ISVTX;
-    const mode_t m0755 =
-        (mode_t)S_IRWXU | (mode_t)S_IRGRP | (mode_t)S_IXGRP | (mode_t)S_IROTH | (mode_t)S_IXOTH;
-    const mode_t m0770 = (mode_t)S_IRWXU | (mode_t)S_IRWXG;
-    const mode_t m0740 = (mode_t)S_IRWXU | (mode_t)S_IRGRP;
-    mu_assert("root sticky shared ok", vmaf_dnn_temp_dir_mode_ok((uid_t)0, shared, me, 0) == 0);
-    mu_assert("own 0755 ok", vmaf_dnn_temp_dir_mode_ok(me, m0755, me, 0) == 0);
-    mu_assert("root euid ok", vmaf_dnn_temp_dir_mode_ok((uid_t)0, m0755, (uid_t)0, 0) == 0);
-    mu_assert("other owner refused", vmaf_dnn_temp_dir_mode_ok(other, m0755, me, 0) == -EACCES);
-    mu_assert("other owner sticky refused",
-              vmaf_dnn_temp_dir_mode_ok(other, shared, me, 0) == -EACCES);
-    mu_assert("root 0777 without sticky refused",
-              vmaf_dnn_temp_dir_mode_ok((uid_t)0, all, me, 0) == -EACCES);
-    mu_assert("own 0770 refused", vmaf_dnn_temp_dir_mode_ok(me, m0770, me, 0) == -EACCES);
-    mu_assert("private 0700 ok", vmaf_dnn_temp_dir_mode_ok(me, (mode_t)S_IRWXU, me, 1) == 0);
-    mu_assert("private group read refused", vmaf_dnn_temp_dir_mode_ok(me, m0740, me, 1) == -EACCES);
-    mu_assert("private root owner refused",
-              vmaf_dnn_temp_dir_mode_ok((uid_t)0, (mode_t)S_IRWXU, me, 1) == -EACCES);
+    enum { me = 1000, other = 1001 };
+    static const struct {
+        uid_t owner;
+        mode_t mode;
+        uid_t euid;
+        int private_only;
+        int expected;
+        char *message;
+    } cases[] = {
+        {0, 01777, me, 0, 0, "root sticky shared ok"},
+        {me, 0755, me, 0, 0, "own 0755 ok"},
+        {0, 0755, 0, 0, 0, "root euid ok"},
+        {other, 0755, me, 0, -EACCES, "other owner refused"},
+        {other, 01777, me, 0, -EACCES, "other owner sticky refused"},
+        {0, 0777, me, 0, -EACCES, "root 0777 without sticky refused"},
+        {me, 0770, me, 0, -EACCES, "own 0770 refused"},
+        {me, 0700, me, 1, 0, "private 0700 ok"},
+        {me, 0740, me, 1, -EACCES, "private group read refused"},
+        {0, 0700, me, 1, -EACCES, "private root owner refused"},
+    };
+    for (size_t i = 0; i < MU_TABLE_LEN(cases); i++) {
+        const int result = vmaf_dnn_temp_dir_mode_ok(cases[i].owner, cases[i].mode, cases[i].euid,
+                                                     cases[i].private_only);
+        mu_assert(cases[i].message, result == cases[i].expected);
+    }
+    return NULL;
+}
+
+struct symlink_tmpdir_paths {
+    const char *parent;
+    const char *child;
+    const char *home;
+    const char *link;
+};
+
+static char *setup_symlink_tmpdir(char *parent, char *child, char *home, char *link,
+                                  struct symlink_tmpdir_paths *created)
+{
+    if (setup_scratch_dir(parent, TEST_BUFFER_256, "linkparent") != 0)
+        return "create parent directory";
+    created->parent = parent;
+    int n = snprintf(child, TEST_BUFFER_512, "%s/private", parent);
+    mu_assert("child path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
+    if (mkdir(child, S_IRWXU) != 0 && errno != EEXIST)
+        return "create child directory";
+    created->child = child;
+    mu_assert("set child 0700", set_directory_mode(child, S_IRWXU) == 0);
+    if (setup_scratch_dir(home, TEST_BUFFER_256, "linkhome") != 0)
+        return "create link directory";
+    created->home = home;
+    n = snprintf(link, TEST_BUFFER_512, "%s/tmpdir", home);
+    mu_assert("link path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
+    if (unlink(link) != 0 && errno != ENOENT)
+        return "remove stale symlink";
+    if (symlink(child, link) != 0)
+        return "create symlink";
+    created->link = link;
+    mu_assert("make parent 0777 without sticky", set_directory_mode(parent, 0777) == 0);
+    return NULL;
+}
+
+static char *cleanup_symlink_tmpdir(const struct symlink_tmpdir_paths *created)
+{
+    const int chmod_rc = created->parent ? set_directory_mode(created->parent, S_IRWXU) : 0;
+    const int rm_link = created->link ? unlink(created->link) : 0;
+    const int rm_home = created->home ? rmdir(created->home) : 0;
+    const int rm_child = created->child ? rmdir(created->child) : 0;
+    const int rm_parent = created->parent ? rmdir(created->parent) : 0;
+    mu_assert("restore parent permissions", chmod_rc == 0);
+    mu_assert("remove symlink", rm_link == 0);
+    mu_assert("remove link directory", rm_home == 0);
+    mu_assert("remove child directory", rm_child == 0);
+    mu_assert("remove parent directory", rm_parent == 0);
     return NULL;
 }
 
 static char *test_tmpdir_rejects_symlink_into_shared_with_buffers(char *parent, char *child,
                                                                   char *home, char *link)
 {
-    mu_assert("create parent directory",
-              setup_scratch_dir(parent, TEST_BUFFER_256, "linkparent") == 0);
-    int n = snprintf(child, TEST_BUFFER_512, "%s/private", parent);
-    mu_assert("child path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
-    if (mkdir(child, S_IRWXU) != 0 && errno != EEXIST)
-        return "create child directory";
-    mu_assert("set child 0700", set_directory_mode(child, S_IRWXU) == 0);
-    mu_assert("create link directory", setup_scratch_dir(home, TEST_BUFFER_256, "linkhome") == 0);
-    n = snprintf(link, TEST_BUFFER_512, "%s/tmpdir", home);
-    mu_assert("link path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
-    if (unlink(link) != 0 && errno != ENOENT)
-        return "remove stale symlink";
-    mu_assert("create symlink", symlink(child, link) == 0);
-    mu_assert("make parent 0777 without sticky", set_directory_mode(parent, 0777) == 0);
-    char *msg = check_invalid_tmpdir(link, -EACCES);
-    const int chmod_rc = set_directory_mode(parent, S_IRWXU);
-    const int rm_link = unlink(link);
-    const int rm_home = rmdir(home);
-    const int rm_child = rmdir(child);
-    const int rm_parent = rmdir(parent);
-    mu_assert("restore parent permissions", chmod_rc == 0);
-    mu_assert("remove symlink", rm_link == 0);
-    mu_assert("remove link directory", rm_home == 0);
-    mu_assert("remove child directory", rm_child == 0);
-    mu_assert("remove parent directory", rm_parent == 0);
-    return msg;
+    struct symlink_tmpdir_paths created = {0};
+    char *setup_msg = setup_symlink_tmpdir(parent, child, home, link, &created);
+    char *msg = setup_msg ? NULL : check_invalid_tmpdir(link, -EACCES);
+    char *cleanup_msg = cleanup_symlink_tmpdir(&created);
+    if (setup_msg)
+        return setup_msg;
+    return cleanup_msg ? cleanup_msg : msg;
 }
 
 /* TMPDIR is a symlink, inside a private 0700 scratch directory, to a 0700
