@@ -45,11 +45,16 @@ keeps them. Attribution is checked on all text above the staged diff block that
 a `diff --git` line); such a line directly below a scissors line is still
 checked.
 Under `core.commentChar=auto`, the hook uses the comment string of Git's own
-template lines. The hook reads `commit.cleanup` only from Git configuration and
-may check more text than Git stores when you pass `--cleanup=...` on the command
-line.
+template lines. The hook reads `commit.cleanup` from Git configuration. If you
+override it with `--cleanup=<mode>` (see `git help commit`), the hook can check
+more or less text than Git stores. For example, when you edit a message with
+`commit.cleanup=scissors` and `--cleanup=strip`, the hook can accept a sign-off
+above the scissors line even if Git keeps a later paragraph that moves the
+sign-off out of the final trailer block. The hook still checks attribution
+below a plain scissors line.
 The binding pull request range check, also run on pre-push, reads stored commit
-messages through `list_head_commit()` in `scripts/ci/check-dco.py`.
+messages through `list_head_commit()` in `scripts/ci/check-dco.py`. It catches
+the misplaced sign-off and any forbidden attribution in the stored message.
 
 Limits:
 
