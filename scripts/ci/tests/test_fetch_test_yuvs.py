@@ -29,6 +29,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
+from unittest.mock import patch
 
 import yaml  # type: ignore[import-untyped]  # hook environments omit PyYAML stubs
 
@@ -722,6 +723,8 @@ class FixtureCachePhases(unittest.TestCase):
     def run_step(
         self, step_id: str, root: Path, names: str = "", fetch_rc: str = "0"
     ) -> TextCommandResult:
+        if BASH is None:
+            self.skipTest("needs bash")
         # Run the action's bash in a temporary workspace with a local fetch stand-in.
         stub = root / "scripts/test/fetch-test-yuvs.sh"
         stub.parent.mkdir(parents=True, exist_ok=True)
@@ -732,6 +735,16 @@ class FixtureCachePhases(unittest.TestCase):
             + self.by_id[step_id]["run"]
         )
         return run_bash("-ec", program, "step", str(root), names, fetch_rc)
+
+    def test_run_step_skips_before_writing_without_bash(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(sys.modules[__name__], "BASH", None),
+        ):
+            root = Path(tmp)
+            with self.assertRaisesRegex(unittest.SkipTest, "^needs bash$"):
+                self.run_step("manifest", root)
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_get_clears_a_previous_marker_before_a_failed_fetch(self) -> None:
         self.assertEqual(self.steps[0], self.by_id["manifest"])
