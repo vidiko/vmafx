@@ -919,14 +919,15 @@ MAX_HOOK_DEPS = 200
 MAX_JSON_PAIRS = 2000
 MAX_PACKAGE_RULES = 500
 MAX_RULE_DEPS = 500
+PATTERN_VALUE = re.compile(r"^/|[*!{]")
 ALLOWED_SKIP_RULE_KEYS = frozenset(
     {"description", "matchManagers", "matchDepTypes", "matchDepNames", "enabled"}
 )
 
 
 def package_key(name: str) -> str:
-    """Normalise a distribution name the way the lock and the hook spell it."""
-    return name.lower().replace("_", "-")
+    """Normalise a distribution name to its PEP 503 key."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def lock_graph(lock: str) -> tuple[dict[str, str], dict[str, set[str]]]:
@@ -1026,7 +1027,21 @@ def unique_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return mapping
 
 
-def hook_exact_pin_keys(hook: dict[object, object], lock_pins: dict[str, str]) -> set[str] | None:
+def lock_tied_pin(dep: str, lock_pins: dict[str, str]) -> tuple[str, str, str] | None:
+    """Return (key, hook_version, lock_version) when dep is an exact pin in lock_pins."""
+    match = LOCK_PIN.fullmatch(dep)
+    if match is None or "=" in match.group(2):
+        return None
+    key = package_key(match.group(1))
+    lock_version = lock_pins.get(key)
+    return (key, match.group(2), lock_version) if lock_version is not None else None
+
+
+def hook_exact_pin_keys(
+    hook: dict[object, object],
+    lock_pins: dict[str, str],
+    mismatches: list[str] | None = None,
+) -> set[str] | None:
     """Return lock-pinned exact dependency keys for one python hook, or None if invalid."""
     if hook.get("language") != "python":
         return set()
@@ -1037,27 +1052,35 @@ def hook_exact_pin_keys(hook: dict[object, object], lock_pins: dict[str, str]) -
     for dep in deps[:MAX_HOOK_DEPS]:
         if not isinstance(dep, str):
             return None
-        match = LOCK_PIN.fullmatch(dep)
-        if match is not None and "=" not in match.group(2):
-            key = package_key(match.group(1))
-            if key in lock_pins:
-                tied.add(key)
+        tied_pin = lock_tied_pin(dep, lock_pins)
+        if tied_pin is None:
+            continue
+        key, version, lock_version = tied_pin
+        if version != lock_version:
+            if mismatches is not None:
+                mismatches.append(f"{hook.get('id', '?')}: {key}=={version} != {lock_version}")
+            return None
+        tied.add(key)
     return tied
 
 
-def lock_tied_hook_pins(config: str, lock: str) -> set[str] | None:
-    """Collect package keys of exact python-hook pins whose package is in the lock."""
+def lock_tied_hook_pins(
+    config: str, lock: str, mismatches: list[str] | None = None
+) -> set[str] | None:
+    """Collect package keys of exact python-hook pins matching the lock versions."""
     hooks = pre_commit_hooks(config)
     pins, _ = lock_graph(lock)
     if hooks is None or not pins or len(hooks) > MAX_TOTAL_HOOKS:
         return None
     tied: set[str] = set()
+    ok = True
     for hook in hooks[:MAX_TOTAL_HOOKS]:
-        keys = hook_exact_pin_keys(hook, pins)
+        keys = hook_exact_pin_keys(hook, pins, mismatches)
         if keys is None:
-            return None
-        tied |= keys
-    return tied
+            ok = False
+        else:
+            tied |= keys
+    return tied if ok else None
 
 
 def renovate_package_rules(renovate: str) -> list[dict[str, object]] | None:
@@ -1089,6 +1112,38 @@ def is_lock_tied_skip_rule(rule: dict[str, object], tied: set[str]) -> bool:
     return len(normalised) == len(names) and normalised == tied
 
 
+def selector_can_match(
+    values: object,
+    allowed: set[str] | frozenset[str],
+    normalise: Callable[[str], str] = str,
+) -> bool:
+    """True when a Renovate match* value is absent, non-literal, or intersects allowed."""
+    if values is None:
+        return True
+    if not isinstance(values, list) or not (0 < len(values) <= MAX_RULE_DEPS):
+        return True
+    for item in values[:MAX_RULE_DEPS]:
+        if (
+            not isinstance(item, str)
+            or PATTERN_VALUE.search(item) is not None
+            or normalise(item) in allowed
+        ):
+            return True
+    return False
+
+
+def rule_can_override_lock_tied(rule: dict[str, object], tied: set[str]) -> bool:
+    """True when a later packageRule can re-enable a lock-tied pre-commit-python pin."""
+    if rule.get("enabled") is not True:
+        return False
+    return (
+        selector_can_match(rule.get("matchManagers"), {"pre-commit"})
+        and selector_can_match(rule.get("matchDepTypes"), {"pre-commit-python"})
+        and selector_can_match(rule.get("matchDepNames"), tied, package_key)
+        and selector_can_match(rule.get("matchPackageNames"), tied, package_key)
+    )
+
+
 def renovate_skips_lock_tied_hook_pins(config: str, lock: str, renovate: str) -> bool:
     """The lock-tied python-hook pins match one disabled pre-commit-python rule."""
     tied = lock_tied_hook_pins(config, lock)
@@ -1103,7 +1158,7 @@ def renovate_skips_lock_tied_hook_pins(config: str, lock: str, renovate: str) ->
     if len(matches) != 1:
         return False
     later = rules[matches[0] + 1 : MAX_PACKAGE_RULES]
-    return not any(rule.get("enabled") is True for rule in later)
+    return not any(rule_can_override_lock_tied(rule, tied) for rule in later[:MAX_PACKAGE_RULES])
 
 
 def sentinel_damage(script: str, directory: Path) -> list[str]:
@@ -1904,12 +1959,24 @@ class GitFixtureIsolation(unittest.TestCase):
         config = (ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
         lock = (ROOT / "requirements/locks/tooling-tests.txt").read_text(encoding="utf-8")
         renovate = (ROOT / "renovate.json").read_text(encoding="utf-8")
+        mismatches: list[str] = []
+        self.assertIsNotNone(lock_tied_hook_pins(config, lock, mismatches), ", ".join(mismatches))
         self.assertTrue(renovate_skips_lock_tied_hook_pins(config, lock, renovate))
         anchor = renovate.index('"pre-commit-python"')
         start = renovate.rindex("    {\n", 0, anchor)
         end = renovate.index("    },\n", anchor) + len("    },\n")
         head, rule, tail = renovate[:start], renovate[start:end], renovate[end:]
         dep_types = '      "matchDepTypes": [\n        "pre-commit-python"\n      ],\n'
+        later_bandit = (
+            '    {\n      "matchManagers": ["pre-commit"],\n'
+            '      "matchDepNames": ["bandit"],\n      "enabled": true\n    },\n'
+        )
+        later_pattern = (
+            '    {\n      "matchPackageNames": ["/.*/"],\n      "enabled": true\n    },\n'
+        )
+        later_other_key = (
+            '    {\n      "matchDatasources": ["pypi"],\n      "enabled": true\n    },\n'
+        )
         planted = {
             "removed": head + tail,
             "missing_bandit": head + rule.replace('        "bandit",\n', "", 1) + tail,
@@ -1921,14 +1988,22 @@ class GitFixtureIsolation(unittest.TestCase):
             "duplicate_key": head
             + rule.replace('"enabled": false', '"enabled": false,\n      "enabled": false', 1)
             + tail,
-            "later_enabled": head + rule + tail.replace('"enabled": false', '"enabled": true', 1),
+            "later_matching_bandit": head + rule + later_bandit + tail,
+            "later_pattern": head + rule + later_pattern + tail,
+            "later_other_match_key": head + rule + later_other_key + tail,
         }
-        for name, edited in list(planted.items())[:10]:
+        for name, edited in list(planted.items())[:12]:
             with self.subTest(planted=name):
                 if name != "duplicate_key":
                     self.assertIsInstance(json.loads(edited), dict)
                 self.assertNotEqual(edited, renovate)
                 self.assertFalse(renovate_skips_lock_tied_hook_pins(config, lock, edited))
+        later_actions = (
+            '    {\n      "matchManagers": ["github-actions"],\n      "enabled": true\n    },\n'
+        )
+        unrelated = head + rule + later_actions + tail
+        self.assertIsInstance(json.loads(unrelated), dict)
+        self.assertTrue(renovate_skips_lock_tied_hook_pins(config, lock, unrelated))
         bandit_deps = '["bandit==1.9.4", "identify==2.6.20"]'
         already = config.replace(bandit_deps, bandit_deps[:-1] + ', "iniconfig==2.3.1"]', 1)
         self.assertNotEqual(already, config)
@@ -1936,6 +2011,29 @@ class GitFixtureIsolation(unittest.TestCase):
         unlisted = config.replace(bandit_deps, bandit_deps[:-1] + ', "click==8.5.0"]', 1)
         self.assertNotEqual(unlisted, config)
         self.assertFalse(renovate_skips_lock_tied_hook_pins(unlisted, lock, renovate))
+
+    def test_renovate_lock_tied_hook_pin_versions_and_names(self) -> None:
+        config = (ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+        lock = (ROOT / "requirements/locks/tooling-tests.txt").read_text(encoding="utf-8")
+        renovate = (ROOT / "renovate.json").read_text(encoding="utf-8")
+        self.assertEqual(package_key("Foo.Bar_baz--qux"), "foo-bar-baz-qux")
+        hook_anchor = config.index("      - id: test-semgrep-float-identity\n")
+        stale = config[:hook_anchor] + config[hook_anchor:].replace(
+            '"pyyaml==6.0.3"', '"pyyaml==0.0.1"', 1
+        )
+        self.assertNotEqual(stale, config)
+        mismatches: list[str] = []
+        self.assertIsNone(lock_tied_hook_pins(stale, lock, mismatches))
+        self.assertEqual(mismatches, ["test-semgrep-float-identity: pyyaml==0.0.1 != 6.0.3"])
+        self.assertFalse(renovate_skips_lock_tied_hook_pins(stale, lock, renovate))
+        pyyaml_spelled = config[:hook_anchor] + config[hook_anchor:].replace(
+            '"pyyaml==6.0.3"', '"PyYAML==6.0.3"', 1
+        )
+        self.assertNotEqual(pyyaml_spelled, config)
+        self.assertTrue(renovate_skips_lock_tied_hook_pins(pyyaml_spelled, lock, renovate))
+        dotted_hook = config.replace("- pytest-timeout==2.4.0", "- pytest.timeout==2.4.0", 1)
+        self.assertNotEqual(dotted_hook, config)
+        self.assertTrue(renovate_skips_lock_tied_hook_pins(dotted_hook, lock, renovate))
 
     def test_sentinel_expected_failures_are_live(self) -> None:
         scripts = scratch_scripts()

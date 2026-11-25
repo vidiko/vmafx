@@ -214,4 +214,8 @@ To support pure sdists (e.g. `mkdocs-minify-plugin` dependencies) securely:
   mirror that lock, so a `pre-commit-python` rule in `renovate.json` disables
   Renovate's pre-commit manager for them and leaves updates to lock refreshes.
   `test_renovate_skips_lock_tied_hook_pins` in
-  `scripts/ci/test_git_fixture_isolation.py` enforces this rule.
+  `scripts/ci/test_git_fixture_isolation.py` enforces this rule. Until the
+  lock writer moves these pins (issue 3656), a pull request that moves a
+  lock-tied version must update the matching hook pins in
+  `.pre-commit-config.yaml` in the same pull request, or
+  `test_renovate_skips_lock_tied_hook_pins` fails.
