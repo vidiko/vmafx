@@ -381,7 +381,7 @@ static char *test_rejection_detects_invocation(void)
 {
     char *dir = calloc(TEST_BUFFER_256, 1u);
     char *path = calloc(TEST_BUFFER_512, 1u);
-    char *record = calloc(sizeof("1"), 1u);
+    char *record = calloc(1u, sizeof("1"));
     char *result = "allocation failed";
     if (dir && path && record)
         result = test_rejection_detects_invocation_with_buffers(dir, path, record);
@@ -562,7 +562,7 @@ static char *run_with_fake_cosign_current_tmpdir(const struct cosign_case *tc, c
 {
     char *dir = calloc(TEST_BUFFER_256, 1u);
     char *path = calloc(TEST_BUFFER_512, 1u);
-    char *record = calloc(sizeof("1"), 1u);
+    char *record = calloc(1u, sizeof("1"));
     char *result = "allocation failed";
     if (dir && path && record)
         result = run_with_fake_cosign_current_tmpdir_with_buffers(tc, argv_out, dir, path, record);
