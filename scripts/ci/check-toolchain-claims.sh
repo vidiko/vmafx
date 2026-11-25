@@ -7,10 +7,9 @@
 # Enforces that any claim asserting a toolchain is missing or that a GPU backend
 # was not compiled is backed by evidence from `scripts/dev/toolchain-probe.sh`.
 #
-# Refuses (exit 1, message naming line) when:
-#   1. Body contains a missing-toolchain claim and lacks a `toolchain-probe v1` block.
-#   2. Body claims a toolchain is missing/not compiled, but the pasted probe output
-#      reports that toolchain was `found` on the host.
+# A claim requires one block covering every tool. A host claim also requires
+# a covering block with no claimed tool found. Pasted output is unauthenticated:
+# the checker detects missing or contradictory evidence, not forged blocks.
 #
 # Checks prose in fences and skips the probe's header and result lines.
 #
@@ -26,17 +25,42 @@ set -euo pipefail
 _check_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/ci/pr-body-input.sh
 . "${_check_dir}/pr-body-input.sh"
+# shellcheck source=scripts/dev/toolchain-probe-format.sh
+. "${_check_dir}/../dev/toolchain-probe-format.sh"
+
+# Bash 3.2 has no {variable} fd allocation. Use a scoped duplicate for the
+# stdin read on that shell. Redirection on the function restores fd 9 on return.
+read_legacy_stdin() {
+  PR_BODY_STDIN_FD=9
+  if [ -t 9 ]; then
+    PR_BODY_STDIN_KIND="tty"
+  elif [ -e /dev/fd/9 ] && [ ! -f /dev/fd/9 ] && [ ! -p /dev/fd/9 ] && [ ! -S /dev/fd/9 ]; then
+    PR_BODY_STDIN_KIND=unreadable
+  else
+    PR_BODY_STDIN_KIND=stream
+    body_text="$(pr_body_read_stdin)"
+  fi
+}
 
 if [ -n "${PR_BODY+x}" ]; then
   body_text="${PR_BODY}"
   body_src="env"
 else
-  pr_body_classify_stdin
-  if [ "${PR_BODY_STDIN_KIND}" = "stream" ]; then
-    body_text="$(pr_body_read_stdin)"
-    pr_body_close_stdin
-    body_src="stdin"
+  body_src="stdin"
+  if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] == 0))); then
+    if ! { : 9<&0; } 2>/dev/null; then
+      PR_BODY_STDIN_KIND=closed
+    else
+      read_legacy_stdin 9<&0
+    fi
   else
+    pr_body_classify_stdin
+    if [ "${PR_BODY_STDIN_KIND}" = "stream" ]; then
+      body_text="$(pr_body_read_stdin)"
+      pr_body_close_stdin
+    fi
+  fi
+  if [ "${PR_BODY_STDIN_KIND}" != "stream" ]; then
     echo "check-toolchain-claims: no PR body supplied — $(pr_body_stdin_reason)" >&2
     echo "  Set PR_BODY env var, OR pipe body on stdin." >&2
     exit 2
@@ -81,27 +105,7 @@ for spec in "${toolchain_map[@]}"; do
 done
 
 space='[[:space:]]+'
-token='[^[:space:]]+'
-# Accepted scripts/dev/toolchain-probe.sh stdout shapes:
-#   - line 74: `toolchain-probe v1 host=<token> os=<token> date=<token>`
-#   - lines 144,157,167,198,206,217,236,244,255,274,281,304,310,317,488:
-#     `toolchain-probe: <name> found <path>[ <version>]`
-#   - lines 175,227,265,290,320,484: `toolchain-probe: <name> absent searched=<dirs>`
-#   - line 295: `toolchain-probe: metal absent searched=none os=<os>`
-#   - lines 403,421,425,430,434,438,490,493,500,505,517,519,524:
-#     `x86_64-w64-mingw32-gcc` detail rows (`dumpversion`, `thread-model`,
-#     `runtime`, `runtime-unresolved`, `pairing ok`, `pairing-mismatch`,
-#     `pairing-unverified`).
-probe_header="^[[:space:]]*toolchain-probe v1 host=${token} os=${token} date=${token}[[:space:]]*$"
-probe_found="^[[:space:]]*toolchain-probe: (${probe_names}) found ${token}(${space}.*)?$"
-probe_absent="^[[:space:]]*toolchain-probe: ((${probe_names}) absent searched=${token}|metal absent searched=none os=${token})[[:space:]]*$"
-mingw_name='x86_64-w64-mingw32-gcc'
-mingw_rt_unres='\(gcc -print-file-name answered no absolute path; refusing instead of staging green\)'
-mingw_opt_unres='unresolved \(evidence only; not every flavour ships it\)'
-mingw_pair_ok="pairing ok thread-model (win32, ${token} imports no libwinpthread|posix, ${token} imports libwinpthread)"
-mingw_pair_bad="pairing-mismatch thread-model (win32 but ${token} imports libwinpthread \(B24: a posix runtime next to a win32-model driver deadlocks on the target\)|posix but ${token} imports no libwinpthread \(B24 inverse: a win32 runtime next to a posix-model driver\))"
-mingw_pair_unv="pairing-unverified (${token}: objdump -p exited [0-9]+|thread-model unknown \(${token} imports (libwinpthread|none)\); refusing instead of guessing a flavour|no objdump found \(target-prefixed or plain\); refusing to pass an unasserted stage)"
-probe_mingw_detail="^[[:space:]]*toolchain-probe: ${mingw_name} (dumpversion ${token}|thread-model ${token}|runtime (libstdc\+\+-6\.dll|libgcc_s_seh-1\.dll|libwinpthread-1\.dll)=${token}|runtime libwinpthread-1\.dll ${mingw_opt_unres}|runtime-unresolved ${token} ${mingw_rt_unres}|${mingw_pair_ok}|${mingw_pair_bad}|${mingw_pair_unv})[[:space:]]*$"
+probe_result_patterns "${probe_names}"
 tick='`'
 fence_tick="^[[:space:]]*(${tick}{3,})[^${tick}]*\$"
 fence_tilde='^[[:space:]]*(~{3,})'
@@ -110,11 +114,12 @@ blank='^[[:space:]]*$'
 # Only fence markers, valid headers, and probe rows inside a strict header
 # block (`after_header=1`) are exempt from prose claim checking.
 declare -a lines=() exempt_lines=()
-declare -A probed_tools=() found_tools=()
+# Each indexed entry is a space-delimited set of canonical probe names.
+declare -a probed_tools=() found_tools=()
+block_count=0
 fence_start=0
 fence_close=''
 after_header=0
-has_probe_header=0
 
 # Opening and closing fences reset the evidence scope. Under CommonMark, a
 # backtick fence info string cannot contain a backtick (same-line spans pass).
@@ -139,12 +144,12 @@ record_probe_row() {
   local line="$1" idx="$2" name
   if [[ "${line}" =~ ${probe_found} ]]; then
     name="${BASH_REMATCH[1]}"
-    probed_tools["${name}"]=1
-    found_tools["${name}"]=1
+    probed_tools[block_count]+=" ${name} "
+    found_tools[block_count]+=" ${name} "
     exempt_lines[idx]=1
   elif [[ "${line}" =~ ${probe_absent} ]]; then
     name="${BASH_REMATCH[2]:-metal}"
-    probed_tools["${name}"]=1
+    probed_tools[block_count]+=" ${name} "
     exempt_lines[idx]=1
   elif [[ "${line}" =~ ${probe_mingw_detail} ]]; then
     exempt_lines[idx]=1
@@ -160,9 +165,13 @@ read_probe_line() {
       after_header=0
     fi
   elif [[ "${line}" =~ ${probe_header} ]]; then
-    has_probe_header=1
+    block_count=$((block_count + 1))
+    probed_tools[block_count]=''
+    found_tools[block_count]=''
     after_header=1
     exempt_lines[idx]=1
+  elif [[ "${line}" =~ ^[[:space:]]*toolchain-probe[[:space:]]+v[0-9]+([[:space:]]|$) ]]; then
+    after_header=0
   elif [ "${after_header}" -eq 1 ]; then
     record_probe_row "${line}" "${idx}"
   fi
@@ -177,10 +186,11 @@ done <<<"${body_text}"
 
 p_no="${wb_l}no${space}\`*(${claim_words})\`*${wb_tok_r}"
 # Allow-list change-scope `no <tool>` phrases in two shapes:
-#   (a) change word follows directly or after one word (`no SYCL changes`, `no nvcc flags changed`);
+#   (a) change word follows after zero to three change objects (`no SYCL changes`, `no nvcc flags changed`);
 #   (b) change verb directly precedes `no <tool>` (`Touches no CUDA`, `changes no HIP`).
-p_scope_word="\`*[a-zA-Z0-9][a-zA-Z0-9_-]*\`*"
-p_no_scope_after="no${space}\`*(${claim_words})\`*${space}(${p_scope_word}${space})?(change|changes|changed|edit|edits|edited|touched|modified)${wb_r}"
+change_objects='build|flag|flags|option|options|code|source|sources|file|files|path|paths|kernel|kernels|backend|test|tests|config|setting|settings|dependency|dependencies'
+p_scope_object="\`*(${change_objects})\`*"
+p_no_scope_after="no${space}\`*(${claim_words})\`*${space}(${p_scope_object}${space}){0,3}(change|changes|changed|edit|edits|edited|touched|modified)${wb_r}"
 p_no_scope_before="(touch|touches|touched|change|changes|changed|edit|edits|edited|modify|modifies|modified)${space}no${space}\`*(${claim_words})\`*${wb_tok_r}"
 p_no_scope="${wb_l}(${p_no_scope_after}|${p_no_scope_before})"
 p_lacks="${wb_l}(lacks|lacking)${space}((a|an|the)${space})?\`*(${claim_words})\`*${wb_tok_r}"
@@ -192,6 +202,16 @@ p_nonhost="${wb_l}(ci|runners?|images?|containers?|golden(${space}|-)builds?)${w
 p_compile="${wb_l}(not${space}compiled|(was|were)${space}not${space}built|did${space}not${space}(compile|build)|compilation(${space}(was|were))?${space}skipped)${wb_r}"
 p_any_tool="${wb_tok_l}\`*(${claim_words})\`*${wb_tok_r}"
 
+p_absence_or_without="(${p_absence}|${p_without})"
+# Subject suffix stops exactly where the absence predicate starts.
+p_subject_action="((has|have)${space}no|lacks)${space}((a|an|the)${space})?\`*(${claim_words})\`*${wb_tok_r}$"
+p_nonhost_subject="${wb_l}(ci|runners?|images?|containers?|golden(${space}|-)builds?)${space}${p_subject_action}"
+p_host_subject="${wb_l}((this|the)${space}host|(this|my)${space}machine)${space}${p_subject_action}"
+word='[[:alnum:]_-]+'
+sep='[^[:alnum:]_-]+'
+left_window="(${word}${sep}){0,3}${word}[^[:alnum:]_-]*$"
+right_window="^[^[:alnum:]_-]*${word}(${sep}${word}){0,3}"
+
 split_clauses() {
   local s="$1"
   s="${s//;/$'\n'}"
@@ -201,49 +221,39 @@ split_clauses() {
   printf '%s\n' "${s}"
 }
 
-is_nonhost_scope() {
-  local clause="$1" line="$2"
-  [[ "${clause}" =~ ${p_host} ]] && return 1
-  [[ "${clause}" =~ ${p_nonhost} ]] && return 0
-  [[ "${line}" =~ ${p_nonhost} && ! "${line}" =~ ${p_host} ]]
+near_host() {
+  local left="$1" match="$2" right="$3" window=''
+  if [[ "${left}" =~ ${left_window} ]]; then window="${BASH_REMATCH[0]}"; fi
+  window+="${match}"
+  if [[ "${right}" =~ ${right_window} ]]; then window+="${BASH_REMATCH[0]}"; fi
+  [[ "${window}" =~ ${p_host} ]]
 }
 
-classify_claim() {
-  local clause="$1" line="$2"
-  host_claim=0
-  if [[ "${clause}" =~ ${p_absence} ]] ||
-    [[ "${clause}" =~ ${p_without} && "${clause}" =~ ${p_host} ]]; then
-    is_nonhost_scope "${clause}" "${line}" || host_claim=1
-    return 0
-  fi
-  if [[ "${clause}" =~ ${p_compile} && "${clause}" =~ ${p_any_tool} ]]; then
-    [[ "${clause}" =~ ${p_host} ]] && host_claim=1
-    return 0
-  fi
-  return 1
+absence_is_host() {
+  local clause="$1" left="$2" match="$3" right="$4"
+  [[ "${left}${match}" =~ ${p_nonhost_subject} ]] && return 1
+  [[ "${left}${match}" =~ ${p_host_subject} ]] && return 0
+  near_host "${left}" "${match}" "${right}" && return 0
+  [[ ! "${clause}" =~ ${p_nonhost} ]]
 }
 
 claim_tools() {
-  local clause="$1" spec family name compiler_alias backend_alias
-  local -A family_explicit=()
-  local -a tools=()
+  local clause="$1" spec family name compiler_alias backend_alias families=' '
+  tools=()
   for spec in "${toolchain_map[@]}"; do
     IFS=';' read -r family name compiler_alias _ <<<"${spec}"
     if [[ "${clause}" =~ ${wb_tok_l}\`*(${name}${compiler_alias:+|${compiler_alias}})\`*${wb_tok_r} ]]; then
-      family_explicit["${family}"]=1
+      families+="${family} "
       tools+=("${name}")
     fi
   done
   for spec in "${toolchain_map[@]}"; do
     IFS=';' read -r family name _ backend_alias <<<"${spec}"
-    if [ -n "${backend_alias}" ] && [ "${family_explicit[${family}]:-0}" -eq 0 ] &&
-      [[ "${clause}" =~ ${wb_tok_l}\`*(${backend_alias})\`*${wb_tok_r} ]]; then
+    if [[ -n "${backend_alias}" && "${families}" != *" ${family} "* &&
+      "${clause}" =~ ${wb_tok_l}\`*(${backend_alias})\`*${wb_tok_r} ]]; then
       tools+=("${name}")
     fi
   done
-  if [ "${#tools[@]}" -gt 0 ]; then
-    printf '%s\n' "${tools[@]}"
-  fi
 }
 
 emit_missing_probe() {
@@ -272,21 +282,73 @@ emit_claim_errors() {
   return "${rc}"
 }
 
-check_clause_tools() {
-  local clause="$1" tool
-  while IFS= read -r tool; do
-    if [ "${probed_tools[${tool}]:-0}" -eq 0 ]; then
-      if [ "${seen_miss[${tool}]:-0}" -eq 0 ]; then
-        missing="${missing:+${missing}, }${tool}"
-        seen_miss["${tool}"]=1
+# Keep the first closest block for diagnostics. A complete block takes
+# precedence over partial blocks, and any agreeing complete block suffices.
+check_evidence() {
+  local clause="$1" host_tools="$2" block tool missing contradicted count
+  local best_count=$((${#toolchain_map[@]} + 1)) best_missing='' best_contradicted=''
+  local -a tools=()
+  if ((block_count == 0)); then
+    emit_missing_probe "${idx}" "${line}"
+    return 1
+  fi
+  claim_tools "${clause}"
+  for ((block = 1; block <= block_count; block++)); do
+    missing='' contradicted='' count=0
+    for tool in ${tools[@]+"${tools[@]}"}; do
+      if [[ "${probed_tools[block]}" != *" ${tool} "* ]]; then
+        missing+="${missing:+, }${tool}"
+        count=$((count + 1))
+      elif [[ ("${host_tools}" == all || "${host_tools}" == *" ${tool} "*) &&
+        "${found_tools[block]}" == *" ${tool} "* ]]; then
+        contradicted+="${contradicted:+, }${tool}"
       fi
-    elif [ "${host_claim}" -eq 1 ] && [ "${found_tools[${tool}]:-0}" -eq 1 ]; then
-      if [ "${seen_contra[${tool}]:-0}" -eq 0 ]; then
-        contradicted="${contradicted:+${contradicted}, }${tool}"
-        seen_contra["${tool}"]=1
-      fi
+    done
+    if [[ -z "${missing}${contradicted}" ]]; then return 0; fi
+    if ((count < best_count)); then
+      best_count=${count}
+      best_missing="${missing}"
+      best_contradicted="${contradicted}"
     fi
-  done < <(claim_tools "${clause}")
+  done
+  if ((best_count > 0)); then best_contradicted=''; fi
+  emit_claim_errors "${idx}" "${line}" "${best_missing}" "${best_contradicted}"
+}
+
+# One absence can name several tools ("no nvcc or hipcc"). A new absence
+# predicate starts a new phrase and gets its own subject and qualifier window.
+check_clause() {
+  local clause="$1" tail="$1" left='' match before after phrase
+  local offset=0 saw_absence=0 host_tools=' '
+  local -a tools=()
+  while ((offset < ${#clause})) && [[ "${tail}" =~ ${p_absence_or_without} ]]; do
+    match="${BASH_REMATCH[0]}"
+    before="${tail%%"${match}"*}"
+    left="${clause:0:offset}${before}"
+    after="${tail#*"${match}"}"
+    phrase="${match}"
+    if ((offset == 0)); then phrase="${before}${match}"; fi
+    if [[ "${after}" =~ ${p_absence_or_without} ]]; then
+      phrase+="${after%%"${BASH_REMATCH[0]}"*}"
+    else
+      phrase+="${after}"
+    fi
+    tail="${after}"
+    offset=$((${#clause} - ${#tail}))
+    if [[ "${match}" =~ ${p_without} ]] && ! near_host "${left}" "${match}" "${after}"; then
+      continue
+    fi
+    saw_absence=1
+    if absence_is_host "${clause}" "${left}" "${match}" "${after}"; then
+      claim_tools "${phrase}"
+      host_tools+="${tools[*]-} "
+    fi
+  done
+  if ((saw_absence == 0)); then
+    [[ "${clause}" =~ ${p_compile} && "${clause}" =~ ${p_any_tool} ]] || return 0
+    if [[ "${clause}" =~ ${p_host} ]]; then host_tools=all; fi
+  fi
+  check_evidence "${clause}" "${host_tools}"
 }
 
 strip_scoped_no() {
@@ -306,24 +368,19 @@ strip_scoped_no() {
 }
 
 check_claim() {
-  local idx="$1" line="$2" clause stripped_clause='' missing='' contradicted=''
-  local -A seen_miss=() seen_contra=()
+  local idx="$1" line="$2" clause stripped_clause='' rc=0
   while IFS= read -r clause; do
     strip_scoped_no "${clause}"
-    classify_claim "${stripped_clause}" "${line}" || continue
-    if [ "${has_probe_header}" -eq 0 ]; then
-      emit_missing_probe "${idx}" "${line}"
-      return 1
-    fi
-    check_clause_tools "${stripped_clause}"
+    check_clause "${stripped_clause}" || rc=1
+    if ((rc != 0 && block_count == 0)); then return 1; fi
   done < <(split_clauses "${line}")
-  emit_claim_errors "${idx}" "${line}" "${missing}" "${contradicted}"
+  return "${rc}"
 }
 
 # Check claims after collecting evidence from the entire description.
 shopt -s nocasematch
 fail=0
-for idx in "${!lines[@]}"; do
+for ((idx = 1; idx <= ${#lines[@]}; idx++)); do
   if [ "${exempt_lines[idx]:-0}" -eq 1 ]; then
     continue
   fi

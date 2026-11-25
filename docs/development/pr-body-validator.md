@@ -318,27 +318,30 @@ The script searches standard vendor directories and sources oneAPI's
 `setvars.sh` in a subshell. Paste its output into the description as text.
 
 ```text
-toolchain-probe v1 host=<host> os=<os> date=<date>
+toolchain-probe v1 host=build-01 os=Linux date=2026-11-04T00:00:00Z
 toolchain-probe: icpx found /opt/intel/oneapi/compiler/2026.0/bin/icpx ...
 toolchain-probe: nvcc found /opt/cuda/bin/nvcc ...
 toolchain-probe: metal absent searched=none os=Linux
 ```
 
-On non-Darwin hosts, `scripts/dev/toolchain-probe.sh` emits the Metal absence
-row with the operating system from `uname -s`.
+The producer and checker share the v1 format in
+`scripts/dev/toolchain-probe-format.sh`. The header carries the hostname
+(letters, digits, dots, hyphens, and underscores), the kernel name from
+`uname -s`, and a UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` format. Recognized
+kernel names are `Linux`, `Darwin`, `FreeBSD`, `NetBSD`, `OpenBSD`, `DragonFly`,
+`SunOS`, `AIX`, and the versioned Windows names beginning with `MINGW32_NT-`,
+`MINGW64_NT-`, `MSYS_NT-`, or `CYGWIN_NT-`. The pasted block is
+**unauthenticated**. Anyone can forge it. The checker catches claims with
+missing or contradictory evidence.
 
-`scripts/ci/check-toolchain-claims.sh` requires a `toolchain-probe v1`
-header with nonempty `host=`, `os=`, and `date=` fields from
-`scripts/dev/toolchain-probe.sh`. Probe rows are exempt from claim checking
-only inside a valid header block (`after_header=1`), inside the same fence
-after the header or in consecutive nonblank lines after an unfenced header;
-outside a header block, probe-shaped lines are checked as prose. Inside a
-header block, `scripts/ci/check-toolchain-claims.sh` accepts the stdout shapes
-printed by `scripts/dev/toolchain-probe.sh`: a `found` row with a path and
-optional version text, an `absent` row ending after `searched=<token>` (or
-`searched=none os=<token>` for `metal` on non-Darwin hosts, with no trailing
-text), and the `x86_64-w64-mingw32-gcc` detail rows (`dumpversion`,
-`thread-model`, `runtime`, `runtime-unresolved`, and `pairing*`). It checks
+Probe rows count as evidence after a valid header in the same fence, or on
+consecutive nonblank lines after an unfenced header. A `found` row carries a
+path and optional version text. An `absent` row ends with one `searched=`
+field. The producer percent-encodes ASCII whitespace and the percent sign, so
+`/tmp/oneAPI SDK%20` becomes `/tmp/oneAPI%20SDK%2520`. The non-Darwin Metal
+row ends with `searched=none os=<kernel>`. MinGW detail rows (`dumpversion`,
+`thread-model`, `runtime`, `runtime-unresolved`, and `pairing*`) describe the
+cross compiler. The checker skips valid probe rows inside a block and checks
 claims in ordinary fenced text, blockquotes, same-line backtick spans such as
 `` ```nvcc``` `` (not a fence opener under CommonMark because the info string
 contains a backtick), and prose mixed into probe output.
@@ -349,7 +352,7 @@ claimed tools only from the clause carrying the claim. It recognizes `no <tool>`
 `(lacks|lacking) <tool>` (with an optional article), and
 `<tool> (is|are|was|were)? <status>`, where `<status>` can be `not installed`,
 `not found`, `not available`, `missing`, `unavailable`, or `absent`. It also
-recognizes `without <tool>` when the clause names this host (`on this host`,
+recognizes `without <tool>` with a nearby host qualifier (`on this host`,
 `this host`, `on the host`, `here`, or `locally`), and compilation claims when
 a tool or backend appears in the same clause as `not compiled`,
 `did not compile`, `did not build`, `(was|were) not built`, or
@@ -360,27 +363,40 @@ claims: every probe name below plus `cuda`, `cuda toolkit`, `sycl`, `oneapi`,
 word, so `tidy-metal` does not match `metal` while `x86_64-w64-mingw32-gcc`
 matches as one name.
 
-A `no <tool>` phrase counts as an absence claim unless it is a change-scope
-phrase (`p_no_scope` in `scripts/ci/check-toolchain-claims.sh`) in one of two
-shapes: `no <tool>` followed directly or after one word by `change`, `changes`,
-`changed`, `edit`, `edits`, `edited`, `touched`, or `modified` (for example,
-`This PR has no SYCL changes.` or `no nvcc flags changed`), or `no <tool>`
-directly preceded by `touch`, `touches`, `touched`, `change`, `changes`,
-`changed`, `edit`, `edits`, `edited`, `modify`, `modifies`, or `modified` (for
-example, `Touches no CUDA code.`). Each change-scope match is stripped from the
-clause before classification and tool lookup; any other `no <tool>` sentence,
-including a second unscoped `no <tool>` in the same clause, still needs the
-`toolchain-probe v1` block.
+A `no <tool>` phrase counts as an absence claim unless it matches a change
+description. In `no <tool> [objects] changed`, the verb can be `change`,
+`changes`, `changed`, `edit`, `edits`, `edited`, `touched`, or `modified`.
+Zero to three change objects may intervene. The checker's `change_objects`
+list allows `build`, `flag`, `flags`, `option`, `options`, `code`, `source`,
+`sources`, `file`, `files`, `path`, `paths`, `kernel`, `kernels`, `backend`,
+`test`, `tests`, `config`, `setting`, `settings`, `dependency`, and
+`dependencies`. For example, `no CUDA build flag changes` describes a change.
+`Having no nvcc installed changed our build plan` still claims absence.
+A change verb immediately before `no <tool>` also qualifies (`touch`,
+`touches`, `touched`, `change`, `changes`, `changed`, `edit`, `edits`, `edited`,
+`modify`, `modifies`, or `modified`).
 
-Both absence and compilation claims require probe results from
-`scripts/dev/toolchain-probe.sh`. An absence claim is a host claim unless the
-clause or line names a `CI`, `runner`, `image`, `container`, or `golden-build`
-(`golden build`) scope without naming this host (`on this host`, `this host`,
-`on the host`, `here`, or `locally`). A compilation claim is a host claim only
-when its clause names this host. A `found` row contradicts host claims only;
-for example, `scripts/ci/check-toolchain-claims.sh` accepts `nvcc found` as
-evidence for a CI runner or CPU-only build line that did not compile CUDA and
-does not name this host.
+The checker strips up to 32 change-scope matches per clause before checking
+the remaining text. A second, unscoped mention of the same tool still needs
+evidence. If a 33rd change-scope match remains, the checker uses the original
+clause for evidence checking.
+
+For absence claims, a runner, image, container, CI, or golden-build subject
+directly before `has no`, `have no`, or `lacks` takes precedence. For example,
+`I verified locally that the CI runner has no nvcc` describes the runner.
+The subjects `this host`, `the host`, `this machine`, and `my machine` bind
+the same verbs to the host. A host qualifier in the absence phrase or within
+the four words on either side also identifies a host claim. Other absence
+claims default to the host unless the clause names a non-host scope.
+Compilation claims require host agreement only when their clause names the
+host.
+
+Each claim needs **one probe block covering every tool it names**. For a host
+claim, one covering block must also report all those tools absent. For a CI
+claim, a found compiler can still supply evidence. When no block covers all
+tools, the error lists the missing results from the closest block (the first
+in a tie). When every covering block contradicts the claim, the error names
+the tools found in the first covering block.
 
 `scripts/ci/check-toolchain-claims.sh` uses `toolchain_map` for both required
 results and contradictions. Explicit compiler names take precedence over

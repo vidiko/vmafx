@@ -33,6 +33,9 @@
 
 set -euo pipefail
 
+# shellcheck source=scripts/dev/toolchain-probe-format.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/toolchain-probe-format.sh"
+
 oneapi_prefix_arg=""
 
 while [ $# -gt 0 ]; do
@@ -71,7 +74,7 @@ ONEAPI_PREFIX="${oneapi_prefix_arg:-${ONEAPI_PREFIX:-}}"
 host_name="$(uname -n)"
 os_name="$(uname -s)"
 now_utc="$(date -u +%FT%TZ)"
-printf "toolchain-probe v1 host=%s os=%s date=%s\n" "$host_name" "$os_name" "$now_utc"
+probe_header_row "$host_name" "$os_name" "$now_utc"
 
 # Safe first-line extractor avoiding SIGPIPE under set -e / pipefail
 get_cmd_version() {
@@ -141,30 +144,28 @@ probe_oneapi_tool() {
   local searched_desc="PATH"
   local -a candidates=()
   if [ -z "${ONEAPI_PREFIX:-}" ] && p="$(command -v "$tool")"; then
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$(get_cmd_version "$p" --version)"
+    probe_found_row "$tool" "$p" "$(get_cmd_version "$p" --version)"
     return 0
   fi
   while IFS= read -r sv || [ -n "$sv" ]; do
     candidates+=("$sv")
   done < <(oneapi_setvars_candidates)
   local -i idx=0
-  if [ "${#candidates[@]}" -gt 0 ]; then
-    for sv in "${candidates[@]}"; do
-      idx=$((idx + 1))
-      if [ "$idx" -gt 50 ]; then break; fi
-      searched_desc="${searched_desc},$(dirname "$sv")"
-      if p="$(oneapi_tool_from_setvars "$sv" "$tool")" && [ -x "$p" ]; then
-        printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" \
-          "$(get_cmd_version oneapi_run_with_setvars "$sv" "$p" --version)"
-        return 0
-      fi
-    done
-  fi
+  for sv in ${candidates[@]+"${candidates[@]}"}; do
+    idx=$((idx + 1))
+    if [ "$idx" -gt 50 ]; then break; fi
+    searched_desc="${searched_desc},$(dirname "$sv")"
+    if p="$(oneapi_tool_from_setvars "$sv" "$tool")" && [ -x "$p" ]; then
+      probe_found_row "$tool" "$p" \
+        "$(get_cmd_version oneapi_run_with_setvars "$sv" "$p" --version)"
+      return 0
+    fi
+  done
   if [ -z "${ONEAPI_PREFIX:-}" ]; then
     local bin
     for bin in /opt/intel/oneapi/compiler/*/bin/"$tool" /opt/intel/oneapi-*/compiler/*/bin/"$tool"; do
       if [ -x "$bin" ]; then
-        printf "toolchain-probe: %s found %s %s\n" "$tool" "$bin" "$(get_cmd_version "$bin" --version)"
+        probe_found_row "$tool" "$bin" "$(get_cmd_version "$bin" --version)"
         return 0
       fi
     done
@@ -172,7 +173,7 @@ probe_oneapi_tool() {
   else
     searched_desc="${ONEAPI_PREFIX}"
   fi
-  printf "toolchain-probe: %s absent searched=%s\n" "$tool" "$searched_desc"
+  probe_absent_row "$tool" "$searched_desc"
 }
 
 # Runs a command with one setvars.sh sourced (icpx needs its environment to
@@ -195,7 +196,7 @@ probe_nvcc() {
     local p v
     p="$(command -v "$tool")"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
 
@@ -203,7 +204,7 @@ probe_nvcc() {
     local p v
     p="${CUDA_PATH}/bin/${tool}"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
 
@@ -214,7 +215,7 @@ probe_nvcc() {
     if [ -x "$bin" ]; then
       local v
       v="$(get_cmd_version "$bin" --version)"
-      printf "toolchain-probe: %s found %s %s\n" "$tool" "$bin" "$v"
+      probe_found_row "$tool" "$bin" "$v"
       return 0
     fi
   done
@@ -224,7 +225,7 @@ probe_nvcc() {
     searched="${searched},${CUDA_PATH}"
   fi
   searched="${searched},/opt/cuda,/usr/local/cuda"
-  printf "toolchain-probe: %s absent searched=%s\n" "$tool" "$searched"
+  probe_absent_row "$tool" "$searched"
 }
 
 probe_hipcc() {
@@ -233,7 +234,7 @@ probe_hipcc() {
     local p v
     p="$(command -v "$tool")"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
 
@@ -241,7 +242,7 @@ probe_hipcc() {
     local p v
     p="${ROCM_PATH}/bin/${tool}"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
 
@@ -252,7 +253,7 @@ probe_hipcc() {
     if [ -x "$bin" ]; then
       local v
       v="$(get_cmd_version "$bin" --version)"
-      printf "toolchain-probe: %s found %s %s\n" "$tool" "$bin" "$v"
+      probe_found_row "$tool" "$bin" "$v"
       return 0
     fi
   done
@@ -262,7 +263,7 @@ probe_hipcc() {
     searched="${searched},${ROCM_PATH}"
   fi
   searched="${searched},/opt/rocm"
-  printf "toolchain-probe: %s absent searched=%s\n" "$tool" "$searched"
+  probe_absent_row "$tool" "$searched"
 }
 
 probe_vulkan_tool() {
@@ -271,7 +272,7 @@ probe_vulkan_tool() {
     local p v
     p="$(command -v "$tool")"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
 
@@ -279,7 +280,7 @@ probe_vulkan_tool() {
     local p v
     p="${VULKAN_SDK}/bin/${tool}"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
 
@@ -287,12 +288,12 @@ probe_vulkan_tool() {
   if [ -n "${VULKAN_SDK:-}" ]; then
     searched="${searched},${VULKAN_SDK}/bin"
   fi
-  printf "toolchain-probe: %s absent searched=%s\n" "$tool" "$searched"
+  probe_absent_row "$tool" "$searched"
 }
 
 probe_metal() {
   if [ "${os_name}" != "Darwin" ]; then
-    printf "toolchain-probe: metal absent searched=none os=%s\n" "${os_name}"
+    probe_metal_os_row "${os_name}"
     return 0
   fi
   local tool="metal"
@@ -301,23 +302,23 @@ probe_metal() {
       local p v
       p="$(xcrun -sdk macosx --find metal 2>/dev/null || echo "xcrun metal")"
       v="$(get_cmd_version xcrun -sdk macosx metal --version)"
-      printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+      probe_found_row "$tool" "$p" "$v"
       return 0
     elif xcrun metal --version >/dev/null 2>&1; then
       local p v
       p="$(xcrun --find metal 2>/dev/null || echo "xcrun metal")"
       v="$(get_cmd_version xcrun metal --version)"
-      printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+      probe_found_row "$tool" "$p" "$v"
       return 0
     fi
   elif command -v metal >/dev/null 2>&1; then
     local p v
     p="$(command -v metal)"
     v="$(get_cmd_version "$p" --version)"
-    printf "toolchain-probe: %s found %s %s\n" "$tool" "$p" "$v"
+    probe_found_row "$tool" "$p" "$v"
     return 0
   fi
-  printf "toolchain-probe: %s absent searched=xcrun,PATH\n" "$tool"
+  probe_absent_row "$tool" xcrun,PATH
 }
 
 # ---------------------------------------------------------------------------
@@ -481,11 +482,11 @@ probe_mingw_cross() {
     p=""
   fi
   if [ -z "${p}" ]; then
-    printf "toolchain-probe: %s absent searched=%s\n" "${driver}" "${searched}"
+    probe_absent_row "${driver}" "${searched}"
     return 0
   fi
 
-  printf "toolchain-probe: %s found %s %s\n" \
+  probe_found_row \
     "${driver}" "${p}" "$(get_cmd_version "${p}" --version)"
   printf "toolchain-probe: %s dumpversion %s\n" \
     "${driver}" "$(get_cmd_version "${p}" -dumpversion)"

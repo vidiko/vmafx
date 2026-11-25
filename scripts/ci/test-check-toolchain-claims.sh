@@ -37,15 +37,16 @@ pass_count=0
 fail_count=0
 
 expect_gate_exit() {
-  local name="$1" expected="$2" body_file="$3"
+  local name="$1" expected="$2" body_file="$3" message="${4:-}" forbidden="${5:-}"
   local out exit_code=0
 
   out="$(PR_BODY="$(cat "${body_file}")" "${gate}" 2>&1)" || exit_code=$?
-  if [ "${exit_code}" -eq "${expected}" ]; then
+  if [[ "${exit_code}" -eq "${expected}" && "${out}" == *"${message}"* &&
+    (-z "${forbidden}" || "${out}" != *"${forbidden}"*) ]]; then
     echo "PASS: ${name} via PR_BODY (exit=${exit_code})"
     pass_count=$((pass_count + 1))
   else
-    echo "FAIL: ${name} via PR_BODY (got exit=${exit_code}, expected ${expected})"
+    echo "FAIL: ${name} via PR_BODY (got exit=${exit_code}, expected ${expected}${message:+ and message: ${message}})"
     echo "----- captured output -----"
     printf '%s\n' "${out}"
     echo "---------------------------"
@@ -55,11 +56,12 @@ expect_gate_exit() {
   # Also test stdin pipe
   local out_stdin exit_code_stdin=0
   out_stdin="$(env -u PR_BODY "${gate}" <"${body_file}" 2>&1)" || exit_code_stdin=$?
-  if [ "${exit_code_stdin}" -eq "${expected}" ]; then
+  if [[ "${exit_code_stdin}" -eq "${expected}" && "${out_stdin}" == *"${message}"* &&
+    (-z "${forbidden}" || "${out_stdin}" != *"${forbidden}"*) ]]; then
     echo "PASS: ${name} via stdin (exit=${exit_code_stdin})"
     pass_count=$((pass_count + 1))
   else
-    echo "FAIL: ${name} via stdin (got exit=${exit_code_stdin}, expected ${expected})"
+    echo "FAIL: ${name} via stdin (got exit=${exit_code_stdin}, expected ${expected}${message:+ and message: ${message}})"
     echo "----- captured output -----"
     printf '%s\n' "${out_stdin}"
     echo "---------------------------"
@@ -380,7 +382,7 @@ expect_gate_exit "positive: claim naming nvcc and hipcc with full probe -> exit 
 expect_body() {
   local name="$1" expected="$2" body="$3"
   printf '%s' "${body}" >"${work}/inline-body.md"
-  expect_gate_exit "${name}" "${expected}" "${work}/inline-body.md"
+  expect_gate_exit "${name}" "${expected}" "${work}/inline-body.md" "${4:-}" "${5:-}"
 }
 
 # Only strict probe lines can be exempt, even in a fence with a header.
@@ -618,6 +620,113 @@ done
 expect_body "scope boundary: 32 scoped matches in one clause pass" 0 "${scope_32}"
 expect_body "scope boundary: 33 scoped matches exceed cap and fail closed" 1 \
   "${scope_32}, no SYCL changes"
+
+# Round 3: evidence belongs to one invocation and host scope to one absence.
+expect_body "availability before changed" 1 'Having no nvcc installed changed our build plan.'
+expect_body "two change objects" 0 'This PR has no CUDA build flag changes.'
+expect_body "compiler with two change objects" 0 'no nvcc build flag changes were made'
+expect_body "three change objects" 0 'no nvcc build config files changed'
+expect_body "four change objects" 1 'no nvcc build config source files changed'
+expect_body "same tool scoped and absent" 1 'no CUDA changes; no nvcc on this host'
+expect_body "same tool scoped and absent in one clause" 1 'no CUDA changes and no nvcc on this host'
+expect_body "header rejects invalid date" 1 "No nvcc on this host.
+${header/date=*/date=banana}
+${absent_nvcc}"
+expect_body "header rejects invalid OS" 1 "No nvcc on this host.
+${header/os=Linux/os=banana}
+${absent_nvcc}"
+expect_body "header rejects invalid hostname" 1 "No nvcc on this host.
+${header/test-box/test@box}
+${absent_nvcc}"
+expect_body "real producer header and rows" 0 "No icpx on this host.
+${probe_empty_out}"
+
+header_b="${header/test-box/host-b}"
+absent_hipcc='toolchain-probe: hipcc absent searched=PATH'
+found_hipcc='toolchain-probe: hipcc found /opt/rocm/bin/hipcc'
+two_tools='No nvcc or hipcc on this host.'
+expect_body "split blocks lack joint coverage" 1 "${two_tools}
+${header}
+${absent_nvcc}
+${header_b}
+${absent_hipcc}" "missing probe results for claimed toolchains: hipcc"
+expect_body "coordinated absences require one block" 1 "No nvcc and no hipcc on this host.
+${header}
+${absent_nvcc}
+${header_b}
+${absent_hipcc}" "missing probe results for claimed toolchains: hipcc"
+expect_body "closest block determines missing results" 1 "No nvcc or hipcc or icpx on this host.
+${header}
+${absent_nvcc}
+${header_b}
+${absent_hipcc}
+toolchain-probe: icpx absent searched=PATH" "missing probe results for claimed toolchains: nvcc"
+expect_body "invalid header ends previous block" 1 "${two_tools}
+${header}
+${absent_nvcc}
+${header_b/date=*/date=banana}
+${absent_hipcc}" "missing probe results for claimed toolchains: hipcc"
+expect_body "single block covers both tools" 0 "${two_tools}
+${header}
+${absent_nvcc}
+${absent_hipcc}"
+expect_body "second covering block agrees" 0 "No nvcc on this host.
+${header}
+${found_nvcc}
+${header_b}
+${absent_nvcc}"
+expect_body "every covering block contradicts" 1 "No nvcc on this host.
+${header}
+${found_nvcc}
+${header_b}
+${found_nvcc}" "claims 'nvcc' is missing"
+expect_body "mixed result contradicts a host claim" 1 "${two_tools}
+${header}
+${absent_nvcc}
+${found_hipcc}"
+
+spaced_prefix="${work}/oneAPI SDK%20"
+spaced_out="$(ONEAPI_PREFIX="${spaced_prefix}" "${probe}")"
+expect_body "encoded producer prefix covers icpx" 0 "No icpx on this host.
+${spaced_out}"
+if [[ "${spaced_out}" == *"icpx absent searched=${work}/oneAPI%20SDK%2520"* ]]; then
+  echo "PASS: space and percent are encoded independently"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: space and percent are encoded independently"
+  fail_count=$((fail_count + 1))
+fi
+
+expect_body "local verification of CI subject" 0 "I verified locally that the CI runner has no nvcc.
+${header}
+${found_nvcc}"
+expect_body "missing here is a host claim" 1 "nvcc is missing here
+${header}
+${found_nvcc}"
+expect_body "four-word window includes locally" 1 "CI notes: locally we still see no nvcc
+${header}
+${found_nvcc}"
+expect_body "five-word window excludes locally" 0 "CI notes: locally we can still see no nvcc
+${header}
+${found_nvcc}"
+expect_body "machine subject binds lacks" 1 "In the CI notes my machine lacks nvcc.
+${header}
+${found_nvcc}"
+mixed_body="the CI image has no nvcc, but this host has no hipcc
+${header}
+${found_nvcc}
+${found_hipcc}"
+expect_body "mixed subject contradiction names only hipcc" 1 "${mixed_body}" "claims 'hipcc' is missing" "claims 'nvcc"
+
+syntax_rc=0
+grep -En '((declare|local)[[:space:]]+-A|mapfile|readarray|,,}|\^\^}|declare[[:space:]]+-n)' "${gate}" || syntax_rc=$?
+if [ "${syntax_rc}" -eq 1 ]; then
+  echo "PASS: Bash 3.2 checker syntax contract"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: Bash 3.2 checker syntax contract (grep rc=${syntax_rc})"
+  fail_count=$((fail_count + 1))
+fi
 
 probe_os="$(uname -s)"
 if [[ "${probe_os}" != Darwin ]]; then
