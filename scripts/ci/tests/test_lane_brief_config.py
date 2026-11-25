@@ -396,8 +396,8 @@ class LaneBriefReplayTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_planted_fix_brief_passes_without_the_markdownlint_clause(self) -> None:
-        # Mutation: drop the markdownlint clause and the mypy-only fix brief launches
-        # again, so the refusal above comes from this file and not from the reader alone.
+        # The brief omits only the Markdownlint clause. Dropping it from the config
+        # lets the brief launch again, showing the reader needs this file to refuse it.
         data = load_config()
         data["required_by_stage"]["fix"].remove(FIX_CLAUSES[1])
         mutant = self.worktree(yaml.safe_dump(data, sort_keys=True))
