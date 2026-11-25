@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
 from unittest import mock
@@ -253,19 +253,78 @@ def ci_text_paths(root: Path) -> list[Path]:
     return sorted(paths)
 
 
-def _logical_ci_lines(
-    text: str, *, blank_after_escape: bool = False
+def _bash_line_end(raw: str, quote: str, word_start: bool) -> tuple[str, bool, bool]:
+    """Return open quote, word boundary and pending escape after one physical line."""
+    chars = iter(raw)
+    for char in chars:
+        if char == "\\" and quote != "'":
+            if next(chars, None) is None:
+                return quote, word_start, True
+            word_start = False
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char == "#" and word_start:
+            return "", True, False
+        elif char in "\"'":
+            quote = char
+            word_start = False
+        else:
+            word_start = char in " \t;&|()<>"
+    return quote, word_start, False
+
+
+def _bash_logical_lines(
+    lines: list[tuple[int, str]], final_newline: bool, *, carry_quotes: bool
 ) -> list[tuple[int, str, bool]]:
-    """Remove Bash backslash-newline pairs. BuildKit accepts trailing blanks and joins with LF."""
+    logical: list[tuple[int, str, bool]] = []
+    parts: list[str] = []
+    quote, word_start = "", True
+    for index, (number, raw) in enumerate(lines):
+        if not parts:
+            start = number
+        quote, word_start, escaped = _bash_line_end(raw, quote, word_start)
+        if not carry_quotes:
+            quote = ""
+        last = index + 1 == len(lines)
+        newline = not last or final_newline
+        overflow = number - start >= MAX_CONTINUATION_LINES
+        if not overflow:
+            if escaped and newline:
+                parts.append(raw[:-1])
+            elif quote and newline:
+                parts.append(raw + "\n")
+            else:
+                parts.append(raw)
+        if last or not (escaped or quote):
+            logical.append((start, "".join(parts), overflow))
+            parts.clear()
+            word_start = True
+    return logical
+
+
+def _logical_ci_lines(
+    text: str, *, blank_after_escape: bool = False, carry_quotes: bool = True
+) -> list[tuple[int, str, bool]]:
+    """Join shell physical lines using the Bash or BuildKit continuation rules."""
     return _join_continued_lines(
-        list(enumerate(text.splitlines(), 1)), blank_after_escape=blank_after_escape
+        list(enumerate(text.splitlines(), 1)),
+        blank_after_escape=blank_after_escape,
+        carry_quotes=carry_quotes,
+        final_newline=text.endswith(("\n", "\r")),
     )
 
 
 def _join_continued_lines(
-    lines: list[tuple[int, str]], *, blank_after_escape: bool
+    lines: list[tuple[int, str]],
+    *,
+    blank_after_escape: bool,
+    final_newline: bool = True,
+    carry_quotes: bool = True,
 ) -> list[tuple[int, str, bool]]:
     """Join numbered lines, bounding storage by their original physical span."""
+    if not blank_after_escape:
+        return _bash_logical_lines(lines, final_newline, carry_quotes=carry_quotes)
     logical: list[tuple[int, str, bool]] = []
     separator = "\n" if blank_after_escape else ""
     parts: list[str] = []
@@ -336,12 +395,16 @@ def _is_operator_token(token: str) -> bool:
     return bool(token) and set(token) <= SHELL_OPERATOR_CHARS
 
 
-def _tokenise_shell_item(text: str) -> list[str]:
+def _iter_shell_tokens(text: str) -> Iterator[str]:
     """Tokenise one logical shell line or nested command string with shlex."""
     lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = "#"
-    return list(lexer)
+    yield from lexer
+
+
+def _tokenise_shell_item(text: str) -> list[str]:
+    return list(_iter_shell_tokens(text))
 
 
 def coverage_shard_argv_problem(step: str, index: int) -> str | None:
@@ -830,14 +893,17 @@ def _hosted_yaml_run_problems(path: Path, text: str) -> list[str]:
 
 
 def apt_update_problems(path: Path, text: str) -> list[str]:
-    """Reject unsafe apt refreshes, folded hosted `run` blocks, and hosted sudo refreshes."""
+    """Reject unsafe apt refreshes, folded hosted `run` blocks, and hosted sudo refreshes.
+
+    Whole-file scans do not track quotes across lines because the file is not Bash throughout.
+    """
     problems: list[str] = []
     hosted_surface = _is_hosted_workflow_or_action(path)
     container_file = _is_containerfile_path(path)
     if hosted_surface:
         problems.extend(_hosted_yaml_run_problems(path, text))
     for line_number, logical_line, overflowed in _logical_ci_lines(
-        text, blank_after_escape=container_file
+        text, blank_after_escape=container_file, carry_quotes=False
     ):
         if overflowed:
             problems.append(f"{path.as_posix()}:{line_number}: {APT_CONTINUATION_MESSAGE}")
@@ -1923,6 +1989,58 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
         for label, path, text, expected in cases:
             with self.subTest(label=label):
                 self.assertEqual(apt_update_problems(path, text), expected)
+
+    def test_logical_ci_lines_bash_quotes_comments_and_escapes(self) -> None:
+        for raw in ("echo # \\", "echo;# \\", "echo c\\\\", r"echo \'", r"echo \""):
+            self.assertEqual(
+                _logical_ci_lines(raw + "\nnext"), [(1, raw, False), (2, "next", False)]
+            )
+        for raw, expected in (
+            ("echo a#b\\\nc", "echo a#bc"),
+            ("echo a\\ #b\\\nc", "echo a\\ #bc"),
+            ("echo a\\\n#b\\\nc", "echo a#bc"),
+            ("echo 'x\\\ny'", "echo 'x\\\ny'"),
+            ('echo "x\\\ny"', 'echo "xy"'),
+            ('echo "x\\\\\ny"', 'echo "x\\\\\ny"'),
+            ("echo 'x\ny", "echo 'x\ny"),
+        ):
+            self.assertEqual(_logical_ci_lines(raw), [(1, expected, False)])
+        self.assertEqual(
+            apt_update_problems(Path("s.sh"), "true # ignored \\\napt-get update"),
+            [f"s.sh:2: {APT_UPDATE_MESSAGE}"],
+        )
+
+    def test_logical_ci_lines_with_line_scoped_quotes(self) -> None:
+        for first, second in (
+            ("echo 'x\\", "y'"),
+            ("# don't \\", "apt-get update"),
+            (r"echo c\\", "d"),
+        ):
+            with self.subTest(first=first):
+                self.assertEqual(
+                    _logical_ci_lines(first + "\n" + second, carry_quotes=False),
+                    [(1, first, False), (2, second, False)],
+                )
+        for text, joined in (
+            ('echo "a \\\nb"', 'echo "a b"'),
+            ("echo a\\\n#b\\\nc", "echo a#bc"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_logical_ci_lines(text, carry_quotes=False), [(1, joined, False)])
+
+    def test_logical_ci_lines_open_quote_overflow_by_mode(self) -> None:
+        text = "owner's note\n" + "plain\n" * 300
+        lines = _logical_ci_lines(text, carry_quotes=False)
+        self.assertEqual(len(lines), 301)
+        self.assertFalse(any(overflow for _, _, overflow in lines))
+        [(start, _, overflow)] = _logical_ci_lines(text)
+        self.assertEqual(start, 1)
+        self.assertTrue(overflow)
+
+    def test_yaml_prose_apostrophe_preserves_refresh_line(self) -> None:
+        path = Path("notes.yaml")
+        text = "description: author's note\nsetup: |\n  apt-get update\n"
+        self.assertEqual(apt_update_problems(path, text), [f"notes.yaml:3: {APT_UPDATE_MESSAGE}"])
 
     def test_logical_ci_lines_continuation_requires_adjacent_newline(self) -> None:
         """Join bash `\\`+newline continuations, not `\\` followed by spaces or tabs."""
