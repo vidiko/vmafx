@@ -830,7 +830,8 @@ def scratch_scripts() -> list[str]:
     return found
 
 
-# No git process may start background work in the sentinel: see make_sentinel().
+# No git process may start background work in the sentinel or the caller fixtures:
+# see make_sentinel() and commit_caller_baseline().
 SENTINEL_CONFIG = (("maintenance.auto", "false"), ("gc.auto", "0"))
 BACKGROUND_WORK = re.compile(r"run_command: git (?:maintenance run|gc --auto)")
 
@@ -884,6 +885,20 @@ def make_sentinel(root: Path) -> Path:
         environment=clean,
     )  # fmt: skip
     return sentinel
+
+
+def commit_caller_baseline(repository: Path, user_name: str, message: str) -> None:
+    """Initialise a caller fixture repository with background maintenance disabled."""
+    repository.mkdir(exist_ok=True)
+    clean = clean_git_environment()
+    run_git(repository, "init", "-q", "-b", "master", environment=clean)
+    for key, value in SENTINEL_CONFIG:
+        run_git(repository, "config", key, value, environment=clean)
+    run_git(repository, "config", "user.name", user_name, environment=clean)
+    run_git(repository, "config", "user.email", "fixture@example.invalid", environment=clean)
+    (repository / "tracked").write_text("committed caller work\n")
+    run_git(repository, "add", "tracked", environment=clean)
+    run_git(repository, "commit", "-qm", message, environment=clean)
 
 
 def declared_failure_report(stderr: str, returncode: int, declared: frozenset[str]) -> str:
@@ -1066,19 +1081,10 @@ class GitFixtureIsolation(unittest.TestCase):
             temporary.mkdir()
             # Even the adversarial test's setup must never inherit a real
             # caller's repository, index, object store or config overrides.
+            commit_caller_baseline(caller, "Isolation Test", "test: caller baseline")
             clean = clean_git_environment()
-
-            def git(*args: str) -> None:
-                run_git(caller, *args, environment=clean)
-
-            git("init", "-q", "-b", "master")
-            git("config", "user.name", "Isolation Test")
-            git("config", "user.email", "fixture@example.invalid")
-            (caller / "tracked").write_text("committed caller work\n")
-            git("add", "tracked")
-            git("commit", "-qm", "test: caller baseline")
             (caller / "staged").write_text("unique staged caller work\n")
-            git("add", "staged")
+            run_git(caller, "add", "staged", environment=clean)
             (caller / "tracked").write_text("unique unstaged caller work\n")
             poison = {
                 "GIT_DIR": str(caller / ".git"),
@@ -1149,14 +1155,8 @@ class GitFixtureIsolation(unittest.TestCase):
                 caller = root / "caller"
                 linked = root / "linked"
                 caller.mkdir()
+                commit_caller_baseline(caller, "Linked Hook Test", "test: linked hook baseline")
                 git = partial(run_git, environment=clean_git_environment())
-
-                git(caller, "init", "-q", "-b", "master")
-                git(caller, "config", "user.name", "Linked Hook Test")
-                git(caller, "config", "user.email", "fixture@example.invalid")
-                (caller / "tracked").write_text("committed caller work\n")
-                git(caller, "add", "tracked")
-                git(caller, "commit", "-qm", "test: linked hook baseline")
                 git(caller, "worktree", "add", "-q", "-b", "linked", str(linked))
                 for path in (caller, linked):
                     (path / "staged").write_text("unique staged work\n")
@@ -1363,6 +1363,26 @@ class GitFixtureIsolation(unittest.TestCase):
             self.assertFalse(commit_starts_background_work(sentinel))
             # Two snapshots with nothing in between are equal: no lock file comes or goes.
             self.assertEqual(snapshot(sentinel), snapshot(sentinel))
+
+    def test_the_caller_baseline_starts_no_background_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="git-caller-maintenance-") as directory:
+            root = Path(directory)
+            clean = clean_git_environment()
+            plain = root / "plain"
+            plain.mkdir()
+            run_git(plain, "init", "-q", "-b", "master", environment=clean)
+            self.assertTrue(commit_starts_background_work(plain))
+            caller = root / "caller"
+            caller.mkdir()
+            commit_caller_baseline(caller, "Caller Baseline Test", "test: caller baseline")
+            self.assertIs(commit_starts_background_work(caller), False)
+            self.assertEqual(snapshot(caller), snapshot(caller))
+            maintenance = run_git(
+                caller, "config", "--local", "--get", "maintenance.auto", environment=clean
+            )
+            gc_auto = run_git(caller, "config", "--local", "--get", "gc.auto", environment=clean)
+            self.assertEqual(maintenance.stdout, "false\n")
+            self.assertEqual(gc_auto.stdout, "0\n")
 
     def test_the_fixture_helper_starts_no_background_maintenance(self) -> None:
         # A detached repack deleted the loose objects of a scratch repository while
