@@ -156,7 +156,7 @@ jobs:
         with:
           phase: get
           names: src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
-      - name: Save Netflix vmaf_resource fixtures
+      - name: Finish provisioning Netflix fixtures
         if: steps.impact.outputs.mode == 'full' || steps.impact.outputs.c_core == 'true' || steps.impact.outputs.actions == 'true'
         uses: ./.github/actions/netflix-fixtures
         with:

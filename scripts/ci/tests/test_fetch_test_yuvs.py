@@ -83,6 +83,18 @@ def fetch(
 
 @unittest.skipIf(BASH is None or shutil.which("md5sum") is None, "needs bash and md5sum")
 class FetchTestYuvs(unittest.TestCase):
+    def test_list_paths_matches_the_manifest(self) -> None:
+        manifest = run_bash("-c", 'source "$1"; select_fixtures', "manifest", str(SCRIPT))
+        self.assertEqual(manifest.returncode, 0, manifest.stderr)
+        paths = [
+            f"python/test/resource/yuv/{line.split()[0]}" for line in manifest.stdout.splitlines()
+        ]
+        self.assertTrue(paths)
+        listed = run_bash(str(SCRIPT), "--list-paths")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.splitlines(), paths)
+        self.assertEqual(run_bash(str(SCRIPT), "--list-paths", "extra").returncode, 2)
+
     def test_a_504_before_200_is_outlasted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, StandIn([504], bodies=BODIES) as server:
             done = fetch(server, Path(tmp))
@@ -521,6 +533,14 @@ def _unit_suite_gets_the_pair(workflow: str) -> bool:
     return -1 < fetch < suite < required < next_step
 
 
+def _calls_fixture_script(run: str, directory: str) -> bool:
+    if "scripts/test/fetch-test-yuvs.sh" in run:
+        return True
+    return PurePosixPath(directory) == PurePosixPath("scripts/test") and bool(
+        re.search(r"""(?:^|[\s'"])(?:\./)?fetch-test-yuvs\.sh(?:$|[\s'"])""", run)
+    )
+
+
 def _direct_fixture_steps(text: str) -> list[str]:
     """Find steps that bypass the local fixture actions."""
     document = yaml.safe_load(text)
@@ -529,7 +549,7 @@ def _direct_fixture_steps(text: str) -> list[str]:
     for container in containers:
         for step in container.get("steps", []):
             name = step.get("name", "<unnamed step>")
-            if "scripts/test/fetch-test-yuvs.sh" in str(step.get("run", "")):
+            if _calls_fixture_script(str(step.get("run", "")), step.get("working-directory", "")):
                 violations.append(f"{name}: calls the fixture script directly")
             if not re.match(r"^actions/cache(?:/(?:restore|save))?@", step.get("uses", "")):
                 continue
@@ -551,6 +571,41 @@ class NetflixFixtureActionContract(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(_direct_fixture_steps(path.read_text(encoding="utf-8")), [])
 
+    def test_callers_provision_before_tests_and_only_tox_saves_resources(self) -> None:
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            jobs = yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
+            for job, definition in jobs.items():
+                steps = definition.get("steps", [])
+                calls = [
+                    i
+                    for i, step in enumerate(steps)
+                    if step.get("uses") == "./.github/actions/netflix-fixtures"
+                ]
+                if not calls:
+                    continue
+                with self.subTest(workflow=path.name, job=job):
+                    get, finish = calls
+                    self.assertEqual([steps[i]["with"]["phase"] for i in calls], ["get", "finish"])
+                    runs = [str(step.get("run", "")) for step in steps]
+                    consumers = (
+                        "run_meson_test.py",
+                        " -m pytest ",
+                        "cargo test --workspace",
+                        "cargo run --example score",
+                        "tox -c python",
+                    )
+                    self.assertFalse(any(token in run for run in runs[:get] for token in consumers))
+                    tox = [i for i, run in enumerate(runs) if "tox -c python" in run]
+                    resource = "true" if tox else "false"
+                    self.assertEqual(
+                        [steps[i]["with"].get("resource", "false") for i in calls],
+                        [resource, resource],
+                    )
+                    if tox:
+                        self.assertGreater(finish, max(tox))
+                    else:
+                        self.assertEqual(finish, get + 1)
+
     def test_the_old_tiny_ai_fetch_is_refused(self) -> None:
         workflow = """\
 jobs:
@@ -563,6 +618,36 @@ jobs:
         self.assertEqual(
             _direct_fixture_steps(workflow),
             ["Fetch the Netflix golden YUV fixtures: calls the fixture script directly"],
+        )
+
+    def test_working_directory_fetch_is_refused(self) -> None:
+        workflow = """\
+jobs:
+  smoke:
+    steps:
+      - name: Fetch clips
+        working-directory: scripts/test
+        run: bash ./fetch-test-yuvs.sh
+"""
+        self.assertEqual(
+            _direct_fixture_steps(workflow), ["Fetch clips: calls the fixture script directly"]
+        )
+        self.assertEqual(_direct_fixture_steps(workflow.replace("scripts/test", "tools")), [])
+
+    def test_combined_cache_with_an_unrelated_key_is_refused(self) -> None:
+        workflow = """\
+jobs:
+  smoke:
+    steps:
+      - name: Cache clips
+        uses: actions/cache@v6
+        with:
+          key: some-other-key
+          path: python/test/resource/yuv
+"""
+        self.assertEqual(
+            _direct_fixture_steps(workflow),
+            ["Cache clips: caches python/test/resource/yuv directly"],
         )
 
     def test_a_direct_fixture_cache_is_refused(self) -> None:
@@ -581,6 +666,107 @@ jobs:
             _direct_fixture_steps(workflow),
             ["Restore the fixtures: caches python/test/resource directly"],
         )
+
+
+class FixtureCachePhases(unittest.TestCase):
+    def setUp(self) -> None:
+        action = ROOT / ".github/actions/netflix-fixtures/action.yml"
+        document = yaml.safe_load(action.read_text(encoding="utf-8"))
+        self.steps = document["runs"]["steps"]
+        self.by_id = {step["id"]: step for step in self.steps if "id" in step}
+        self.saves = [
+            step for step in self.steps if step.get("uses", "").startswith("actions/cache/save@")
+        ]
+        self.assertEqual(len(self.saves), 2)
+        self.assertEqual(document["inputs"]["resource"]["default"], "false")
+
+    def test_canonical_restore_is_exact_and_manifest_scoped(self) -> None:
+        restore = self.by_id["canonical"]
+        self.assertTrue(restore["uses"].startswith("actions/cache/restore@"))
+        self.assertEqual(restore["if"], "inputs.phase == 'get'")
+        self.assertEqual(
+            restore["with"],
+            {
+                "key": "vmaf-fixtures-canonical-v1-${{ hashFiles('scripts/test/fetch-test-yuvs.sh') }}",
+                "path": "${{ steps.manifest.outputs.paths }}",
+            },
+        )
+        self.assertLess(self.steps.index(self.by_id["manifest"]), self.steps.index(restore))
+        self.assertLess(self.steps.index(restore), self.steps.index(self.by_id["fetch"]))
+
+    def test_only_a_verified_full_get_saves_canonical_paths(self) -> None:
+        save = self.saves[0]
+        self.assertEqual(save["with"], self.by_id["canonical"]["with"])
+        self.assertEqual(
+            save["if"],
+            "inputs.phase == 'get' && steps.fetch.outputs.full == 'true' && steps.canonical.outputs.cache-hit != 'true'",
+        )
+        self.assertEqual(self.steps.index(save), self.steps.index(self.by_id["fetch"]) + 1)
+
+    def test_only_opted_in_jobs_save_the_resource_tree_at_finish(self) -> None:
+        restore = self.by_id["resource"]
+        save = self.saves[1]
+        key = "vmaf-fixtures-resource-v2-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}"
+        self.assertTrue(restore["uses"].startswith("actions/cache/restore@"))
+        self.assertEqual(restore["if"], "inputs.phase == 'get' && inputs.resource == 'true'")
+        self.assertEqual(save["with"], {"path": "python/test/resource", "key": key})
+        self.assertEqual(
+            restore["with"], {**save["with"], "restore-keys": "vmaf-fixtures-resource-v2-"}
+        )
+        self.assertEqual(
+            save["if"],
+            "inputs.phase == 'finish' && inputs.resource == 'true' && steps.check_save.outputs.save == 'true'",
+        )
+        self.assertLess(self.steps.index(restore), self.steps.index(self.by_id["canonical"]))
+
+    def run_step(
+        self, step_id: str, root: Path, names: str = "", fetch_rc: str = "0"
+    ) -> TextCommandResult:
+        # Run the action's bash in a temporary workspace with a local fetch stand-in.
+        stub = root / "scripts/test/fetch-test-yuvs.sh"
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text('printf "%s\\n" "$@" > arguments\nexit "$FETCH_RC"\n')
+        program = (
+            'cd "$1"\nexport RUNNER_TEMP="$PWD" GITHUB_OUTPUT="$PWD/output"\n'
+            'export FIXTURE_NAMES="$2" FETCH_RC="$3" RESOURCE=true RESOURCE_HIT=false\n'
+            + self.by_id[step_id]["run"]
+        )
+        return run_bash("-ec", program, "step", str(root), names, fetch_rc)
+
+    def test_get_clears_a_previous_marker_before_a_failed_fetch(self) -> None:
+        self.assertEqual(self.steps[0], self.by_id["manifest"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "netflix-fixtures.save"
+            marker.touch()
+            setup = self.run_step("manifest", root)
+            self.assertEqual(setup.returncode, 0, setup.stderr)
+            self.assertEqual((root / "arguments").read_text(), "--list-paths\n")
+            self.assertFalse(marker.exists())
+            self.assertEqual(self.run_step("fetch", root, fetch_rc="1").returncode, 1)
+            self.assertFalse(marker.exists())
+
+    def test_multiline_names_are_a_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            done = self.run_step("fetch", root, "\nfirst.yuv\n\tsecond.yuv ")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(
+                (root / "arguments").read_text().splitlines(), ["first.yuv", "second.yuv"]
+            )
+            self.assertFalse((root / "netflix-fixtures.save").exists())
+            self.assertFalse((root / "output").exists())
+            self.assertEqual(self.run_step("fetch", root, "first.yuv\n--bundle").returncode, 2)
+
+    def test_whitespace_full_fetch_allows_one_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            done = self.run_step("fetch", root, " \n\t ")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            for _ in range(2):
+                finish = self.run_step("check_save", root)
+                self.assertEqual(finish.returncode, 0, finish.stderr)
+            self.assertEqual((root / "output").read_text().splitlines(), ["full=true", "save=true"])
 
 
 class PythonBindingBitExactRuns(unittest.TestCase):

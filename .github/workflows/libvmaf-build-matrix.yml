@@ -550,6 +550,13 @@ jobs:
              -o /tmp/pc_static_smoke
           echo "static link OK"
 
+      - name: Restore Netflix vmaf_resource fixtures
+        if: ${{ ((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true' }}
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+          resource: 'true'
+
       - name: Run meson dnn suite (DNN leg)
         if: ${{ (matrix.dnn) && steps.impact.outputs.c_core == 'true' }}
         run: >-
@@ -560,15 +567,6 @@ jobs:
       - name: Prefetch Go modules for the suite
         if: ${{ (!matrix.sycl && !matrix.cuda && !matrix.hip) && steps.impact.outputs.c_core == 'true' }}
         run: sudo "$(command -v python3)" scripts/ci/prefetch_go_modules.py
-
-      # The src01 8-bit pair is one input of the bit-exact tests' all-or-none
-      # set (core/test/vmafx_fixture_util.h), so the whole set comes with it.
-      - name: Fetch gate test YUV fixtures (Metal leg)
-        id: metal_fixtures
-        if: ${{ (contains(matrix.meson_extra, 'enable_metal=enabled')) && steps.impact.outputs.c_core == 'true' }}
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: get
 
       - name: Run tests
         if: ${{ (!matrix.sycl && !matrix.cuda && !matrix.hip) && steps.impact.outputs.c_core == 'true' }}
@@ -585,13 +583,6 @@ jobs:
           connect-timeout-seconds: 1800
 
       # ADR-0726 (design notes)
-
-      - name: Restore Netflix vmaf_resource fixtures
-        # The Metal leg already provisioned the full set before the unit suite.
-        if: ${{ ((startsWith(matrix.os, 'ubuntu') && !matrix.sycl && !matrix.cuda && !matrix.hip) || matrix.os == 'macos-latest') && steps.impact.outputs.c_core == 'true' && steps.metal_fixtures.outcome != 'success' }}
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: get
 
       # The motion PQ pin rows read this bundle; a failed download fails the leg.
       - name: Fetch the PQ fixture
@@ -646,6 +637,7 @@ jobs:
         uses: ./.github/actions/netflix-fixtures
         with:
           phase: finish
+          resource: 'true'
 
       # ADR-1495 (design notes)
       - name: Check the host math library (icx)

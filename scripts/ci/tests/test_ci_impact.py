@@ -335,6 +335,23 @@ class RoutingContract(unittest.TestCase):
         self.assertTrue(plan.selectors["c_core"])
         self.assertTrue(plan.selectors["golden_harness"])
 
+    def test_fixture_action_selects_every_consumer(self) -> None:
+        plan = _plan_for([".github/actions/netflix-fixtures/action.yml"])
+        self.assertEqual(plan.mode, "impact")
+        for selector in (
+            "build_work",
+            "c_core",
+            "rust",
+            "golden_harness",
+            "upstream_consumers",
+            "tiny_ai",
+            "python",
+            "actions",
+            "gstreamer_element",
+        ):
+            with self.subTest(selector=selector):
+                self.assertTrue(plan.selectors[selector])
+
     def test_golden_fixture_change_runs_goldens(self) -> None:
         plan = _plan_for(["python/test/resource/yuv/src01_hrc00_576x324.yuv"])
         self.assertTrue(plan.selectors["golden_harness"])

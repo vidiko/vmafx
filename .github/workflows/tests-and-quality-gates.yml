@@ -115,6 +115,12 @@ jobs:
         with:
           phase: get
 
+      - name: Finish provisioning Netflix fixtures
+        if: ${{ success() && steps.impact.outputs.golden_harness == 'true' }}
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
+
       - name: Get the PQ fixture
         if: steps.impact.outputs.golden_harness == 'true'
         uses: ./.github/actions/pq-fixture
@@ -165,12 +171,6 @@ jobs:
       - name: Finish with the PQ fixture
         if: ${{ !cancelled() && steps.impact.outputs.golden_harness == 'true' }}
         uses: ./.github/actions/pq-fixture
-        with:
-          phase: finish
-
-      - name: Save Netflix vmaf_resource fixtures
-        if: ${{ success() && steps.impact.outputs.golden_harness == 'true' }}
-        uses: ./.github/actions/netflix-fixtures
         with:
           phase: finish
 
@@ -239,7 +239,7 @@ jobs:
         uses: ./.github/actions/netflix-fixtures
         with:
           phase: get
-      - name: Save Netflix vmaf_resource fixtures
+      - name: Finish provisioning Netflix fixtures
         if: steps.impact.outputs.golden_harness == 'true'
         uses: ./.github/actions/netflix-fixtures
         with:
@@ -480,6 +480,16 @@ jobs:
             -Denable_dnn=enabled --buildtype=release \
             -Dwerror=true $(../scripts/ci/werror-args.sh true)
           meson compile -C build
+      - name: Fetch the Netflix fixtures for Tiny AI
+        if: steps.impact.outputs.tiny_ai == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Finish provisioning Netflix fixtures
+        if: steps.impact.outputs.tiny_ai == 'true'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
       - name: Run meson dnn suite
         if: steps.impact.outputs.tiny_ai == 'true'
         working-directory: core
@@ -495,16 +505,6 @@ jobs:
             -r requirements/locks/package-build.txt
           "${venv}/bin/pip" install --require-hashes -r ai/requirements-dev-lock.txt
           "${venv}/bin/pip" install --no-deps --no-build-isolation -e ai
-      - name: Fetch the Netflix golden YUV fixtures
-        if: steps.impact.outputs.tiny_ai == 'true'
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: get
-      - name: Save Netflix vmaf_resource fixtures
-        if: steps.impact.outputs.tiny_ai == 'true'
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: finish
       - name: Run ai/ pytests
         if: steps.impact.outputs.tiny_ai == 'true'
         env:
@@ -791,7 +791,7 @@ jobs:
         uses: ./.github/actions/netflix-fixtures
         with:
           phase: get
-      - name: Save Netflix vmaf_resource fixtures
+      - name: Finish provisioning Netflix fixtures
         if: steps.impact.outputs.python == 'true'
         uses: ./.github/actions/netflix-fixtures
         with:
@@ -899,6 +899,16 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      - name: Fetch the Netflix golden YUV fixtures
+        # ADR-1528 (design notes)
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Finish provisioning Netflix fixtures
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
+
       - name: Run embedded MCP C smoke test
         # ADR-0209, ADR-2094 (design notes)
         working-directory: core
@@ -920,16 +930,6 @@ jobs:
             -r mcp-server/vmaf-mcp/requirements-dev-lock.txt
           "${venv}/bin/pip" install --no-deps --no-build-isolation \
             -e mcp-server/vmaf-mcp
-
-      - name: Fetch the Netflix golden YUV fixtures
-        # ADR-1528 (design notes)
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: get
-      - name: Save Netflix vmaf_resource fixtures
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: finish
 
       - name: Run Python MCP server pytests
         env:
@@ -1072,7 +1072,7 @@ jobs:
         uses: ./.github/actions/netflix-fixtures
         with:
           phase: get
-      - name: Save Netflix vmaf_resource fixtures
+      - name: Finish provisioning Netflix fixtures
         if: steps.impact.outputs.golden_harness == 'true'
         uses: ./.github/actions/netflix-fixtures
         with:

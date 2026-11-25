@@ -174,18 +174,22 @@ download of https://…/src01_hrc00_576x324.yuv: attempt 1 of 7 failed (HTTP Err
 ## CI parity
 
 CI jobs provision the clips with `./.github/actions/netflix-fixtures`.
-After checkout, call it with `phase: get`. It restores the shared
-`python/test/resource` cache, repairs tracked files overwritten by the
-archive, and uses the fetch script to verify each requested clip by MD5.
-When every requested clip is valid, the script makes zero requests to
-Netflix. Pass a space-separated `names` input to fetch a subset.
+After checkout, call it with `phase: get` before the first consumer. It
+restores the exact canonical cache and verifies each requested clip by MD5.
+A valid restored clip needs no download. Pass whitespace-separated filenames
+in `names` for a subset, or omit it to verify every clip listed by
+`bash scripts/test/fetch-test-yuvs.sh --list-paths`.
 
-Call the same action with `phase: finish` after `get`. To include extra
-fixtures that the Python harness adds through `download_reactively()`,
-call `finish` after the tests. The action saves the resource tree after a
-successful full fetch on a cache miss, including after a prefix restore.
-Subset fetches can reuse the shared cache. They leave publishing to full
-fetches so the shared key always covers the canonical set.
+The first writer fixes each cache key’s contents, so full fetches publish
+only manifest clips under `vmaf-fixtures-canonical-v1-` at get time, and
+only the Build and libvmaf matrix tox legs publish `python/test/resource`
+under `vmaf-fixtures-resource-v2-` after tests.
+The canonical key hashes the fetch script. The resource key hashes the Python
+test files and accepts prefix hits within v2. To include fixtures added by
+`download_reactively()`, those tox legs set `resource: 'true'` on both
+`get` and `finish`. They restore and prune the resource tree before
+overlaying the canonical clips, then call `finish` after tox and bundle
+cleanup. Other jobs call `finish` immediately after `get`.
 
 `scripts/ci/tests/test_fetch_test_yuvs.py` checks that workflows use the
 fixture actions for direct fetches and caching. If the canonical content

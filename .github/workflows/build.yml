@@ -206,6 +206,13 @@ jobs:
             New-Item -ItemType Junction -Path "compat/vmaf" -Target (Resolve-Path "compat/python-vmaf")
           }
 
+      - name: Restore Netflix vmaf_resource fixtures
+        if: (startsWith(matrix.os, 'ubuntu') && !matrix.sycl) || matrix.os == 'macos-latest'
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+          resource: 'true'
+
       - name: Run decorator regressions
         run: python -m pytest compat/vmaf/tests/test_decorator_extended.py -v
 
@@ -571,12 +578,6 @@ jobs:
           --no-rebuild --print-errorlogs
 
       # ── Python tox (Linux + macOS) ───────────────────────────────────
-      - name: Restore Netflix vmaf_resource fixtures
-        if: (startsWith(matrix.os, 'ubuntu') && !matrix.sycl) || matrix.os == 'macos-latest'
-        uses: ./.github/actions/netflix-fixtures
-        with:
-          phase: get
-
       # The motion PQ pin rows read this bundle; a failed download fails the leg.
       - name: Get the PQ fixture
         if: (startsWith(matrix.os, 'ubuntu') && !matrix.sycl) || matrix.os == 'macos-latest'
@@ -631,6 +632,7 @@ jobs:
         uses: ./.github/actions/netflix-fixtures
         with:
           phase: finish
+          resource: 'true'
 
       # ── HIP smoke test ────────────────────────────────────────────────
       - name: Run HIP smoke test (no GPU)

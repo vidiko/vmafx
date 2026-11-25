@@ -1,1 +1,2 @@
-- CI reuses verified Netflix test clips from a shared cache, so jobs with valid cached clips avoid intermittent download failures.
+- **Netflix fixture caching** now restores verified clips before use and
+  reserves the post-test resource cache for Python tox jobs.

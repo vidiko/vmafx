@@ -19,6 +19,7 @@
 # the usual scipy/skimage env).
 #
 # Usage: fetch-test-yuvs.sh [--bundle NAME] [NAME...]
+#   --list-paths: print repository-relative canonical clip paths without fetching.
 #   No argument: every fixture of FIXTURES. With arguments: only the named
 #   ones (a name that is not in FIXTURES is refused).
 #   --bundle <name>: provision fixture bundle into python/test/resource/yuv/<name>/
@@ -467,6 +468,16 @@ main() {
 # instead, to call main() with a stand-in server and a fixture list of its own.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
+    --list-paths)
+      if [ "$#" -ne 1 ]; then
+        echo "ERROR: --list-paths takes no arguments" >&2
+        exit 2
+      fi
+      for entry in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
+        printf 'python/test/resource/yuv/%s\n' "${entry% *}"
+      done
+      exit 0
+      ;;
     --print-bundle-sha)
       bundle="${2-pq-sollevante-v1}"
       if ! sha="$(get_bundle_sha "${bundle}")"; then
