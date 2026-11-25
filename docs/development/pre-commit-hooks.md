@@ -139,7 +139,7 @@ change; see `T-HOOKS-WINDOWS-POSIX-FIXTURES-2026-09-30` in
 | Git event | Lefthook (`lefthook.yml`) | Dispatcher (`Framework` mode, default) | Dispatcher (`Native` mode) |
 | --- | --- | --- | --- |
 | `pre-commit` | `framework-hooks.sh pre-commit` plus governance checks | Configured formatters and checks | Three native formatters |
-| `commit-msg` | `framework-hooks.sh commit-msg {1}` (Conventional Commits) | Configured Conventional Commits validation | Same framework check |
+| `commit-msg` | `framework-hooks.sh commit-msg '{1}'` (Conventional Commits) | Configured Conventional Commits validation | Same framework check |
 | `pre-push` | `framework-hooks.sh pre-push {1} {2}` plus governance checks | All configured push checks | Same framework checks |
 | `pre-rebase` | Not declared (`make install-hooks` owns it) | Agent worktree drift guard | Same guard |
 
@@ -147,6 +147,11 @@ Both `framework-hooks.sh` (`commit-msg` and `pre-push`) and the ADR-1241
 dispatcher forward Git's arguments and pushed-ref input to
 `pre-commit hook-impl`. The framework selects checks and changed files
 from `.pre-commit-config.yaml`.
+
+On POSIX, the single quotes keep a message-file path with spaces in one
+argument. Paths containing apostrophes are unsupported because Lefthook
+substitutes the path before the shell parses the command. This invocation is
+unproven on Windows.
 
 At `commit-msg`, `.pre-commit-config.yaml` runs `conventional-pre-commit`
 `v4.5.0` with `--strict` and the repository's fourteen allowed types (`feat`,

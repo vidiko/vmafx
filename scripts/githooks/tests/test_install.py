@@ -574,7 +574,7 @@ class LefthookBridgeTests(unittest.TestCase):
             with self.subTest(run=value):
                 self.assertFalse(value.startswith(("|", ">")), "a block scalar hides its quotes")
                 self.assertNotIn('"', value)
-        for stage in ("pre-commit\n", "commit-msg {1}\n", "pre-push {1} {2}\n"):
+        for stage in ("pre-commit\n", "commit-msg '{1}'\n", "pre-push {1} {2}\n"):
             self.assertEqual(
                 lefthook.count(f"run: bash scripts/git-hooks/framework-hooks.sh {stage}"), 1
             )
@@ -586,8 +586,32 @@ class LefthookBridgeTests(unittest.TestCase):
         commands = config["commit-msg"]["commands"]
         self.assertEqual(
             commands["framework-hooks"]["run"],
-            "bash scripts/git-hooks/framework-hooks.sh commit-msg {1}",
+            "bash scripts/git-hooks/framework-hooks.sh commit-msg '{1}'",
         )
+
+    def test_commit_msg_run_preserves_message_path_with_spaces(self) -> None:
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        template = config["commit-msg"]["commands"]["framework-hooks"]["run"]
+        self.stub("scripts/git-hooks/framework-hooks.sh")
+        for message in ("linked worktree/MERGE_MSG", "developer's worktree/MERGE_MSG"):
+            with self.subTest(message=message):
+                self.argv_log.unlink(missing_ok=True)
+                # Lefthook 2.2.2 substitutes raw Git arguments before sh parses the command.
+                result = run_command(
+                    ("sh", "-c", template.replace("{1}", message)),
+                    allowed_executables=("sh",),
+                    cwd=self.repo,
+                    env=self.env,
+                    capture_output=True,
+                    text=True,
+                    timeout_seconds=60,
+                )
+                if "'" in message:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(self.argv_log.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.argv_calls(), [["commit-msg", message]])
 
     def test_agent_hook_files_are_in_the_form_lefthook_rewrites_them_to(self) -> None:
         # `lefthook uninstall` (v2.1.14 internal/command/uninstall_ai.go) re-marshals

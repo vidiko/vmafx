@@ -49,9 +49,10 @@ commit-msg:
     framework-hooks:
       # ADR-1249: lefthook owns commit-msg and delegates to the commit-msg stage
       # that .pre-commit-config.yaml declares (conventional-pre-commit --strict).
-      # Lefthook passes Git's message file as {1}.
+      # Lefthook 2.2.2 on POSIX: quoting {1} kept a path with spaces in one
+      # argument. A single apostrophe left the quote unmatched and failed closed.
       # Windows execution and quote-free invocation: ADR-2012.
-      run: bash scripts/git-hooks/framework-hooks.sh commit-msg {1}
+      run: bash scripts/git-hooks/framework-hooks.sh commit-msg '{1}'
 
 post-commit:
   commands:
