@@ -32,7 +32,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -836,16 +836,31 @@ SENTINEL_CONFIG = (("maintenance.auto", "false"), ("gc.auto", "0"))
 BACKGROUND_WORK = re.compile(r"run_command: git (?:maintenance run|gc --auto)")
 
 
+def traced_commit_starts_background_work(
+    repository: Path, commit_args: Sequence[str], environment: dict[str, str]
+) -> bool:
+    """Run `git` `commit_args` with `GIT_TRACE=1` and report background maintenance or gc."""
+    done = run_git(repository, *commit_args, environment={**environment, "GIT_TRACE": "1"})
+    return BACKGROUND_WORK.search(str(done.stderr)) is not None
+
+
 def commit_starts_background_work(repository: Path) -> bool:
     """True when an empty commit in `repository` makes git start maintenance or gc."""
-    environment = {**clean_git_environment(), "GIT_TRACE": "1"}
-    done = run_git(
+    return traced_commit_starts_background_work(
         repository,
-        "-c", "user.name=Sentinel", "-c", "user.email=sentinel@example.invalid",
-        "commit", "-q", "--allow-empty", "-m", "probe",
-        environment=environment,
-    )  # fmt: skip
-    return BACKGROUND_WORK.search(str(done.stderr)) is not None
+        (
+            "-c",
+            "user.name=Sentinel",
+            "-c",
+            "user.email=sentinel@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "probe",
+        ),
+        clean_git_environment(),
+    )
 
 
 def sentinel_environment(sentinel: Path) -> dict[str, str]:
@@ -898,7 +913,10 @@ def commit_caller_baseline(repository: Path, user_name: str, message: str) -> No
     run_git(repository, "config", "user.email", "fixture@example.invalid", environment=clean)
     (repository / "tracked").write_text("committed caller work\n")
     run_git(repository, "add", "tracked", environment=clean)
-    run_git(repository, "commit", "-qm", message, environment=clean)
+    if traced_commit_starts_background_work(repository, ("commit", "-qm", message), clean):
+        raise AssertionError(
+            f"caller baseline commit started background maintenance in {repository}"
+        )
 
 
 def declared_failure_report(stderr: str, returncode: int, declared: frozenset[str]) -> str:
@@ -1372,6 +1390,14 @@ class GitFixtureIsolation(unittest.TestCase):
             plain.mkdir()
             run_git(plain, "init", "-q", "-b", "master", environment=clean)
             self.assertTrue(commit_starts_background_work(plain))
+            unconfigured = root / "unconfigured"
+            with (
+                patch.object(sys.modules[__name__], "SENTINEL_CONFIG", ()),
+                self.assertRaisesRegex(AssertionError, re.escape(str(unconfigured))),
+            ):
+                commit_caller_baseline(
+                    unconfigured, "Unconfigured Caller Test", "test: unconfigured caller"
+                )
             caller = root / "caller"
             caller.mkdir()
             commit_caller_baseline(caller, "Caller Baseline Test", "test: caller baseline")
