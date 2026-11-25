@@ -72,26 +72,49 @@ esac
 # `git -c` settings, which the hooks are meant to see.
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
+physical_dir() {
+  # A final marker keeps command substitution from trimming newlines in a path.
+  CDPATH='' cd -P -- "$1" && pwd -P && printf .
+}
+
+stage=${stage:-${1:-}}
+if [ "$stage" = commit-msg ]; then
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+  if [ "$#" -eq 0 ] || [ -z "$1" ]; then
+    echo "framework-hooks.sh: commit-msg needs the message file" >&2
+    exit 2
+  fi
+  if [ "$#" -ne 1 ]; then
+    echo "framework-hooks.sh: commit-msg takes one message file, got $#" >&2
+    exit 2
+  fi
+  # Git supplies one of two files in this worktree's git dir. Compare physical
+  # directories so a Git for Windows drive path and its MSYS spelling agree.
+  name=${1##*/}
+  parent=${1%"$name"}
+  if ! git_output=$(git rev-parse --absolute-git-dir 2>/dev/null && printf .) ||
+    ! expected=$(physical_dir "${git_output%$'\n.'}" 2>/dev/null) ||
+    ! received=$(physical_dir "${parent:-.}" 2>/dev/null) ||
+    [[ $received != "$expected" || ! -f $1 ||
+      ($name != COMMIT_EDITMSG && $name != MERGE_MSG) ]]; then
+    git_dir=${git_output%$'\n.'}
+    git_dir=${git_dir:-current worktree git dir (unavailable)}
+    printf 'framework-hooks.sh: invalid commit-msg file "%s", expected COMMIT_EDITMSG or MERGE_MSG in "%s"\n' \
+      "${1//$'\n'/\\n}" "${git_dir//$'\n'/\\n}" >&2
+    exit 2
+  fi
+fi
+
 # Installing hook environments also drops GIT_INDEX_FILE (pre-commit/pre-commit#3609).
 env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY "$fw" install-hooks || exit 1
 
-stage=${stage:-${1:-}}
 case "$stage" in
   pre-commit)
     exec "$fw" run
     ;;
   commit-msg)
-    if [ "$#" -gt 0 ]; then
-      shift
-    fi
-    if [ "$#" -eq 0 ] || [ -z "$1" ]; then
-      echo "framework-hooks.sh: commit-msg needs the message file" >&2
-      exit 2
-    fi
-    if [ "$#" -ne 1 ]; then
-      echo "framework-hooks.sh: commit-msg takes one message file, got $#" >&2
-      exit 2
-    fi
     exec "$fw" hook-impl --config=.pre-commit-config.yaml --hook-type=commit-msg \
       --hook-dir "$(git rev-parse --git-path hooks)" -- "$1"
     ;;

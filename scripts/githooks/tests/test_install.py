@@ -561,8 +561,22 @@ if [ "$1" = hook-impl ]; then cat >> "$BRIDGE_LOG"; fi
 """
 
 
+def replace_lefthook_item(template: str, item: str) -> str:
+    # Lefthook v2.2.2 internal/run/controller/command/replacer/replacer.go:267-294
+    # (replaceQuoted): only quoted placeholders strip one enclosing apostrophe pair.
+    unquoted = re.sub(r"^'(.*)'$", r"\1", item)
+
+    def substitute(match: re.Match[str]) -> str:
+        quote = match[1]
+        return f"{quote}{unquoted}{quote}" if quote else item
+
+    return re.sub(r"""(['"])\{1\}\1|\{1\}""", substitute, template)
+
+
 class LefthookBridgeTests(unittest.TestCase):
     """lefthook.yml hands its framework stages to framework-hooks.sh (ADR-1249, ADR-2012)."""
+
+    repo: Path
 
     def test_run_values_survive_the_windows_command_line(self) -> None:
         # lefthook on Windows starts `sh -c "<run>"` without escaping it, so a
@@ -584,34 +598,114 @@ class LefthookBridgeTests(unittest.TestCase):
         self.assertIsInstance(config, dict)
         self.assertIn("commit-msg", config)
         commands = config["commit-msg"]["commands"]
+        self.assertEqual(commands["framework-hooks"].get("timeout"), "300s")
         self.assertEqual(
             commands["framework-hooks"]["run"],
             "bash scripts/git-hooks/framework-hooks.sh commit-msg '{1}'",
         )
 
-    def test_commit_msg_run_preserves_message_path_with_spaces(self) -> None:
+    def prepare_message_repo(self, name: str) -> Path:
+        self.repo = self.repo / name
+        try:
+            self.repo.mkdir()
+        except OSError as error:
+            self.skipTest(f"cannot create repository path {self.repo}: {error}")
+        self.init_repo()
+        script = Path("scripts/git-hooks/framework-hooks.sh")
+        (self.repo / script.parent).mkdir(parents=True)
+        shutil.copy2(ROOT / script, self.repo / script)
+        self.stub(".venv/bin/pre-commit")
+        return self.repo / ".git"
+
+    def run_message_job(self, item: str) -> TextCommandResult:
+        self.argv_log.unlink(missing_ok=True)
         config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
         template = config["commit-msg"]["commands"]["framework-hooks"]["run"]
-        self.stub("scripts/git-hooks/framework-hooks.sh")
-        for message in ("linked worktree/MERGE_MSG", "developer's worktree/MERGE_MSG"):
-            with self.subTest(message=message):
-                self.argv_log.unlink(missing_ok=True)
-                # Lefthook 2.2.2 substitutes raw Git arguments before sh parses the command.
-                result = run_command(
-                    ("sh", "-c", template.replace("{1}", message)),
-                    allowed_executables=("sh",),
-                    cwd=self.repo,
-                    env=self.env,
-                    capture_output=True,
-                    text=True,
-                    timeout_seconds=60,
-                )
-                if "'" in message:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertFalse(self.argv_log.exists())
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(self.argv_calls(), [["commit-msg", message]])
+        return run_command(
+            ("sh", "-c", replace_lefthook_item(template, item)),
+            allowed_executables=("sh",),
+            cwd=self.repo,
+            env=self.env,
+            input_data="",
+            capture_output=True,
+            text=True,
+            timeout_seconds=60,
+        )
+
+    def test_commit_msg_run_preserves_message_path_with_spaces(self) -> None:
+        git_dir = self.prepare_message_repo("repository with spaces")
+        for name in ("COMMIT_EDITMSG", "MERGE_MSG"):
+            with self.subTest(name=name):
+                message = git_dir / name
+                message.touch()
+                result = self.run_message_job(message.as_posix())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                install, hook = self.argv_calls()
+                self.assertEqual(install, ["install-hooks"])
+                self.assertEqual(hook[0], "hook-impl")
+                self.assertEqual(hook[hook.index("--") + 1 :], [message.as_posix()])
+
+    def test_commit_msg_rejects_paired_apostrophes(self) -> None:
+        git_dir = self.prepare_message_repo("repository a'b'c")
+        message = git_dir / "COMMIT_EDITMSG"
+        message.touch()
+        received = message.as_posix().replace("a'b'c", "abc")
+        # A real file at the altered path also has to be refused.
+        Path(received).parent.mkdir(parents=True)
+        Path(received).touch()
+        for item in (message.as_posix(), f"'{message.as_posix()}'"):
+            with self.subTest(item=item):
+                result = self.run_message_job(item)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(received, result.stderr)
+                self.assertIn(git_dir.resolve().as_posix(), result.stderr)
+                self.assertFalse(self.argv_log.exists())
+
+    def test_commit_msg_rejects_unmatched_apostrophe(self) -> None:
+        git_dir = self.prepare_message_repo("developer's repository")
+        message = git_dir / "COMMIT_EDITMSG"
+        message.touch()
+        result = self.run_message_job(message.as_posix())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.argv_log.exists())
+
+    def test_commit_msg_rejects_unexpected_message_files(self) -> None:
+        other_git_dir = self.repo / ".git"
+        git_dir = self.prepare_message_repo("repository with spaces")
+        for path in (
+            git_dir / "unexpected-name",
+            self.repo / "COMMIT_EDITMSG",
+            other_git_dir / "COMMIT_EDITMSG",
+        ):
+            with self.subTest(path=path):
+                path.touch()
+                result = self.run_message_job(path.as_posix())
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(path.as_posix(), result.stderr)
+                self.assertFalse(self.argv_log.exists())
+
+    def test_commit_msg_preserves_newlines_in_directory_comparison(self) -> None:
+        git_dir = self.prepare_message_repo("repository")
+        other_dir = git_dir.with_name(".git\n")
+        try:
+            other_dir.mkdir()
+        except OSError as error:
+            self.skipTest(f"cannot create directory with trailing newline: {error}")
+        message = other_dir / "COMMIT_EDITMSG"
+        message.touch()
+        result = self.run_message_job(message.as_posix())
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn(message.as_posix().replace("\n", r"\n"), result.stderr)
+        self.assertFalse(self.argv_log.exists())
+
+    def test_commit_msg_rejects_empty_or_missing_file(self) -> None:
+        git_dir = self.prepare_message_repo("repository with spaces")
+        for item in ("", (git_dir / "MERGE_MSG").as_posix()):
+            with self.subTest(item=item):
+                result = self.run_message_job(item)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.argv_log.exists())
 
     def test_agent_hook_files_are_in_the_form_lefthook_rewrites_them_to(self) -> None:
         # `lefthook uninstall` (v2.1.14 internal/command/uninstall_ai.go) re-marshals
@@ -645,6 +739,9 @@ class LefthookBridgeTests(unittest.TestCase):
             GIT_CONFIG_GLOBAL=os.devnull,
             GIT_CONFIG_NOSYSTEM="1",
         )
+        self.init_repo()
+
+    def init_repo(self) -> None:
         run_command(
             (self.git, "init", "--quiet"),
             allowed_executables=(self.git,),
@@ -691,6 +788,8 @@ class LefthookBridgeTests(unittest.TestCase):
 
     def test_hook_dir_follows_core_hooks_path(self) -> None:
         self.stub(".venv/bin/pre-commit")
+        message = ".git/COMMIT_EDITMSG"
+        (self.repo / message).touch()
         for hooks_path in ("custom-hooks", (self.repo / "absolute-hooks").as_posix()):
             with self.subTest(hooks_path=hooks_path):
                 self.log.unlink(missing_ok=True)
@@ -703,7 +802,7 @@ class LefthookBridgeTests(unittest.TestCase):
                     check=True,
                     timeout_seconds=60,
                 )
-                for args in (("commit-msg", "message"), ("pre-push", "origin", "url")):
+                for args in (("commit-msg", message), ("pre-push", "origin", "url")):
                     result = self.bridge(*args)
                     self.assertEqual(result.returncode, 0, result.stderr)
                 calls = [args for args in self.argv_calls() if args[0] == "hook-impl"]
@@ -766,10 +865,9 @@ class LefthookBridgeTests(unittest.TestCase):
 
     def test_commit_msg_forwards_message_file(self) -> None:
         self.stub(".venv/bin/pre-commit")
-        message = self.repo / "msg dir" / "COMMIT EDITMSG"
-        message.parent.mkdir()
+        message = self.repo / ".git" / "COMMIT_EDITMSG"
         message.write_text("fix: subject\n", encoding="utf-8")
-        result = self.bridge("commit-msg", str(message))
+        result = self.bridge("commit-msg", message.as_posix())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.argv_calls(),
@@ -782,7 +880,7 @@ class LefthookBridgeTests(unittest.TestCase):
                     "--hook-dir",
                     ".git/hooks",
                     "--",
-                    str(message),
+                    message.as_posix(),
                 ],
             ],
         )

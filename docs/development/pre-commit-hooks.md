@@ -118,9 +118,10 @@ The hooks run in Git for Windows' Bash. Set up a checkout once:
    (`source .venv/Scripts/activate`): `lefthook install`, then
    `bash scripts/githooks/install.sh` (the command behind `make install-hooks`).
    Lefthook's `pre-commit`, `commit-msg` and `pre-push` jobs run through
-   `framework-hooks.sh` and find `.venv` themselves; only a checkout without
-   lefthook runs the `commit-msg` dispatcher, which looks `pre-commit` up on
-   `PATH`.
+   `framework-hooks.sh` and find `.venv` themselves. The installer keeps a
+   Lefthook shim at `.git/hooks/commit-msg`. If Lefthook does not own that hook,
+   the installer places the dispatcher there, which finds `pre-commit` on `PATH`.
+   An unrecognized custom hook blocks installation.
 5. For pushes, install the push-stage tools into the same virtualenv:
    `requirements/locks/mypy.txt` (with `--require-hashes`) and
    `docs/requirements.txt` for the MkDocs strict build. `govulncheck` on
@@ -149,9 +150,14 @@ dispatcher forward Git's arguments and pushed-ref input to
 from `.pre-commit-config.yaml`.
 
 On POSIX, the single quotes keep a message-file path with spaces in one
-argument. Paths containing apostrophes are unsupported because Lefthook
-substitutes the path before the shell parses the command. This invocation is
-unproven on Windows.
+argument. The bridge accepts only an existing regular file named
+`COMMIT_EDITMSG` or `MERGE_MSG` in the current worktree's Git directory.
+If apostrophe parsing changes the directory, the bridge rejects the path
+before starting the framework. An unmatched quote stops the shell before
+the bridge runs. This invocation is unproven on Windows.
+
+The Lefthook job allows 300 seconds for the framework, including its first-run
+environment installation. Lefthook fails the job when that time expires.
 
 At `commit-msg`, `.pre-commit-config.yaml` runs `conventional-pre-commit`
 `v4.5.0` with `--strict` and the repository's fourteen allowed types (`feat`,
