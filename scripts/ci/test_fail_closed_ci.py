@@ -256,7 +256,7 @@ def ci_text_paths(root: Path) -> list[Path]:
 def _logical_ci_lines(
     text: str, *, blank_after_escape: bool = False
 ) -> list[tuple[int, str, bool]]:
-    """Join backslash continuations (default False: bash rule; True: BuildKit rule)."""
+    """Remove Bash backslash-newline pairs. BuildKit accepts trailing blanks and joins with LF."""
     return _join_continued_lines(
         list(enumerate(text.splitlines(), 1)), blank_after_escape=blank_after_escape
     )
@@ -267,6 +267,7 @@ def _join_continued_lines(
 ) -> list[tuple[int, str, bool]]:
     """Join numbered lines, bounding storage by their original physical span."""
     logical: list[tuple[int, str, bool]] = []
+    separator = "\n" if blank_after_escape else ""
     parts: list[str] = []
     start_line = 1
     count = 0
@@ -279,11 +280,11 @@ def _join_continued_lines(
         if count <= MAX_CONTINUATION_LINES:
             parts.append(candidate[:-1] if continues else raw)
         if not continues:
-            logical.append((start_line, "\n".join(parts), count > MAX_CONTINUATION_LINES))
+            logical.append((start_line, separator.join(parts), count > MAX_CONTINUATION_LINES))
             parts = []
             count = 0
     if count > 0:
-        logical.append((start_line, "\n".join(parts), count > MAX_CONTINUATION_LINES))
+        logical.append((start_line, separator.join(parts), count > MAX_CONTINUATION_LINES))
     return logical
 
 
@@ -1935,7 +1936,7 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
         )
         self.assertEqual(
             _logical_ci_lines("a \\\nb\n"),
-            [(1, "a \nb", False)],
+            [(1, "a b", False)],
         )
 
     def test_effective_acquire_retries_and_option_spellings(self) -> None:
