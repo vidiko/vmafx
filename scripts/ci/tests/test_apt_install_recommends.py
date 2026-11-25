@@ -3,24 +3,14 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Require --no-install-recommends when apt-install-cached.sh installs driver-recommending libs.
 
-Positive: checked-in tests-and-quality-gates.yml holds; quoted (`'`, `"`), split plain, and
-literal-block `run` steps fail without --no-install-recommends and pass with it; workflow and
-composite-action step `run` scalars report missing flags at their `run:` line; anchored mappings
-aliased (`- *step`) or merged (`- <<: *step`, `- <<: [*a, *b]`) into `steps` report missing flags
-at the anchored `run` scalar or literal install line; qualified apt tokens (`:arch`, `=version`,
-`/release`, trailing `+`) match their base package name.
-Negative: non-driver packages, `-dev:arch` packages, and trailing-`-` removal tokens pass without
---no-install-recommends; collection YAML raw scans allow-list only literal-block (`|`) step `run`
-spans, so quoted or plain `run` and non-`run` values outside step `run` (`env.run`,
-`steps[*].env.run`, `env.CMD`) and unreferenced anchored mappings pass without findings;
-single-line plain `run` steps are recorded once across raw and YAML scans; chained subcommands and
-multiple installs on one line fail when any flagged install omits the flag.
-Boundary: YAML decoding scans only `MappingNode` items of `steps` sequences and their `<<` merged
-mappings (unless overridden by the step's own `run`); aliased step mappings, merged mappings, and
-shared `run: *cmd` scalars deduplicate by node id; backslash-continued flags pass;
-backslash-space/tab do not continue; continuations over MAX_CONTINUATION_LINES, step merges over
-MAX_STEP_MERGE_DEPTH, invalid collection YAML, YAML over MAX_YAML_NODES, missing apt lists,
-oversize workflow/list inputs, and excess install calls (MAX_INSTALL_CALLS) fail closed.
+Positive: workflow and composite-action step installs require the flag for driver-recommending
+packages, including qualified apt tokens. Shell mode checks every chained install independently.
+Negative: other packages and removal tokens need no flag. YAML scans only each step's effective
+scalar run. Metadata, shadowed merges and neighbouring steps cannot supply commands or flags.
+Boundary: literal runs report the physical install line; other styles report the scalar start.
+Aliases of the same run report once. PyYAML resolves merge precedence after bounded path checks.
+Malformed YAML, non-mapping roots, invalid merges, excess nodes, merge depth, shell continuations,
+install calls, missing lists and oversize inputs produce findings.
 """
 
 from __future__ import annotations
@@ -30,6 +20,7 @@ import re
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 
@@ -52,10 +43,7 @@ from scripts.ci.test_fail_closed_ci import (  # noqa: E402
 )
 
 InstallCall = tuple[int, str, tuple[str, ...]]
-Span = tuple[int, int]
-RunScalar = tuple[int, int, str]
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
-COLLECTION_LINE_RE = re.compile(r"^(?:---(?:\s+|$))?(?:[-?](?=\s|$)|[\[{])|:(?=\s|$)")
 APT_QUALIFIER_RE = re.compile(r"[:=/]")
 
 DEFAULT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "tests-and-quality-gates.yml"
@@ -109,15 +97,6 @@ def parse_install_calls(line: str) -> list[tuple[str, tuple[str, ...]]]:
     return calls
 
 
-def _has_collection_line(text: str) -> bool:
-    """Return True when text contains a non-comment YAML mapping or sequence line."""
-    for raw in text.splitlines():
-        stripped = raw.lstrip()
-        if stripped and not stripped.startswith("#") and COLLECTION_LINE_RE.search(stripped):
-            return True
-    return False
-
-
 def _apt_package_base(token: str) -> str:
     """Return the apt package base name for driver matching, or '' for a removal token."""
     if token.endswith("-"):
@@ -126,171 +105,117 @@ def _apt_package_base(token: str) -> str:
     return head.removesuffix("+")
 
 
-def _literal_scalar_span(node: yaml.ScalarNode) -> Span | None:
-    """Return inclusive 1-based body `(start_line, end_line)` for a literal `|` scalar."""
-    start_line = int(node.start_mark.line) + 2
-    end_line = int(node.end_mark.line) + (1 if int(node.end_mark.column) > 0 else 0)
-    return (start_line, end_line) if start_line <= end_line else None
+def _step_mappings(mapping: yaml.MappingNode) -> Iterator[yaml.MappingNode]:
+    """Yield every mapping item of a steps sequence, including repeated aliases."""
+    for key, value in mapping.value:
+        if isinstance(key, yaml.ScalarNode) and key.value == "steps":
+            if isinstance(value, yaml.SequenceNode):
+                yield from (item for item in value.value if isinstance(item, yaml.MappingNode))
 
 
-def _collect_direct_run_scalars(
-    mapping: yaml.MappingNode,
-    scalar_ids: set[int],
-    scalars: list[RunScalar],
-    literal_spans: list[Span],
-) -> bool:
-    """Record unseen direct `run` scalars from `mapping`; return True if `mapping` sets `run`."""
-    has_run = False
-    for key_node, val_node in mapping.value:
-        if not (isinstance(key_node, yaml.ScalarNode) and key_node.value == "run"):
-            continue
-        has_run = True
-        if not isinstance(val_node, yaml.ScalarNode) or id(val_node) in scalar_ids:
-            continue
-        scalar_ids.add(id(val_node))
-        if val_node.style == "|":
-            span = _literal_scalar_span(val_node)
-            if span is not None:
-                literal_spans.append(span)
-        else:
-            scalars.append(
-                (
-                    int(val_node.start_mark.line) + 1,
-                    int(val_node.end_mark.line) + 1,
-                    str(val_node.value),
-                )
-            )
-    return has_run
-
-
-def _merged_child_mappings(mapping: yaml.MappingNode) -> list[tuple[int, yaml.MappingNode]]:
-    """Return `(merge_key_line, child_mapping)` pairs from `<<` keys on `mapping`."""
-    merged: list[tuple[int, yaml.MappingNode]] = []
-    for key_node, val_node in mapping.value:
-        if not (isinstance(key_node, yaml.ScalarNode) and key_node.tag == YAML_MERGE_TAG):
-            continue
-        key_line = int(key_node.start_mark.line) + 1
-        if isinstance(val_node, yaml.MappingNode):
-            merged.append((key_line, val_node))
-        elif isinstance(val_node, yaml.SequenceNode):
-            merged.extend(
-                (key_line, item) for item in val_node.value if isinstance(item, yaml.MappingNode)
-            )
-    return merged
-
-
-def _mapping_run_scalars(
-    mapping: yaml.MappingNode,
-    source_name: str,
-    scalar_ids: set[int],
-    scalars: list[RunScalar],
-    literal_spans: list[Span],
-) -> str | None:
-    """Collect step `run` scalars and literal spans across `<<` merges; return bound error."""
-    work: list[tuple[yaml.MappingNode, int]] = [(mapping, 0)]
-    seen_merged: set[int] = {id(mapping)}
-    for index in range(MAX_YAML_NODES):
-        if index >= len(work):
-            return None
-        current, depth = work[index]
-        if _collect_direct_run_scalars(current, scalar_ids, scalars, literal_spans):
-            continue
-        for key_line, child in _merged_child_mappings(current):
-            if id(child) in seen_merged:
-                continue
-            if depth >= MAX_STEP_MERGE_DEPTH:
-                return f"{source_name}:{key_line}: step merge depth exceeds {MAX_STEP_MERGE_DEPTH}"
-            seen_merged.add(id(child))
-            work.append((child, depth + 1))
-    return f"{source_name}:1: {HOSTED_YAML_NODE_BOUND_MESSAGE}"
-
-
-def _record_step_mapping_ids(
-    mapping: yaml.MappingNode,
-    step_ids: set[int],
-) -> list[yaml.MappingNode]:
-    """Register new `MappingNode` items in `steps` sequences on `mapping` and return them."""
-    new_steps: list[yaml.MappingNode] = []
-    for key_node, val_node in mapping.value:
-        if not (isinstance(key_node, yaml.ScalarNode) and key_node.value == "steps"):
-            continue
-        if not isinstance(val_node, yaml.SequenceNode):
-            continue
-        for item in val_node.value:
-            if isinstance(item, yaml.MappingNode) and id(item) not in step_ids:
-                step_ids.add(id(item))
-                new_steps.append(item)
-    return new_steps
-
-
-def _compose_collection_root(
-    text: str,
-    source_name: str,
-) -> tuple[yaml.CollectionNode | None, str | None]:
-    """Compose `text` when it is a YAML collection; return `(root, yaml_finding)`."""
-    try:
-        root = yaml.compose(text, Loader=yaml.SafeLoader)
-    except yaml.YAMLError as error:
-        if not _has_collection_line(text):
-            return (None, None)
-        return (None, f"{source_name}:{_yaml_error_line(error)}: {HOSTED_YAML_PARSE_MESSAGE}")
-    if isinstance(root, yaml.CollectionNode):
-        return (root, None)
-    return (None, None)
-
-
-def _yaml_run_scalars(
-    text: str,
-    source_name: str,
-) -> tuple[list[RunScalar], list[Span] | None, str | None]:
-    """Compose YAML with bounded walk; return `(scalars, literal_spans, yaml_finding)`."""
-    root, yaml_error = _compose_collection_root(text, source_name)
-    if root is None or yaml_error is not None:
-        return ([], None, yaml_error)
-    scalars: list[RunScalar] = []
-    literal_spans: list[Span] = []
-    scalar_ids: set[int] = set()
-    step_ids: set[int] = set()
+def _workflow_steps(
+    root: yaml.MappingNode, source_name: str
+) -> tuple[list[yaml.MappingNode], str | None]:
+    steps: list[yaml.MappingNode] = []
     stack: list[yaml.Node] = [root]
-    seen: set[int] = {id(root)}
+    seen = {id(root)}
+    bound = f"{source_name}:1: {HOSTED_YAML_NODE_BOUND_MESSAGE}"
     for _ in range(MAX_YAML_NODES):
-        if not stack:
-            return (scalars, literal_spans, None)
         current = stack.pop()
         if isinstance(current, yaml.MappingNode):
-            for step in _record_step_mapping_ids(current, step_ids):
-                merge_err = _mapping_run_scalars(
-                    step, source_name, scalar_ids, scalars, literal_spans
-                )
-                if merge_err is not None:
-                    return ([], None, merge_err)
+            for step in _step_mappings(current):
+                if len(steps) >= MAX_YAML_NODES:
+                    return [], bound
+                steps.append(step)
         _push_child_collections(current, stack, seen)
-    return ([], None, f"{source_name}:1: {HOSTED_YAML_NODE_BOUND_MESSAGE}")
+        if not stack:
+            return steps, None
+    return [], bound
+
+
+def _merge_edges(mapping: yaml.MappingNode) -> Iterator[tuple[int, yaml.MappingNode]]:
+    """Yield merge edges for bounds checking. PyYAML validates their types during flattening."""
+    for key, value in mapping.value:
+        if key.tag == YAML_MERGE_TAG:
+            line = int(key.start_mark.line) + 1
+            if isinstance(value, yaml.MappingNode):
+                yield line, value
+            elif isinstance(value, yaml.SequenceNode):
+                for child in value.value:
+                    if isinstance(child, yaml.MappingNode):
+                        yield line, child
+
+
+def _merge_bound_error(steps: list[yaml.MappingNode], source_name: str) -> str | None:
+    """Check every path before flatten_mapping mutates any shared anchor."""
+    work = [(step, 0) for step in steps]
+    for mapping, depth in work:
+        for line, child in _merge_edges(mapping):
+            if depth >= MAX_STEP_MERGE_DEPTH:
+                return f"{source_name}:{line}: step merge depth exceeds {MAX_STEP_MERGE_DEPTH}"
+            if len(work) >= MAX_YAML_NODES:
+                return f"{source_name}:1: {HOSTED_YAML_NODE_BOUND_MESSAGE}"
+            work.append((child, depth + 1))
+    return None
+
+
+def _effective_run(step: yaml.MappingNode, loader: yaml.SafeLoader) -> yaml.ScalarNode | None:
+    """Return the effective scalar run, or None if the winning run is absent or non-scalar."""
+    loader.flatten_mapping(step)
+    for key, value in reversed(step.value):
+        if isinstance(key, yaml.ScalarNode) and key.value == "run":
+            return value if isinstance(value, yaml.ScalarNode) else None
+    return None
+
+
+def _yaml_run_scalars(text: str, source_name: str) -> tuple[list[yaml.ScalarNode], str | None]:
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        if not isinstance(root, yaml.MappingNode):
+            return [], f"{source_name}:1: workflow root is not a YAML mapping"
+        steps, error = _workflow_steps(root, source_name)
+        error = error or _merge_bound_error(steps, source_name)
+        if error:
+            return [], error
+        scalars: list[yaml.ScalarNode] = []
+        scalar_ids: set[int] = set()
+        loader = yaml.SafeLoader("")
+        try:
+            for step in steps:
+                run = _effective_run(step, loader)
+                if run is not None and id(run) not in scalar_ids:
+                    scalar_ids.add(id(run))
+                    scalars.append(run)
+        finally:
+            loader.dispose()
+    except yaml.YAMLError as error_detail:
+        return [], f"{source_name}:{_yaml_error_line(error_detail)}: {HOSTED_YAML_PARSE_MESSAGE}"
+    return sorted(scalars, key=lambda run: run.start_mark.line), None
 
 
 def _scan_shell_text(
     text: str,
     source_name: str,
+    *,
     fixed_lineno: int | None = None,
-) -> tuple[list[InstallCall], list[tuple[int, str]]]:
+    line_offset: int = 0,
+) -> tuple[list[InstallCall], list[str]]:
     """Scan shell text for install calls and per-line continuation or quote findings."""
     calls: list[InstallCall] = []
-    findings: list[tuple[int, str]] = []
+    findings: list[str] = []
     for lineno, line, overflowed in _logical_ci_lines(text):
-        report_line = fixed_lineno if fixed_lineno is not None else lineno
+        report_line = fixed_lineno if fixed_lineno is not None else lineno + line_offset
         if overflowed:
             msg = (
                 f"{source_name}:{report_line}: continuation exceeds"
                 f" {MAX_CONTINUATION_LINES} physical lines"
             )
-            findings.append((report_line, msg))
+            findings.append(msg)
             continue
         try:
             parsed = parse_install_calls(line)
         except ValueError:
-            findings.append(
-                (report_line, f"{source_name}:{report_line}: {APT_UNBALANCED_QUOTE_MESSAGE}")
-            )
+            findings.append(f"{source_name}:{report_line}: {APT_UNBALANCED_QUOTE_MESSAGE}")
             continue
         for list_rel, args in parsed:
             calls.append((report_line, list_rel, args))
@@ -299,66 +224,49 @@ def _scan_shell_text(
     return (calls, findings)
 
 
-def _yaml_run_pass(
-    scalars: list[tuple[int, int, str]],
-    source_name: str,
-) -> tuple[list[tuple[int, int]], list[InstallCall], list[str]]:
-    """Scan non-literal YAML `run` scalars; return (spans, decoded_calls, findings)."""
-    spans = [(start_line, end_line) for start_line, end_line, _ in scalars]
+def _scan_yaml_text(text: str, source_name: str) -> tuple[list[InstallCall], list[str]]:
+    scalars, error = _yaml_run_scalars(text, source_name)
+    if error is not None:
+        return [], [error]
     calls: list[InstallCall] = []
     findings: list[str] = []
-    for start_line, _, value in scalars:
+    for run in scalars:
+        start = int(run.start_mark.line) + 1
         scalar_calls, scalar_findings = _scan_shell_text(
-            value, source_name, fixed_lineno=start_line
+            run.value,
+            source_name,
+            fixed_lineno=None if run.style == "|" else start,
+            line_offset=start,
         )
-        findings.extend(msg for _, msg in scalar_findings)
-        for call in scalar_calls:
-            calls.append(call)
-            if len(calls) > MAX_INSTALL_CALLS:
-                return (spans, calls, findings)
-    return (spans, calls, findings)
+        calls.extend(scalar_calls)
+        findings.extend(scalar_findings)
+        if len(calls) > MAX_INSTALL_CALLS:
+            break
+    return calls, findings
 
 
-def _in_any_span(lineno: int, spans: list[Span]) -> bool:
-    """Return True when lineno lies within any inclusive (start_line, end_line) span."""
-    return any(start <= lineno <= end for start, end in spans)
-
-
-def _keep_raw_line(
-    lineno: int,
-    literal_spans: list[Span] | None,
-    non_literal_spans: list[Span],
-) -> bool:
-    """Return True when raw scan keeps `lineno` under collection allow-list and span exclusion."""
-    if literal_spans is not None and not _in_any_span(lineno, literal_spans):
-        return False
-    return not (non_literal_spans and _in_any_span(lineno, non_literal_spans))
+def _validate_mode(mode: str) -> None:
+    if mode not in ("yaml", "shell"):
+        raise ValueError(f"unknown scan mode: {mode!r}")
 
 
 def scan_install_calls(
-    text: str,
-    source_name: str,
+    text: str, source_name: str, *, mode: str = "yaml"
 ) -> tuple[list[InstallCall], list[str]]:
-    """Scan workflow text for bounded install calls, continuation overflows, and call-cap hits."""
-    scalars, literal_spans, yaml_error = _yaml_run_scalars(text, source_name)
-    if yaml_error is not None:
-        return ([], [yaml_error])
-    raw_calls, raw_findings = _scan_shell_text(text, source_name)
-    spans, yaml_calls, yaml_findings = _yaml_run_pass(scalars, source_name)
-    raw_calls = [call for call in raw_calls if _keep_raw_line(call[0], literal_spans, spans)]
-    raw_findings = [item for item in raw_findings if _keep_raw_line(item[0], literal_spans, spans)]
-    findings = [*(msg for _, msg in raw_findings), *yaml_findings]
-    merged = sorted([*raw_calls, *yaml_calls], key=lambda call: call[0])
-    if len(merged) > MAX_INSTALL_CALLS:
-        over_line = merged[MAX_INSTALL_CALLS][0]
+    """Scan a workflow's effective run scalars or a standalone shell script in source order."""
+    _validate_mode(mode)
+    scan = _scan_yaml_text if mode == "yaml" else _scan_shell_text
+    calls, findings = scan(text, source_name)
+    if len(calls) > MAX_INSTALL_CALLS:
+        over_line = calls[MAX_INSTALL_CALLS][0]
         findings.append(f"{source_name}:{over_line}: exceeds {MAX_INSTALL_CALLS} install calls")
-        return (merged[:MAX_INSTALL_CALLS], findings)
-    return (merged, findings)
+        return calls[:MAX_INSTALL_CALLS], findings
+    return calls, findings
 
 
-def extract_install_calls(text: str) -> list[tuple[int, str, tuple[str, ...]]]:
-    """Find every (lineno, list_path, trailing_args) install call in workflow text."""
-    calls, _ = scan_install_calls(text, "<workflow>")
+def extract_install_calls(text: str, *, mode: str = "yaml") -> list[InstallCall]:
+    """Find every (lineno, list_path, trailing_args) install call, up to MAX_INSTALL_CALLS."""
+    calls, _ = scan_install_calls(text, "<workflow>", mode=mode)
     return calls
 
 
@@ -396,11 +304,14 @@ def check_workflow_text(
     repo_root: Path = REPO_ROOT,
     source_name: str = ".github/workflows/tests-and-quality-gates.yml",
     driver_recommending: AbstractSet[str] = DRIVER_RECOMMENDING,
+    *,
+    mode: str = "yaml",
 ) -> list[str]:
     """Return findings where a DRIVER_RECOMMENDING list lacks --no-install-recommends."""
     if len(text.encode("utf-8")) > MAX_WORKFLOW_BYTES:
+        _validate_mode(mode)
         return [f"{source_name}: exceeds {MAX_WORKFLOW_BYTES} bytes"]
-    calls, findings = scan_install_calls(text, source_name)
+    calls, findings = scan_install_calls(text, source_name, mode=mode)
     cache: dict[Path, set[str] | str] = {}
     drivers = set(driver_recommending)
     for lineno, list_rel, args in calls:
@@ -430,7 +341,7 @@ def check_workflow(
     text, err = read_bounded_utf8(target, MAX_WORKFLOW_BYTES)
     if err is not None or text is None:
         return [err] if err is not None else []
-    return check_workflow_text(text, repo_root=repo_root, source_name=str(target))
+    return check_workflow_text(text, repo_root=repo_root, source_name=str(target), mode="yaml")
 
 
 class AptInstallRecommendsTest(unittest.TestCase):
@@ -497,14 +408,14 @@ class AptInstallRecommendsTest(unittest.TestCase):
             "          bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt \\\n"
             "            --no-install-recommends\n"
         )
-        self.assertEqual(check_workflow_text(continued, repo_root=self.root), [])
+        self.assertEqual(check_workflow_text(continued, repo_root=self.root, mode="shell"), [])
         chained = (
             "          bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt"
             " && echo --no-install-recommends\n"
         )
-        self.assertEqual(len(check_workflow_text(chained, repo_root=self.root)), 1)
+        self.assertEqual(len(check_workflow_text(chained, repo_root=self.root, mode="shell")), 1)
         missing = "          bash scripts/ci/apt-install-cached.sh install .github/apt/nope.txt\n"
-        missing_findings = check_workflow_text(missing, repo_root=self.root)
+        missing_findings = check_workflow_text(missing, repo_root=self.root, mode="shell")
         self.assertEqual(len(missing_findings), 1)
         self.assertIn("missing apt list", missing_findings[0])
 
@@ -514,7 +425,9 @@ class AptInstallRecommendsTest(unittest.TestCase):
             "bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt \\ \n"
             "--no-install-recommends\n"
         )
-        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        findings = check_workflow_text(
+            snippet, repo_root=self.root, source_name="fixture.yml", mode="shell"
+        )
         self.assertEqual(
             findings,
             [
@@ -529,7 +442,9 @@ class AptInstallRecommendsTest(unittest.TestCase):
             "bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt \\\t\n"
             "--no-install-recommends\n"
         )
-        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        findings = check_workflow_text(
+            snippet, repo_root=self.root, source_name="fixture.yml", mode="shell"
+        )
         self.assertEqual(
             findings,
             [
@@ -544,7 +459,9 @@ class AptInstallRecommendsTest(unittest.TestCase):
             "          bash scripts/ci/apt-install-cached.sh refresh"
             " && bash scripts/ci/apt-install-cached.sh install .github/apt/coverage.txt\n"
         )
-        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        findings = check_workflow_text(
+            snippet, repo_root=self.root, source_name="fixture.yml", mode="shell"
+        )
         self.assertEqual(len(findings), 1)
         self.assertIn("libcudart12", findings[0])
 
@@ -554,7 +471,9 @@ class AptInstallRecommendsTest(unittest.TestCase):
             "          bash scripts/ci/apt-install-cached.sh refresh"
             "&&bash scripts/ci/apt-install-cached.sh install .github/apt/coverage.txt\n"
         )
-        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        findings = check_workflow_text(
+            snippet, repo_root=self.root, source_name="fixture.yml", mode="shell"
+        )
         self.assertEqual(len(findings), 1)
         self.assertIn("libcudart12", findings[0])
 
@@ -566,7 +485,9 @@ class AptInstallRecommendsTest(unittest.TestCase):
             " .github/apt/first.txt --no-install-recommends"
             " && bash scripts/ci/apt-install-cached.sh install .github/apt/second.txt\n"
         )
-        findings = check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml")
+        findings = check_workflow_text(
+            snippet, repo_root=self.root, source_name="fixture.yml", mode="shell"
+        )
         self.assertEqual(len(findings), 1)
         self.assertIn(".github/apt/second.txt", findings[0])
 
@@ -580,13 +501,17 @@ class AptInstallRecommendsTest(unittest.TestCase):
             " .github/apt/second.txt --no-install-recommends\n"
         )
         self.assertEqual(
-            check_workflow_text(snippet, repo_root=self.root, source_name="fixture.yml"),
+            check_workflow_text(
+                snippet, repo_root=self.root, source_name="fixture.yml", mode="shell"
+            ),
             [],
         )
 
     def test_workflow_byte_cap_boundary(self) -> None:
         self._write_list(".github/apt/cov.txt", "libcudart12\n")
-        call_line = "bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt\n"
+        call_line = (
+            "steps:\n  - run: bash scripts/ci/apt-install-cached.sh install .github/apt/cov.txt\n"
+        )
         exact_size = 262_144
         exact_wf = self.root / "exact.yml"
         exact_wf.write_text(
@@ -619,7 +544,7 @@ class AptInstallRecommendsTest(unittest.TestCase):
         )
         self.assertEqual(exact_list.stat().st_size, exact_size)
         exact_snippet = "bash scripts/ci/apt-install-cached.sh install .github/apt/exact.txt\n"
-        exact_findings = check_workflow_text(exact_snippet, repo_root=self.root)
+        exact_findings = check_workflow_text(exact_snippet, repo_root=self.root, mode="shell")
         self.assertEqual(len(exact_findings), 1)
         self.assertIn("libcudart12", exact_findings[0])
 
@@ -633,7 +558,7 @@ class AptInstallRecommendsTest(unittest.TestCase):
             "bash scripts/ci/apt-install-cached.sh install .github/apt/oversize.txt\n"
         )
         self.assertEqual(
-            check_workflow_text(oversize_snippet, repo_root=self.root),
+            check_workflow_text(oversize_snippet, repo_root=self.root, mode="shell"),
             [f"{oversize_list}: exceeds {MAX_LIST_BYTES} bytes"],
         )
 
@@ -643,13 +568,17 @@ class AptInstallRecommendsTest(unittest.TestCase):
         at_cap = head + "  \\\n" * 198 + "  --no-install-recommends\n"
         self.assertEqual(len(at_cap.splitlines()), 200)
         self.assertEqual(
-            check_workflow_text(at_cap, repo_root=self.root, source_name="fixture.yml"),
+            check_workflow_text(
+                at_cap, repo_root=self.root, source_name="fixture.yml", mode="shell"
+            ),
             [],
         )
         over_cap = head + "  \\\n" * 199 + "  --no-install-recommends\n"
         self.assertEqual(len(over_cap.splitlines()), 201)
         self.assertEqual(
-            check_workflow_text(over_cap, repo_root=self.root, source_name="fixture.yml"),
+            check_workflow_text(
+                over_cap, repo_root=self.root, source_name="fixture.yml", mode="shell"
+            ),
             [f"fixture.yml:1: continuation exceeds {MAX_CONTINUATION_LINES} physical lines"],
         )
 
@@ -657,13 +586,14 @@ class AptInstallRecommendsTest(unittest.TestCase):
         self._write_list(".github/apt/plain.txt", "ninja-build\n")
         one_call = "bash scripts/ci/apt-install-cached.sh install .github/apt/plain.txt\n"
         self.assertEqual(
-            check_workflow_text(one_call * 64, repo_root=self.root),
+            check_workflow_text(one_call * 64, repo_root=self.root, mode="shell"),
             [],
         )
         over_findings = check_workflow_text(
             one_call * 65,
             repo_root=self.root,
             source_name="fixture.yml",
+            mode="shell",
         )
         self.assertEqual(
             over_findings,
@@ -700,6 +630,88 @@ class AptInstallRecommendsTest(unittest.TestCase):
                 " without --no-install-recommends"
             ],
         )
+
+    def test_literal_continuation_stops_at_step_boundary(self) -> None:
+        self._write_list("cov.txt", "libcudart12\n")
+        for next_run in ("echo ok", "|\n      echo ok", "|\n      echo --no-install-recommends"):
+            with self.subTest(next_run=next_run):
+                snippet = (
+                    "steps:\n"
+                    "  - run: |\n"
+                    "      apt-install-cached.sh install cov.txt \\\n"
+                    "  - name: --no-install-recommends\n"
+                    f"    run: {next_run}\n"
+                )
+                self.assertEqual(
+                    check_workflow_text(snippet, self.root, "wf"),
+                    ["wf:3: cov.txt names libcudart12 without --no-install-recommends"],
+                )
+
+    def test_merge_sequence_uses_first_mapping_with_run(self) -> None:
+        self._write_list("cov.txt", "libcudart12\n")
+        install = "apt-install-cached.sh install cov.txt"
+        flagged = install + " --no-install-recommends"
+        missing = ["wf:2: cov.txt names libcudart12 without --no-install-recommends"]
+        for a, b, expected in ((flagged, install, []), (install, flagged, missing)):
+            snippet = f"a: &a\n  run: {a}\nb: &b\n  run: {b}\nsteps:\n  - <<: [*a, *b]\n"
+            self.assertEqual(check_workflow_text(snippet, self.root, "wf"), expected)
+
+    def test_shared_leaf_over_merge_depth(self) -> None:
+        chain = "leaf: &m0 {run: echo ok}\n" + "".join(
+            f"anchor{depth}: &m{depth} {{<<: *m{depth - 1}}}\n"
+            for depth in range(1, MAX_STEP_MERGE_DEPTH + 1)
+        )
+        # A preceding step can also reference the chain before the over-depth step.
+        for prefix in ("", "  - <<: *m1\n"):
+            snippet = chain + f"steps:\n{prefix}  - <<: [*m0, *m{MAX_STEP_MERGE_DEPTH}]\n"
+            self.assertEqual(
+                check_workflow_text(snippet, self.root, "wf"),
+                [f"wf:2: step merge depth exceeds {MAX_STEP_MERGE_DEPTH}"],
+            )
+
+    def test_merge_path_visit_bound(self) -> None:
+        chain = "leaf: &m0 {run: echo ok}\n"
+        for depth in range(1, MAX_STEP_MERGE_DEPTH):
+            aliases = ", ".join([f"*m{depth - 1}"] * 5)
+            chain += f"anchor{depth}: &m{depth} {{<<: [{aliases}]}}\n"
+        snippet = chain + f"steps:\n  - <<: *m{MAX_STEP_MERGE_DEPTH - 1}\n"
+        self.assertEqual(
+            check_workflow_text(snippet, self.root, "wf"),
+            [f"wf:1: {HOSTED_YAML_NODE_BOUND_MESSAGE}"],
+        )
+        self.assertEqual(
+            check_workflow_text("steps:\n  - &step {<<: *step}\n", self.root, "wf"),
+            [f"wf:2: step merge depth exceeds {MAX_STEP_MERGE_DEPTH}"],
+        )
+
+    def test_invalid_merge_and_non_scalar_override(self) -> None:
+        base = "base: &a {run: apt-install-cached.sh install missing.txt}\nsteps:\n"
+        self.assertEqual(
+            check_workflow_text(base + "  - <<: [*a, 1]\n", self.root, "wf"),
+            [f"wf:3: {HOSTED_YAML_PARSE_MESSAGE}"],
+        )
+        self.assertEqual(check_workflow_text(base + "  - <<: *a\n    run: []\n"), [])
+
+    def test_shell_and_yaml_modes(self) -> None:
+        self._write_list("cov.txt", "libcudart12\n")
+        snippet = "echo status: ready\n  apt-install-cached.sh install cov.txt\n"
+        self.assertEqual(
+            check_workflow_text(snippet, self.root, "wf", mode="shell"),
+            ["wf:2: cov.txt names libcudart12 without --no-install-recommends"],
+        )
+        self.assertEqual(extract_install_calls(snippet, mode="shell"), [(2, "cov.txt", ())])
+        self.assertEqual(check_workflow_text(snippet, self.root, "wf", mode="yaml"), [])
+        for document in ("echo ok", "[]", ""):
+            self.assertEqual(
+                check_workflow_text(document, self.root, "wf"),
+                ["wf:1: workflow root is not a YAML mapping"],
+            )
+        self.assertEqual(
+            check_workflow_text("'unterminated", self.root, "wf"),
+            [f"wf:1: {HOSTED_YAML_PARSE_MESSAGE}"],
+        )
+        with self.assertRaises(ValueError):
+            check_workflow_text(snippet, mode="auto")
 
     def test_qualified_driver_tokens_without_flag_fail(self) -> None:
         snippet = (
@@ -776,6 +788,21 @@ class AptInstallRecommendsTest(unittest.TestCase):
         self.assertEqual(
             check_workflow_text(over_cap, repo_root=self.root, source_name="fixture.yml"),
             [f"fixture.yml:4: exceeds {MAX_INSTALL_CALLS} install calls"],
+        )
+
+    def test_install_call_cap_across_scalars_in_source_order(self) -> None:
+        call = "apt-install-cached.sh install cov.txt"
+        snippet = (
+            f"command: &first '{call}'\nsteps:\n"
+            + f"  - run: |\n      {call}\n" * MAX_INSTALL_CALLS
+            + "  - run: *first\n"
+        )
+        calls, findings = scan_install_calls(snippet, "wf")
+        lines = [1, *range(4, 2 * MAX_INSTALL_CALLS + 1, 2)]
+        self.assertEqual([line for line, _, _ in calls], lines)
+        overflow_line = 2 + 2 * MAX_INSTALL_CALLS
+        self.assertEqual(
+            findings, [f"wf:{overflow_line}: exceeds {MAX_INSTALL_CALLS} install calls"]
         )
 
     def test_job_env_quoted_run_without_flag_passes(self) -> None:
