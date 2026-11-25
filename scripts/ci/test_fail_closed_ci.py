@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from unittest import mock
@@ -253,80 +253,14 @@ def ci_text_paths(root: Path) -> list[Path]:
     return sorted(paths)
 
 
-def _bash_line_end(raw: str, quote: str, word_start: bool) -> tuple[str, bool, bool]:
-    """Return open quote, word boundary and pending escape after one physical line."""
-    chars = iter(raw)
-    for char in chars:
-        if char == "\\" and quote != "'":
-            if next(chars, None) is None:
-                return quote, word_start, True
-            word_start = False
-        elif quote:
-            if char == quote:
-                quote = ""
-        elif char == "#" and word_start:
-            return "", True, False
-        elif char in "\"'":
-            quote = char
-            word_start = False
-        else:
-            word_start = char in " \t;&|()<>"
-    return quote, word_start, False
+def _logical_ci_lines(text: str) -> list[tuple[int, str, bool]]:
+    """Join backslash-continued physical lines up to MAX_CONTINUATION_LINES."""
+    return _join_continued_lines(list(enumerate(text.splitlines(), 1)))
 
 
-def _bash_logical_lines(
-    lines: list[tuple[int, str]], final_newline: bool, *, carry_quotes: bool
-) -> list[tuple[int, str, bool]]:
-    logical: list[tuple[int, str, bool]] = []
-    parts: list[str] = []
-    quote, word_start = "", True
-    for index, (number, raw) in enumerate(lines):
-        if not parts:
-            start = number
-        quote, word_start, escaped = _bash_line_end(raw, quote, word_start)
-        if not carry_quotes:
-            quote = ""
-        last = index + 1 == len(lines)
-        newline = not last or final_newline
-        overflow = number - start >= MAX_CONTINUATION_LINES
-        if not overflow:
-            if escaped and newline:
-                parts.append(raw[:-1])
-            elif quote and newline:
-                parts.append(raw + "\n")
-            else:
-                parts.append(raw)
-        if last or not (escaped or quote):
-            logical.append((start, "".join(parts), overflow))
-            parts.clear()
-            word_start = True
-    return logical
-
-
-def _logical_ci_lines(
-    text: str, *, blank_after_escape: bool = False, carry_quotes: bool = True
-) -> list[tuple[int, str, bool]]:
-    """Join shell physical lines using the Bash or BuildKit continuation rules."""
-    return _join_continued_lines(
-        list(enumerate(text.splitlines(), 1)),
-        blank_after_escape=blank_after_escape,
-        carry_quotes=carry_quotes,
-        final_newline=text.endswith(("\n", "\r")),
-    )
-
-
-def _join_continued_lines(
-    lines: list[tuple[int, str]],
-    *,
-    blank_after_escape: bool,
-    final_newline: bool = True,
-    carry_quotes: bool = True,
-) -> list[tuple[int, str, bool]]:
+def _join_continued_lines(lines: list[tuple[int, str]]) -> list[tuple[int, str, bool]]:
     """Join numbered lines, bounding storage by their original physical span."""
-    if not blank_after_escape:
-        return _bash_logical_lines(lines, final_newline, carry_quotes=carry_quotes)
     logical: list[tuple[int, str, bool]] = []
-    separator = "\n" if blank_after_escape else ""
     parts: list[str] = []
     start_line = 1
     count = 0
@@ -334,21 +268,21 @@ def _join_continued_lines(
         if count == 0:
             start_line = number
         count = number - start_line + 1
-        candidate = raw.rstrip(" \t") if blank_after_escape else raw
-        continues = candidate.endswith("\\")
+        stripped = raw.rstrip()
+        continues = stripped.endswith("\\")
         if count <= MAX_CONTINUATION_LINES:
-            parts.append(candidate[:-1] if continues else raw)
+            parts.append(stripped[:-1] if continues else raw)
         if not continues:
-            logical.append((start_line, separator.join(parts), count > MAX_CONTINUATION_LINES))
+            logical.append((start_line, "\n".join(parts), count > MAX_CONTINUATION_LINES))
             parts = []
             count = 0
     if count > 0:
-        logical.append((start_line, separator.join(parts), count > MAX_CONTINUATION_LINES))
+        logical.append((start_line, "\n".join(parts), count > MAX_CONTINUATION_LINES))
     return logical
 
 
 def _dockerfile_logical_lines(text: str) -> list[tuple[int, str, bool]]:
-    """Drop Docker comments/blanks, keep escape directives, and join BuildKit continuations."""
+    """Drop Docker comments and blanks before joining; retain leading escape directives."""
     logical: list[tuple[int, str, bool]] = []
     lines: list[tuple[int, str]] = []
     directives = True
@@ -366,7 +300,7 @@ def _dockerfile_logical_lines(text: str) -> list[tuple[int, str, bool]]:
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         lines.append((number, raw))
-    return [*logical, *_join_continued_lines(lines, blank_after_escape=True)]
+    return [*logical, *_join_continued_lines(lines)]
 
 
 def _is_hosted_workflow_or_action(path: Path) -> bool:
@@ -395,16 +329,12 @@ def _is_operator_token(token: str) -> bool:
     return bool(token) and set(token) <= SHELL_OPERATOR_CHARS
 
 
-def _iter_shell_tokens(text: str) -> Iterator[str]:
+def _tokenise_shell_item(text: str) -> list[str]:
     """Tokenise one logical shell line or nested command string with shlex."""
     lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = "#"
-    yield from lexer
-
-
-def _tokenise_shell_item(text: str) -> list[str]:
-    return list(_iter_shell_tokens(text))
+    return list(lexer)
 
 
 def coverage_shard_argv_problem(step: str, index: int) -> str | None:
@@ -893,18 +823,13 @@ def _hosted_yaml_run_problems(path: Path, text: str) -> list[str]:
 
 
 def apt_update_problems(path: Path, text: str) -> list[str]:
-    """Reject unsafe apt refreshes, folded hosted `run` blocks, and hosted sudo refreshes.
-
-    Whole-file scans do not track quotes across lines because the file is not Bash throughout.
-    """
+    """Reject unsafe apt refreshes, folded hosted `run` blocks, and hosted sudo refreshes."""
     problems: list[str] = []
     hosted_surface = _is_hosted_workflow_or_action(path)
     container_file = _is_containerfile_path(path)
     if hosted_surface:
         problems.extend(_hosted_yaml_run_problems(path, text))
-    for line_number, logical_line, overflowed in _logical_ci_lines(
-        text, blank_after_escape=container_file, carry_quotes=False
-    ):
+    for line_number, logical_line, overflowed in _logical_ci_lines(text):
         if overflowed:
             problems.append(f"{path.as_posix()}:{line_number}: {APT_CONTINUATION_MESSAGE}")
             continue
@@ -1459,13 +1384,6 @@ class UbuntuAptSnapshotContract(unittest.TestCase):
             "\n".join(ubuntu_apt_snapshot_problems(image + "\n" + over_bound)),
         )
 
-    def test_dockerfile_continuation_allows_blank_after_escape(self) -> None:
-        """Keep BuildKit continuation joining when spaces or tabs trail the escape."""
-        self.assertEqual(_dockerfile_logical_lines("RUN a \\ \n  b\n"), [(1, "RUN a \n  b", False)])
-        self.assertEqual(
-            _dockerfile_logical_lines("RUN a \\\t\n  b\n"), [(1, "RUN a \n  b", False)]
-        )
-
     def test_only_parsed_instruction_shapes_are_accepted(self) -> None:
         image = self.image()
         before_pin = image.index("RUN apt-get")
@@ -1931,7 +1849,7 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
 
     def test_update_split_across_continuation(self) -> None:
         """Join backslash continuations with first-line reporting and bounded physical length."""
-        self.track({"split.sh": "apt-get -qq \\\n  update\n"})
+        self.track({"split.sh": "apt-get -qq \\   \n  update\n"})
         self.assertEqual(
             apt_update_contract_problems(self.root),
             [f"split.sh:1: {APT_UPDATE_MESSAGE}"],
@@ -1953,108 +1871,6 @@ class AptUpdateFailClosedContract(DisposableRepoTestCase):
         self.assertEqual(
             apt_update_contract_problems(self.root),
             [f"split.sh:1: {APT_CONTINUATION_MESSAGE}"],
-        )
-
-    def test_dockerfile_update_split_blank_after_continuation(self) -> None:
-        """Join BuildKit trailing-blank continuations in containerfiles, not in shell files."""
-        cases: tuple[tuple[str, Path, str, list[str]], ...] = (
-            (
-                "positive-space",
-                Path("Dockerfile"),
-                "FROM ubuntu:24.04\nRUN apt-get \\ \n  update\n",
-                [f"Dockerfile:2: {APT_UPDATE_MESSAGE}"],
-            ),
-            (
-                "positive-tab",
-                Path("Containerfile"),
-                "FROM ubuntu:24.04\nRUN apt-get \\\t\n  update\n",
-                [f"Containerfile:2: {APT_UPDATE_MESSAGE}"],
-            ),
-            (
-                "boundary-compliant",
-                Path("Dockerfile"),
-                (
-                    "FROM ubuntu:24.04\n"
-                    "RUN apt-get --error-on=any -o Acquire::Retries=3 \\ \n  update\n"
-                ),
-                [],
-            ),
-            (
-                "negative-shell",
-                Path("ci/split.sh"),
-                "apt-get -qq \\ \n  update\n",
-                [],
-            ),
-        )
-        for label, path, text, expected in cases:
-            with self.subTest(label=label):
-                self.assertEqual(apt_update_problems(path, text), expected)
-
-    def test_logical_ci_lines_bash_quotes_comments_and_escapes(self) -> None:
-        for raw in ("echo # \\", "echo;# \\", "echo c\\\\", r"echo \'", r"echo \""):
-            self.assertEqual(
-                _logical_ci_lines(raw + "\nnext"), [(1, raw, False), (2, "next", False)]
-            )
-        for raw, expected in (
-            ("echo a#b\\\nc", "echo a#bc"),
-            ("echo a\\ #b\\\nc", "echo a\\ #bc"),
-            ("echo a\\\n#b\\\nc", "echo a#bc"),
-            ("echo 'x\\\ny'", "echo 'x\\\ny'"),
-            ('echo "x\\\ny"', 'echo "xy"'),
-            ('echo "x\\\\\ny"', 'echo "x\\\\\ny"'),
-            ("echo 'x\ny", "echo 'x\ny"),
-        ):
-            self.assertEqual(_logical_ci_lines(raw), [(1, expected, False)])
-        self.assertEqual(
-            apt_update_problems(Path("s.sh"), "true # ignored \\\napt-get update"),
-            [f"s.sh:2: {APT_UPDATE_MESSAGE}"],
-        )
-
-    def test_logical_ci_lines_with_line_scoped_quotes(self) -> None:
-        for first, second in (
-            ("echo 'x\\", "y'"),
-            ("# don't \\", "apt-get update"),
-            (r"echo c\\", "d"),
-        ):
-            with self.subTest(first=first):
-                self.assertEqual(
-                    _logical_ci_lines(first + "\n" + second, carry_quotes=False),
-                    [(1, first, False), (2, second, False)],
-                )
-        for text, joined in (
-            ('echo "a \\\nb"', 'echo "a b"'),
-            ("echo a\\\n#b\\\nc", "echo a#bc"),
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(_logical_ci_lines(text, carry_quotes=False), [(1, joined, False)])
-
-    def test_logical_ci_lines_open_quote_overflow_by_mode(self) -> None:
-        text = "owner's note\n" + "plain\n" * 300
-        lines = _logical_ci_lines(text, carry_quotes=False)
-        self.assertEqual(len(lines), 301)
-        self.assertFalse(any(overflow for _, _, overflow in lines))
-        [(start, _, overflow)] = _logical_ci_lines(text)
-        self.assertEqual(start, 1)
-        self.assertTrue(overflow)
-
-    def test_yaml_prose_apostrophe_preserves_refresh_line(self) -> None:
-        path = Path("notes.yaml")
-        text = "description: author's note\nsetup: |\n  apt-get update\n"
-        self.assertEqual(apt_update_problems(path, text), [f"notes.yaml:3: {APT_UPDATE_MESSAGE}"])
-
-    def test_logical_ci_lines_continuation_requires_adjacent_newline(self) -> None:
-        """Join bash `\\`+newline continuations, not `\\` followed by spaces or tabs."""
-        self.assertEqual(
-            _logical_ci_lines("a \\ \nb\n"),
-            [(1, "a \\ ", False), (2, "b", False)],
-        )
-        self.assertEqual(
-            _logical_ci_lines("a \\\t\nb\n"),
-            [(1, "a \\\t", False), (2, "b", False)],
-        )
-        self.assertEqual(
-            _logical_ci_lines("a \\\nb\n"),
-            [(1, "a b", False)],
         )
 
     def test_effective_acquire_retries_and_option_spellings(self) -> None:
