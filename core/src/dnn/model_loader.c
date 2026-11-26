@@ -13,6 +13,14 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "pdjson.h"
+#endif
+
 #ifdef _WIN32
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -261,9 +269,10 @@ static int json_dup_string_elem(const char **pp, char **out_s)
     return 0;
 }
 
-static const char *skip_spaces(const char *p)
+static const char *skip_spaces(const char *p, const char *end)
 {
-    while (*p && json_is_space(*p))
+    while (p < end && json_is_space(*p))
+        // SAFETY: p precedes end within the same buffer.
         p++;
     return p;
 }
@@ -298,9 +307,11 @@ static int extract_string_array(const char *doc, const char *key, char **out, si
     if (rc != 0)
         return rc;
 
+    // SAFETY: the sidecar is NUL-terminated and capped at DNN_SIDECAR_JSON_MAX.
+    const char *end = doc + strnlen(doc, DNN_SIDECAR_JSON_MAX);
     size_t cnt = 0u;
-    while (*p) {
-        p = skip_spaces(p);
+    while (p < end) {
+        p = skip_spaces(p, end);
         if (*p == ']') {
             *out_n = cnt;
             return 0;
@@ -310,7 +321,7 @@ static int extract_string_array(const char *doc, const char *key, char **out, si
             free_partial_string_array(out, cnt);
             return rc;
         }
-        p = skip_spaces(p);
+        p = skip_spaces(p, end);
         if (*p == ',') {
             ++p;
             continue;
@@ -352,9 +363,11 @@ static int extract_float_array(const char *doc, const char *key, float *out, siz
     if (rc != 0)
         return rc;
 
+    // SAFETY: the sidecar is NUL-terminated and capped at DNN_SIDECAR_JSON_MAX.
+    const char *end = doc + strnlen(doc, DNN_SIDECAR_JSON_MAX);
     size_t cnt = 0u;
-    while (*p) {
-        p = skip_spaces(p);
+    while (p < end) {
+        p = skip_spaces(p, end);
         if (*p == ']') {
             *out_n = cnt;
             return 0;
@@ -366,7 +379,7 @@ static int extract_float_array(const char *doc, const char *key, float *out, siz
         if (cnt >= max)
             return -ERANGE;
         out[cnt++] = v;
-        p = skip_spaces(p);
+        p = skip_spaces(p, end);
         if (*p == ',') {
             ++p;
             continue;
@@ -1152,110 +1165,149 @@ int vmaf_dnn_validate_onnx(const char *path, size_t max_bytes)
  * ============================================================ */
 
 #ifndef _WIN32
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
 /* environ is a POSIX extension; the variable is only accessed in the
  * POSIX (non-Windows) build path via posix_spawnp().  Confine the
  * extern declaration here to match the actual usage site. */
 extern char **environ;
-#endif
 
-#ifndef _WIN32 /* only the POSIX vmaf_dnn_verify_signature() below uses the two registry helpers */
-/* Parse the `"..."` value after a matched JSON key; 0 on success,
- * @p no_colon_err when ':' is missing, -EBADMSG when the value is not quoted. */
-static int json_quoted_after_key(const char *key_pos, int no_colon_err, const char **out_val,
-                                 size_t *out_len)
+struct registry_string {
+    const char *ptr;
+    size_t len;
+};
+
+struct registry_entry {
+    struct registry_string onnx;
+    struct registry_string bundle;
+};
+
+/* Keep the wire bytes of the value, including any escapes, for exact comparison. */
+static int read_registry_string(json_stream *stream, const char *doc, size_t len, int missing_colon,
+                                struct registry_string *value)
 {
-    const char *colon = strchr(key_pos, ':');
-    if (!colon)
-        return no_colon_err;
-    // SAFETY: colon points to ':' in key_pos, so colon + 1 is within the NUL-terminated string.
-    const char *p = skip_spaces(colon + 1);
-    if (*p != '"')
+    const size_t pos = json_get_position(stream);
+    if (pos > len || value->ptr)
         return -EBADMSG;
-    p++;
-    const char *q = strchr(p, '"');
-    if (!q)
+    // SAFETY: pos <= len, and the slurped buffer has a terminator at doc[len].
+    const char *end = doc + len;
+    // SAFETY: pos indexes the byte after the key's closing quote.
+    const char *colon = skip_spaces(doc + pos, end);
+    if (colon == end || *colon != ':')
+        return missing_colon;
+    // SAFETY: colon precedes end, so colon + 1 lies within the buffer.
+    const char *quote = skip_spaces(colon + 1, end);
+    if (json_next(stream) != JSON_STRING)
         return -EBADMSG;
-    *out_val = p;
-    // SAFETY: q was found by strchr starting at p, so p <= q in the same string.
-    *out_len = (size_t)(q - p);
+    const size_t after = json_get_position(stream);
+    if (after > len || quote == end)
+        return -EBADMSG;
+    // SAFETY: pdjson consumed a quoted string at quote and stopped after its closing quote.
+    value->ptr = quote + 1;
+    // SAFETY: doc[after - 1] is the closing quote, at or after value->ptr.
+    value->len = (size_t)(&doc[after - 1u] - value->ptr);
     return 0;
 }
 
-static int read_entry_bundle_name(const char *after_onnx, const char **name, size_t *len)
+/* Descend into the models array only. Skip all unrelated values as complete
+ * JSON values, so keys in nested metadata cannot become registry fields. */
+static int read_registry_field(json_stream *stream, const char *doc, size_t len,
+                               struct registry_entry *entry)
 {
-    const char *next_onnx = strstr(after_onnx, "\"onnx\"");
-    const char *bundle_key = strstr(after_onnx, "\"sigstore_bundle\"");
-    if (!bundle_key || (next_onnx && bundle_key > next_onnx))
-        return -ENOENT;
-    return json_quoted_after_key(bundle_key, -EBADMSG, name, len);
+    size_t size = 0u;
+    const char *key = json_get_string(stream, &size);
+    if (size == sizeof("models") && memcmp(key, "models", size) == 0 &&
+        json_get_depth(stream) == 1u)
+        return json_next(stream) == JSON_ARRAY ? 0 : -EBADMSG;
+    if (size == sizeof("onnx") && memcmp(key, "onnx", size) == 0)
+        return read_registry_string(stream, doc, len, -ENOENT, &entry->onnx);
+    if (size == sizeof("sigstore_bundle") && memcmp(key, "sigstore_bundle", size) == 0)
+        return read_registry_string(stream, doc, len, -EBADMSG, &entry->bundle);
+    return json_skip(stream) == JSON_ERROR ? -EBADMSG : 0;
 }
 
-/* The returned slice belongs to the registry and is used only for comparison. */
-static int find_bundle_for_onnx(const char *registry_doc, size_t doc_len, const char *onnx_basename,
-                                const char **name, size_t *name_len)
+static bool registry_basename_matches(const struct registry_string *onnx, const char *base,
+                                      size_t len)
 {
-    const size_t base_len = strnlen(onnx_basename, PATH_MAX);
-    if (base_len == PATH_MAX)
-        return -ENAMETOOLONG;
-    const char *cursor = registry_doc;
-    for (size_t entry = 0u; entry < doc_len; entry++) {
-        cursor = strstr(cursor, "\"onnx\"");
-        if (!cursor)
+    return onnx->ptr && onnx->len == len && memcmp(onnx->ptr, base, len) == 0;
+}
+
+static int scan_registry(json_stream *stream, const char *doc, size_t len, const char *base,
+                         size_t base_len, struct registry_string *bundle)
+{
+    struct registry_entry entry = {0};
+    for (size_t token = 0u; token <= len; token++) {
+        switch (json_next(stream)) {
+        case JSON_OBJECT:
+            entry = (struct registry_entry){0};
             break;
-        const char *p = NULL;
-        size_t len = 0u;
-        const int err = json_quoted_after_key(cursor, -ENOENT, &p, &len);
-        if (err != 0)
-            return err;
-        // SAFETY: p[len] is the closing quote found by json_quoted_after_key, so p + len + 1u is in bounds.
-        const char *after_quote = p + len + 1u;
-        if (base_len == len && memcmp(p, onnx_basename, len) == 0)
-            return read_entry_bundle_name(after_quote, name, name_len);
-        cursor = after_quote;
+        case JSON_STRING: {
+            const int err = read_registry_field(stream, doc, len, &entry);
+            if (err != 0)
+                return err;
+            break;
+        }
+        case JSON_OBJECT_END:
+            if (registry_basename_matches(&entry.onnx, base, base_len)) {
+                *bundle = entry.bundle;
+                return bundle->ptr ? 0 : -ENOENT;
+            }
+            break;
+        case JSON_ARRAY_END:
+        case JSON_DONE:
+            return -ENOENT;
+        default:
+            return -EBADMSG;
+        }
     }
-    return -ENOENT;
+    return -EBADMSG;
 }
 
-/* Slurp a registry or bundle JSON file into a freshly-allocated NUL-terminated
- * buffer and write its length (without the NUL) to @p out_len. Bounded to
- * 1 MiB: the registry is < 8 KiB and a bundle about 10 KiB today; the cap is a
- * defensive sanity bound. Caller frees. */
-static int slurp_json_file(const char *path, char **out_buf, size_t *out_len)
+/* Stat the open descriptor before making reads blocking. */
+static int regular_json_size(int fd, size_t *size)
 {
-    FILE *f = vmaf_fopen_utf8(path, "rb");
-    if (!f)
+    struct stat st;
+    if (fstat(fd, &st) != 0)
         return -errno;
-    if (fseek(f, 0, SEEK_END) != 0) {
-        (void)fclose(f);
-        return -EIO;
-    }
-    long sz_raw = ftell(f);
-    if (sz_raw < 0 || sz_raw > 1048576L) {
-        (void)fclose(f);
+    if (!S_ISREG(st.st_mode))
+        return -EINVAL;
+    if (st.st_size < 0 || st.st_size > 1048576L)
         return -EFBIG;
-    }
-    const size_t sz = (size_t)sz_raw;
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        (void)fclose(f);
-        return -EIO;
-    }
-    char *buf = (char *)calloc(sz + 1u, 1u);
-    if (!buf) {
-        (void)fclose(f);
-        return -ENOMEM;
-    }
-    const size_t r = fread(buf, 1u, sz, f);
-    (void)fclose(f);
-    if (r != sz) {
-        free(buf);
-        return -EIO;
-    }
-    *out_buf = buf;
-    *out_len = sz;
+    const int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0)
+        return -errno;
+    *size = (size_t)st.st_size;
     return 0;
+}
+
+static int read_json_stream(FILE *f, size_t size, char **out)
+{
+    char *buf = calloc(size + 1u, 1u);
+    int err = buf ? 0 : -ENOMEM;
+    if (buf && fread(buf, 1u, size, f) != size)
+        err = -EIO;
+    if (fclose(f) != 0 && err == 0)
+        err = -errno;
+    if (err != 0)
+        free(buf);
+    else
+        *out = buf;
+    return err;
+}
+
+static int slurp_json_file(int dir_fd, const char *name, int flags, char **out, size_t *len)
+{
+    const int fd = openat(dir_fd, name, O_RDONLY | O_NONBLOCK | O_CLOEXEC | flags);
+    if (fd < 0)
+        return errno == ELOOP ? -EINVAL : -errno;
+    int err = regular_json_size(fd, len);
+    if (err == 0) {
+        FILE *f = fdopen(fd, "rb");
+        if (f)
+            return read_json_stream(f, *len, out);
+        err = -errno;
+    }
+    if (close(fd) != 0)
+        vmaf_log(VMAF_LOG_LEVEL_WARNING, "cannot close %s after read error\n", name);
+    return err;
 }
 #endif /* !_WIN32 */
 
@@ -1275,12 +1327,11 @@ int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path)
     return -ENOSYS;
 }
 #else
-/* Compute the basename portion of `path` (no allocation; returns a pointer
- * into the input). Defensive against trailing slashes by stopping at the
- * first non-slash from the right. */
+/* Return the bytes after the last slash, or the whole path if it has none. */
 static const char *path_basename(const char *path)
 {
     const char *slash = strrchr(path, '/');
+    // SAFETY: a slash in the path is followed by another byte or the terminator.
     return slash ? slash + 1 : path;
 }
 
@@ -1294,7 +1345,7 @@ static int is_executable_file(const char *path)
 static void copy_n_terminated(char *dst, const char *src, size_t len);
 
 /* Locate `cosign` on PATH. Returns 0 on success and writes the resolved
- * absolute path into `out`; returns -EACCES otherwise. Implemented by
+ * path into `out`; returns -ENAMETOOLONG for an overlong PATH, -EACCES for a miss. Implemented by
  * walking PATH manually and stat-checking each candidate so we never need
  * a shell.
  *
@@ -1305,23 +1356,23 @@ static int locate_cosign(const char *path_env, char *out, size_t out_sz)
 {
     if (!path_env || path_env[0] == '\0')
         return -EACCES;
-    const char *p = path_env;
-    while (*p) {
-        const char *colon = strchr(p, ':');
-        // SAFETY: colon was found by strchr starting at p, so p <= colon in path_env.
-        const size_t seg_len = colon ? (size_t)(colon - p) : strlen(p);
+    const size_t len = strnlen(path_env, VMAF_DNN_COSIGN_PATH_MAX + 1u);
+    if (len > VMAF_DNN_COSIGN_PATH_MAX)
+        return -ENAMETOOLONG;
+    for (size_t offset = 0u; offset < len;) {
+        // SAFETY: offset < len, the bounded length of path_env.
+        const char *p = path_env + offset;
+        const char *colon = memchr(p, ':', len - offset);
+        // SAFETY: a non-NULL colon lies in the remaining PATH slice.
+        const size_t seg_len = colon ? (size_t)(colon - p) : len - offset;
         if (seg_len > 0u && seg_len + sizeof("/cosign") <= out_sz) {
-            assert(seg_len < out_sz);
             copy_n_terminated(out, p, seg_len);
-            // SAFETY: seg_len + sizeof("/cosign") <= out_sz bounds out + seg_len.
-            (void)snprintf(out + seg_len, out_sz - seg_len, "/cosign");
+            // SAFETY: the checked capacity includes the suffix and its NUL.
+            copy_n_terminated(out + seg_len, "/cosign", sizeof("/cosign") - 1u);
             if (is_executable_file(out))
                 return 0;
         }
-        if (!colon)
-            break;
-        // SAFETY: colon points to ':' in path_env, so colon + 1 is within path_env.
-        p = colon + 1;
+        offset += seg_len + 1u;
     }
     return -EACCES;
 }
@@ -1333,12 +1384,14 @@ static int default_registry_path(const char *onnx_path, char *out, size_t out_sz
 {
     const char *slash = strrchr(onnx_path, '/');
     if (slash) {
+        // SAFETY: slash is the separator found within onnx_path.
         const size_t dlen = (size_t)(slash - onnx_path);
         if (dlen + sizeof("/registry.json") > out_sz)
             return -ENAMETOOLONG;
         assert(dlen < out_sz);
-        memcpy(out, onnx_path, dlen);
-        (void)snprintf(out + dlen, out_sz - dlen, "/registry.json");
+        copy_n_terminated(out, onnx_path, dlen);
+        // SAFETY: the capacity check includes both the suffix and its terminator.
+        copy_n_terminated(out + dlen, "/registry.json", sizeof("/registry.json") - 1u);
         return 0;
     }
     const int n = snprintf(out, out_sz, "model/tiny/registry.json");
@@ -1352,73 +1405,6 @@ static void copy_n_terminated(char *dst, const char *src, size_t len)
     for (size_t i = 0u; i < len; i++)
         dst[i] = src[i];
     dst[len] = '\0';
-}
-
-static int confine_bundle_path_with_buffers(const char *reg_dir, char *out, size_t out_sz,
-                                            char *resolved)
-{
-    if (vmaf_fullpath_utf8(out, resolved, PATH_MAX) == NULL)
-        return errno == ENOENT ? -ENOENT : -EINVAL;
-    if (enforce_tiny_model_jail(resolved, reg_dir) != 0)
-        return -EINVAL;
-    const size_t rlen = strnlen(resolved, PATH_MAX);
-    if (rlen + 1u > out_sz)
-        return -ENAMETOOLONG;
-    copy_n_terminated(out, resolved, rlen);
-    return 0;
-}
-
-static int confine_bundle_path(const char *reg_path, size_t dlen, int has_slash, char *out,
-                               size_t out_sz)
-{
-    char *reg_dir = calloc(PATH_MAX, 1u);
-    char *resolved = calloc(PATH_MAX, 1u);
-    if (!reg_dir || !resolved) {
-        free(reg_dir);
-        free(resolved);
-        return -ENOMEM;
-    }
-    if (!has_slash) {
-        copy_n_terminated(reg_dir, ".", 1u);
-    } else if (dlen == 0u) {
-        copy_n_terminated(reg_dir, "/", 1u);
-    } else {
-        copy_n_terminated(reg_dir, reg_path, dlen);
-    }
-    const int err = confine_bundle_path_with_buffers(reg_dir, out, out_sz, resolved);
-    free(reg_dir);
-    free(resolved);
-    return err;
-}
-
-/* Resolve @p bundle_rel against the directory of @p reg_path and confine the
- * resolved target to that directory. */
-static int resolve_bundle_abs(const char *reg_path, const char *bundle_rel, char *out,
-                              size_t out_sz)
-{
-    /* path_basename() removed POSIX separators; also reject backslashes. */
-    if (strchr(bundle_rel, '\\'))
-        return -EINVAL;
-    const size_t blen = strlen(bundle_rel);
-    const char *reg_slash = strrchr(reg_path, '/');
-    if (!reg_slash) {
-        if (blen + 1u > out_sz)
-            return -ENAMETOOLONG;
-        memcpy(out, bundle_rel, blen);
-        out[blen] = '\0';
-        return confine_bundle_path(reg_path, 0u, 0, out, out_sz);
-    }
-    // SAFETY: reg_slash was found by strrchr in reg_path, so reg_path <= reg_slash.
-    const size_t dlen = (size_t)(reg_slash - reg_path);
-    if (dlen + 1u + blen + 1u > out_sz || dlen >= PATH_MAX)
-        return -ENAMETOOLONG;
-    assert(dlen < out_sz);
-    memcpy(out, reg_path, dlen);
-    out[dlen] = '/';
-    // SAFETY: dlen + 1u + blen + 1u <= out_sz was checked above.
-    memcpy(out + dlen + 1u, bundle_rel, blen);
-    out[dlen + 1u + blen] = '\0';
-    return confine_bundle_path(reg_path, dlen, 1, out, out_sz);
 }
 
 /* Spawn `cosign verify-blob` on @p onnx_path with @p bundle_abs and wait for
@@ -1453,71 +1439,105 @@ static int run_cosign_verify(const char *cosign_path, const char *bundle_abs, co
     if (sp != 0)
         return -sp;
 
+    enum { MAX_WAIT_ATTEMPTS = 128 };
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
+    for (unsigned attempt = 0u; attempt < MAX_WAIT_ATTEMPTS; attempt++) {
+        if (waitpid(pid, &status, 0) >= 0)
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -EPROTO;
         if (errno != EINTR)
             return -errno;
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-        return -EPROTO;
-    return 0;
-}
-
-/* Look @p onnx_path's basename up in the registry (defaulting to
- * <dirname(onnx_path)>/registry.json when @p registry_path is NULL) and
- * write the absolute path of its cosign bundle into @p out. */
-static int lookup_bundle_abs(const char *onnx_path, const char *registry_path, char *out,
-                             size_t out_sz)
-{
-    /* Default registry: <dirname(onnx_path)>/registry.json. */
-    char default_reg[PATH_MAX];
-    const char *reg_path = registry_path;
-    if (!reg_path) {
-        const int prc = default_registry_path(onnx_path, default_reg, sizeof(default_reg));
-        if (prc != 0)
-            return prc;
-        reg_path = default_reg;
-    }
-    assert(reg_path != NULL);
-
-    char *reg_buf = NULL;
-    size_t reg_len = 0u;
-    int err = slurp_json_file(reg_path, &reg_buf, &reg_len);
-    if (err != 0)
-        return err;
-    assert(reg_buf != NULL);
-
-    const char *base = path_basename(onnx_path);
-    assert(base != NULL);
-    char bundle_rel[PATH_MAX];
-    const char *registry_name = NULL;
-    size_t name_len = 0u;
-    err = find_bundle_for_onnx(reg_buf, reg_len, base, &registry_name, &name_len);
-    if (err == 0) {
-        const int n = snprintf(bundle_rel, sizeof(bundle_rel), "%s.sigstore.json", base);
-        if (n < 0 || (size_t)n >= sizeof(bundle_rel)) {
-            err = -ENAMETOOLONG;
-        } else if ((size_t)n != name_len || memcmp(bundle_rel, registry_name, name_len) != 0) {
-            err = -EINVAL;
-        }
-    }
-    free(reg_buf);
-    if (err != 0)
-        return err;
-    assert(bundle_rel[0] != '\0');
-
-    return resolve_bundle_abs(reg_path, bundle_rel, out, out_sz);
+    return -EINTR;
 }
 
 /* Search-only directory open: O_PATH (Linux) and O_SEARCH (POSIX) need no read
  * permission, so an execute-only directory on the TMPDIR path still opens. */
 #if defined(O_PATH)
-#define TEMP_DIR_OPEN_MODE O_PATH
+#define DIR_OPEN_MODE O_PATH
 #elif defined(O_SEARCH)
-#define TEMP_DIR_OPEN_MODE O_SEARCH
+#define DIR_OPEN_MODE O_SEARCH
 #else
-#define TEMP_DIR_OPEN_MODE O_RDONLY
+#define DIR_OPEN_MODE O_RDONLY
 #endif
+
+/* Pin the directory once for both the registry read and the derived bundle read. */
+static int registry_directory_fd(const char *path, size_t prefix_len)
+{
+    const char *parent = ".";
+    char *dir = NULL;
+    if (prefix_len != 0u) {
+        dir = strndup(path, prefix_len);
+        if (!dir)
+            return -ENOMEM;
+        parent = dir;
+    }
+    const int fd = openat(AT_FDCWD, parent, DIR_OPEN_MODE | O_DIRECTORY | O_CLOEXEC);
+    const int result = fd < 0 ? -errno : fd;
+    free(dir);
+    return result;
+}
+
+static int derive_bundle_name(const char *doc, size_t len, const char *base, char *name, size_t cap)
+{
+    const size_t base_len = strnlen(base, cap);
+    if (base_len == cap)
+        return -ENAMETOOLONG;
+    json_stream stream;
+    json_open_buffer(&stream, doc, len);
+    struct registry_string bundle = {0};
+    const int err = scan_registry(&stream, doc, len, base, base_len, &bundle);
+    json_close(&stream);
+    if (err != 0)
+        return err;
+    const int n = snprintf(name, cap, "%s.sigstore.json", base);
+    if (n < 0 || (size_t)n >= cap)
+        return -ENAMETOOLONG;
+    if (bundle.len != (size_t)n || memcmp(bundle.ptr, name, bundle.len) != 0 || strchr(name, '\\'))
+        return -EINVAL;
+    return 0;
+}
+
+static int read_registry_bundle(int dir_fd, const char *registry, size_t prefix_len,
+                                const char *base, char **bundle, size_t *len)
+{
+    char *doc = NULL;
+    size_t doc_len = 0u;
+    int err = slurp_json_file(dir_fd, registry, 0, &doc, &doc_len);
+    if (err != 0)
+        return err;
+    char bundle_rel[PATH_MAX];
+    err = derive_bundle_name(doc, doc_len, base, bundle_rel, sizeof(bundle_rel));
+    free(doc);
+    if (err != 0)
+        return err;
+    if (prefix_len + strnlen(bundle_rel, PATH_MAX) >= PATH_MAX)
+        return -ENAMETOOLONG;
+    return slurp_json_file(dir_fd, bundle_rel, O_NOFOLLOW, bundle, len);
+}
+
+static int lookup_bundle(const char *onnx_path, const char *registry_path, char **bundle,
+                         size_t *len)
+{
+    char default_reg[PATH_MAX];
+    if (!registry_path) {
+        const int rc = default_registry_path(onnx_path, default_reg, sizeof(default_reg));
+        if (rc != 0)
+            return rc;
+        registry_path = default_reg;
+    }
+    if (strnlen(registry_path, PATH_MAX) == PATH_MAX)
+        return -ENAMETOOLONG;
+    const char *registry = path_basename(registry_path);
+    // SAFETY: registry points to the basename within registry_path.
+    const size_t prefix_len = (size_t)(registry - registry_path);
+    const int fd = registry_directory_fd(registry_path, prefix_len);
+    if (fd < 0)
+        return fd;
+    int err = read_registry_bundle(fd, registry, prefix_len, path_basename(onnx_path), bundle, len);
+    if (close(fd) != 0 && err == 0)
+        err = -errno;
+    return err;
+}
 
 /* Owner and mode rule for the temporary directory chain (ADR-2985). With
  * @p private_only 0 (TMPDIR and each directory above it): root or @p euid owns
@@ -1549,7 +1569,7 @@ static void close_dir_fd(int fd, const char *path)
  * errno. */
 static int temp_dir_openat(int parent, const char *name, uid_t euid, int private_only)
 {
-    const int fd = openat(parent, name, TEMP_DIR_OPEN_MODE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    const int fd = openat(parent, name, DIR_OPEN_MODE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return -errno;
     struct stat st;
@@ -1776,25 +1796,14 @@ static int verify_private_copy(const char *cosign_path, const char *copy_path, c
     return err;
 }
 
-/* Read the bundle at @p bundle_abs once, check its signing certificate
- * (signer_identity.h) and hand cosign a private copy of the bytes just
- * checked, so cosign never verifies a bundle other than the one whose owner
- * ID and identity were read (ADR-2985). A certificate of another identity or owner is
- * -EPROTO, as a signature cosign rejects. */
-static int verify_bundle(const char *cosign_path, const char *tmp_dir, const char *bundle_abs,
-                         const char *onnx_path)
+/* Pass cosign a private copy of exactly the bytes checked here (ADR-2985). */
+static int verify_bundle(const char *cosign_path, const char *tmp_dir, const char *bundle,
+                         size_t bundle_len, const char *onnx_path)
 {
-    char *bundle = NULL;
-    size_t bundle_len = 0u;
-    int err = slurp_json_file(bundle_abs, &bundle, &bundle_len);
-    if (err != 0)
-        return err;
-    assert(bundle != NULL);
-    err = vmaf_dnn_signer_check_bundle(bundle, bundle_len);
+    int err = vmaf_dnn_signer_check_bundle(bundle, bundle_len);
     if (err != 0) {
         vmaf_log(VMAF_LOG_LEVEL_ERROR, err == -EPERM ? "tiny model: wrong signer\n" :
                                                        "tiny model: malformed signer bundle\n");
-        free(bundle);
         return -EPROTO;
     }
 
@@ -1803,11 +1812,9 @@ static int verify_bundle(const char *cosign_path, const char *tmp_dir, const cha
     if (!copy_path || !copy_dir) {
         free(copy_path);
         free(copy_dir);
-        free(bundle);
         return -ENOMEM;
     }
     err = write_private_copy(tmp_dir, bundle, bundle_len, copy_dir, PATH_MAX, copy_path, PATH_MAX);
-    free(bundle);
     if (err == 0)
         err = verify_private_copy(cosign_path, copy_path, copy_dir, onnx_path);
     free(copy_path);
@@ -1821,20 +1828,13 @@ int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path)
         return -EINVAL;
     assert(onnx_path != NULL);
 
-    char bundle_abs[PATH_MAX];
-    int err = lookup_bundle_abs(onnx_path, registry_path, bundle_abs, sizeof(bundle_abs));
-    if (err != 0)
+    char *bundle = NULL;
+    size_t bundle_len = 0u;
+    int err = lookup_bundle(onnx_path, registry_path, &bundle, &bundle_len);
+    if (err != 0) {
+        free(bundle);
         return err;
-    assert(bundle_abs[0] != '\0');
-
-    /* The bundle file must exist before we even invoke cosign — otherwise
-     * cosign's error message is opaque. Fail-closed: missing bundle = no
-     * trust. */
-    struct stat bst;
-    if (stat(bundle_abs, &bst) != 0)
-        return -ENOENT;
-    if (!S_ISREG(bst.st_mode))
-        return -ENOENT;
+    }
 
     /* Cache environment variables once per function call to avoid repeated
      * unsafe getenv() calls in multithreaded contexts (getenv is not required
@@ -1848,11 +1848,10 @@ int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path)
 
     char cosign_path[PATH_MAX];
     err = locate_cosign(path_env, cosign_path, sizeof(cosign_path));
-    if (err != 0)
-        return err;
-    assert(cosign_path[0] != '\0');
-
-    return verify_bundle(cosign_path, tmp_env, bundle_abs, onnx_path);
+    if (err == 0)
+        err = verify_bundle(cosign_path, tmp_env, bundle, bundle_len, onnx_path);
+    free(bundle);
+    return err;
 }
 #endif /* !_WIN32 */
 

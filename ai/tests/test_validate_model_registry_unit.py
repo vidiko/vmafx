@@ -354,7 +354,14 @@ def test_consistency_check_rejects_wrong_bundle_name(tmp_path: Path) -> None:
 
 
 def test_schema_rejects_invalid_bundle_name() -> None:
-    for value in ("sub/x.onnx.sigstore.json", "x.sigstore.json"):
+    for value in (
+        "sub/x.onnx.sigstore.json",
+        "x.sigstore.json",
+        "x.onnx.sigstore.json\n",
+        "sub\\x.onnx.sigstore.json",
+        ".onnx.sigstore.json",
+        "X.onnx.sigstore.json",
+    ):
         errors = VMR._jsonschema_errors(
             {"schema_version": 1, "models": [_entry(sigstore_bundle=value)]}, _SCHEMA
         )

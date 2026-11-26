@@ -2178,6 +2178,9 @@ pdjson_default_impl = static_library('test_pdjson_impl',
     c_args : pdjson_default_impl_args,
 )
 
+# Targets compiling dnn_sources directly need the parser for registry entry lookup.
+dnn_deps += [declare_dependency(link_with : pdjson_default_impl)]
+
 test_pdjson = executable('test_pdjson',
     ['test.c', 'test_pdjson.c'],
     include_directories : [test_inc, include_directories('../src')],

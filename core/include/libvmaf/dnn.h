@@ -425,37 +425,41 @@ VMAF_EXPORT const char *vmaf_dnn_session_attached_ep(VmafDnnSession *sess);
 
 /**
  * Verify the Sigstore bundle for a tiny model against the model registry
- * (T6-9 / ADR-0211). Looks up @p onnx_path's basename in
- * `model/tiny/registry.json` (alongside @p onnx_path unless
- * @p registry_path is non-NULL), reads the entry's `sigstore_bundle`
- * field (which must be a relative path confined to the registry directory),
+ * (T6-9 / ADR-0211). Looks up @p onnx_path's basename in the registry,
+ * derives `<onnx file name>.sigstore.json`
+ * in the registry directory and compares the name byte for byte with the
+ * entry's `sigstore_bundle`. For example, `sub/x.onnx.sigstore.json` returns
+ * -EINVAL. The verifier opens the derived regular file without following a symlink,
  * checks the bundle's signing certificate (the supply-chain workflow of
  * vidiko/vmafx and the vidiko GitHub owner ID; ADR-2985) and shells out to
  * `cosign verify-blob` via `posix_spawnp(3p)` on a private copy of the
  * checked bundle (written inside a mode 0700 `mkdtemp(3)` directory under
- * an existing absolute `TMPDIR`, else `/tmp`, whose base and ancestors are
- * not group- or other-writable without the sticky bit, and removed).
+ * an existing absolute `TMPDIR`, defaulting to `/tmp`). Root or the effective
+ * user must own each resolved directory from the base through its ancestors.
+ * Group- or other-writable directories require the sticky bit.
  *
  * Designed to fail closed: any error short-circuits model load. Wired
  * through the CLI by `--tiny-model-verify`.
  *
  * @param onnx_path      filesystem path to the model file.
  * @param registry_path  optional explicit registry path; NULL → look up
- *                       `registry.json` next to @p onnx_path.
+ *                       `registry.json` next to @p onnx_path, or
+ *                       `model/tiny/registry.json` for a bare file name.
  *
  * @return 0 on successful verification, -ENOENT on missing registry /
  *         missing bundle / no matching entry, -EACCES when `cosign` is
- *         not on PATH or `TMPDIR` (or `/tmp`) or any of its ancestors is
- *         group- or other-writable without the sticky bit, -EPROTO when the
+ *         unavailable on PATH or the temporary directory fails ownership,
+ *         permission or sticky-bit checks, -EPROTO when the
  *         bundle is not a valid v0.3 bundle or its certificate names another
  *         identity or owner or cosign exits non-zero, -EFBIG / -EIO /
  *         -ENOMEM when the bundle cannot be read, -ENAMETOOLONG when a
- *         derived path exceeds `PATH_MAX`, another negative errno
+ *         derived path including its terminator exceeds `PATH_MAX` or PATH
+ *         exceeds the cosign search limit, another negative errno
  *         when its private copy cannot be written, -ENOSYS on
  *         Windows (the supply-chain workflow runs on Linux/macOS only),
- *         -EINVAL on a NULL @p onnx_path, a `sigstore_bundle` path that is
- *         absolute, contains `..` or resolves outside the registry
- *         directory, or a `TMPDIR` (or `/tmp`) that is relative, missing or
+ *         -EINVAL on a NULL @p onnx_path, a mismatched bundle name, a bundle
+ *         that is a symlink or other non-regular file, or a `TMPDIR` that is
+ *         relative, missing or
  *         not a directory.
  *
  * @note Thread safety: Safe to call from any thread; uses no shared mutable state.

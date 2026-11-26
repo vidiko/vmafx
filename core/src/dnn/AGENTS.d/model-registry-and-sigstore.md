@@ -22,7 +22,7 @@ invariant: Model registry entries must validate against schema and verify Sigsto
   `sigstore_bundle` for `schema_version: 1` entries. New fields
   added by extending schema first, then registry, then any
   consumers — never other way around. `--tiny-model-verify`
-  path in `model_loader.c` parses registry inline (no JSON dep),
+  path in `model_loader.c` reads registry objects with the in-tree pdjson parser,
   spawns `cosign` via `posix_spawnp(3p)`; `system(3)` stays
   banned.
 
@@ -62,12 +62,15 @@ invariant: Model registry entries must validate against schema and verify Sigsto
   (`TBSCertificate`, `signatureAlgorithm`, `signatureValue`), subject
   alternative name `supply-chain.yml` on `refs/tags/v<digit>...` or
   `refs/heads/master`, and Fulcio extension `.1.17` =
-  `VMAF_DNN_SIGNER_OWNER_ID` (`340303765`). `resolve_bundle_abs()` confines
-  `sigstore_bundle` relative path inside registry directory. Checked bytes
+  `VMAF_DNN_SIGNER_OWNER_ID` (`340303765`). Derive `<onnx file name>.sigstore.json` in
+  the registry directory. Compare the derived name byte for byte with
+  `sigstore_bundle`. A value such as `sub/x.onnx.sigstore.json` returns
+  `-EINVAL`. Read the regular file through the registry directory descriptor
+  with `O_NOFOLLOW`. Checked bytes
   copied into mode 0700 `mkdtemp(3)` directory (`bundle` opened inside with
   `O_EXCL|O_NOFOLLOW`) under validated `TMPDIR` or `/tmp` (base and
-  ancestors up to `/` rejected when group- or other-writable without sticky
-  bit), passed to cosign with anchored `VMAF_DNN_SIGNER_IDENTITY_REGEXP`; C
+  ancestors up to `/` must belong to root or the effective user, and every
+  group- or other-writable directory needs the sticky bit), passed to cosign with anchored `VMAF_DNN_SIGNER_IDENTITY_REGEXP`; C
   grammar and expression change together. Never pass cosign registry bundle
   path, unanchored expression, or name-only check. `test_signer_identity`,
   `test_tiny_model_verify` (fake cosign records argv) and

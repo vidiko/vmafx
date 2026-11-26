@@ -20,6 +20,7 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -84,15 +85,14 @@ static int write_in_dir(const char *dir, const char *name, const char *body)
     return wrote < 0 || closed != 0 ? -1 : 0;
 }
 
-/* Best-effort cleanup of <dir>/<name>. Errors ignored — these are
- * scratch files inside a private fixture directory. */
-static void cleanup_in_dir(const char *dir, const char *name)
+/* The file may be absent after a partial fixture setup. */
+static int cleanup_in_dir(const char *dir, const char *name)
 {
     char path[512];
     const int n = snprintf(path, sizeof(path), "%s/%s", dir, name);
     if (n < 0 || (size_t)n >= (int)sizeof(path))
-        return;
-    (void)unlink(path);
+        return -ENAMETOOLONG;
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -errno;
 }
 
 static char *run_with_registry_body_with_buffers(const char *body, const char *onnx_path,
@@ -108,7 +108,7 @@ static char *run_with_registry_body_with_buffers(const char *body, const char *o
             const int err = vmaf_dnn_verify_signature(onnx_path, path);
             msg = err == expected_err ? NULL : "unexpected registry verification status";
         }
-        cleanup_in_dir(dir, "registry.json");
+        mu_assert("remove fixture file", cleanup_in_dir(dir, "registry.json") == 0);
     }
     mu_assert("remove registry directory", rmdir(dir) == 0);
     return msg;
@@ -146,6 +146,18 @@ static char *test_verify_missing_bundle(void)
     return run_with_registry_body(body, "/tmp/y.onnx", -ENOENT, "missing_bundle");
 }
 
+static char *test_verify_ignores_next_objects_bundle(void)
+{
+    const char *body = "{\"models\":[{\"onnx\":\"x.onnx\"},{\"sigstore_bundle\":\"other\","
+                       "\"onnx\":\"y.onnx\"}]}";
+    return run_with_registry_body(body, "x.onnx", -ENOENT, "next_bundle");
+}
+
+static char *test_verify_whitespace_to_end(void)
+{
+    return run_with_registry_body("{\"onnx\": \t\n  ", "x.onnx", -EBADMSG, "whitespace");
+}
+
 static char *test_verify_entry_without_bundle(void)
 {
     const char *body = "{\"models\":[{\"id\":\"z\",\"onnx\":\"z.onnx\",\"sha256\":\"00\"}]}";
@@ -154,11 +166,6 @@ static char *test_verify_entry_without_bundle(void)
 
 static char *test_verify_default_registry_missing(void)
 {
-    /* registry_path = NULL forces the default-registry derivation:
-     *   <dirname(onnx_path)>/registry.json
-     * The onnx file lives in our scratch dir, but registry.json is
-     * intentionally absent — exercises slurp_registry()'s fopen-fail
-     * branch through the default-path lookup logic (lines 547-560). */
     char dir[256];
     mu_assert("setup scratch dir", setup_scratch_dir(dir, sizeof(dir), "defreg") == 0);
     mu_assert("write onnx", write_in_dir(dir, "model.onnx", "fake") == 0);
@@ -171,17 +178,13 @@ static char *test_verify_default_registry_missing(void)
     /* fopen() of the missing default registry returns -ENOENT. */
     mu_assert("default registry missing -> -ENOENT", err == -ENOENT);
 
-    cleanup_in_dir(dir, "model.onnx");
+    mu_assert("remove fixture file", cleanup_in_dir(dir, "model.onnx") == 0);
     (void)rmdir(dir);
     return NULL;
 }
 
 static char *test_verify_default_registry_no_slash_in_onnx(void)
 {
-    /* onnx_path has no '/' separator -> falls through to the
-     * model/tiny/registry.json default. That path won't exist in /tmp's
-     * cwd, so we expect a slurp_registry() failure (-ENOENT). Exercises
-     * lines 555-558 (the "no slash in onnx_path" branch). */
     const int err = vmaf_dnn_verify_signature("nonexistent.onnx", NULL);
     /* Whatever cwd resolves "model/tiny/registry.json" to, it must not
      * exist for an absolute-no-slash test argument run from the meson
@@ -192,10 +195,7 @@ static char *test_verify_default_registry_no_slash_in_onnx(void)
 
 static char *test_verify_registry_no_slash_in_path(void)
 {
-    /* registry_path has no '/' — exercises the bundle_abs `else` branch
-     * (lines 601-607) where we just memcpy the relative bundle path. We
-     * expect -ENOENT because the bundle won't exist in cwd. Use chdir to
-     * a known scratch dir for a deterministic outcome. */
+    /* Resolve a registry basename in a known working directory. */
     char dir[256];
     mu_assert("setup scratch dir", setup_scratch_dir(dir, sizeof(dir), "noslash") == 0);
     const char *body = "{\"models\":[{\"id\":\"r\",\"onnx\":\"r.onnx\",\"sha256\":\"00\","
@@ -218,7 +218,7 @@ static char *test_verify_registry_no_slash_in_path(void)
     mu_assert("restore cwd", restored == 0);
     mu_assert("no-slash registry + missing bundle -> -ENOENT", err == -ENOENT);
 
-    cleanup_in_dir(dir, "reg_noslash.json");
+    mu_assert("remove fixture file", cleanup_in_dir(dir, "reg_noslash.json") == 0);
     (void)rmdir(dir);
     return NULL;
 }
@@ -279,8 +279,8 @@ static char *setup_fake_cosign_fixture_with_buffers(const char *dir, const struc
                                                     char *reg_body)
 {
     const int n = snprintf(reg_body, TEST_BUFFER_256,
-                           "{\"models\":[{\"id\":\"k\",\"onnx\":\"k.onnx\",\"sha256\":\"00\","
-                           "\"sigstore_bundle\":\"%s\"}]}",
+                           "{\"models\":[{\"id\":\"k\",\"sigstore_bundle\":\"%s\","
+                           "\"onnx\":\"k.onnx\",\"sha256\":\"00\"}]}",
                            tc->registry_name);
     mu_assert("registry fits", n > 0 && (size_t)n < TEST_BUFFER_256);
     mu_assert("write registry", write_in_dir(dir, "registry.json", reg_body) == 0);
@@ -370,7 +370,7 @@ static char *test_rejection_detects_invocation_with_buffers(char *dir, char *pat
     mu_assert("create private root", setup_scratch_dir(dir, TEST_BUFFER_256, "invoked") == 0);
     const int wrote = write_in_dir(dir, "invoked", "1");
     char *unexpected = check_invocation(dir, NO_SPAWN, path, record);
-    cleanup_in_dir(dir, "invoked");
+    mu_assert("remove fixture file", cleanup_in_dir(dir, "invoked") == 0);
     mu_assert("remove private root", rmdir(dir) == 0);
     mu_assert("plant invocation record", wrote == 0);
     mu_assert("unexpected invocation must fail", unexpected != NULL);
@@ -485,15 +485,19 @@ static char *check_copy_observation(const char *dir, char *argv_out)
 
 static int cleanup_fake_cosign_fixture(const char *dir)
 {
-    cleanup_in_dir(dir, "registry.json");
-    cleanup_in_dir(dir, "k.onnx.sigstore.json");
-    cleanup_in_dir(dir, "k.onnx");
-    cleanup_in_dir(dir, "cosign");
-    cleanup_in_dir(dir, "invoked");
-    cleanup_in_dir(dir, "argv.txt");
-    cleanup_in_dir(dir, "mode.txt");
-    cleanup_in_dir(dir, "bytes.txt");
-    return rmdir(dir);
+    static const char *const files[] = {
+        "registry.json", k_bundle_name, "k.onnx",   "cosign",
+        "invoked",       "argv.txt",    "mode.txt", "bytes.txt",
+    };
+    int err = 0;
+    for (size_t i = 0u; i < MU_TABLE_LEN(files); i++) {
+        const int rc = cleanup_in_dir(dir, files[i]);
+        if (err == 0)
+            err = rc;
+    }
+    if (rmdir(dir) != 0 && err == 0)
+        err = -errno;
+    return err;
 }
 
 static int save_env(const char *name, char **saved)
@@ -510,7 +514,7 @@ static int restore_env(const char *name, char *saved)
     return rc;
 }
 
-static char *verify_with_fake_cosign(const char *dir, int *status)
+static char *verify_on_path(const char *dir, const char *search_path, int *status)
 {
     char onnx_path[512];
     const int n = snprintf(onnx_path, sizeof(onnx_path), "%s/k.onnx", dir);
@@ -521,11 +525,10 @@ static char *verify_with_fake_cosign(const char *dir, int *status)
     if (rn <= 0 || (size_t)rn >= sizeof(reg_path))
         return "snprintf reg_path";
 
-    /* Override PATH so locate_cosign() finds the stub. */
     char *path_save = NULL;
     if (save_env("PATH", &path_save) != 0)
         return "save PATH";
-    if (setenv("PATH", dir, 1) != 0) {
+    if (setenv("PATH", search_path, 1) != 0) {
         free(path_save);
         return "setenv PATH override";
     }
@@ -544,7 +547,7 @@ static char *run_with_fake_cosign_current_tmpdir_with_buffers(const struct cosig
     char *msg = setup_fake_cosign_fixture(dir, tc);
     int err = 0;
     if (!msg)
-        msg = verify_with_fake_cosign(dir, &err);
+        msg = verify_on_path(dir, dir, &err);
     if (!msg)
         msg = check_invocation(dir, tc->spawn, path, record);
     if (!msg && tc->spawn == SPAWN_ONCE)
@@ -594,10 +597,7 @@ static char *test_verify_copy_uses_private_directory(void)
 
 static char *test_verify_cosign_success(void)
 {
-    /* Fake cosign exits 0 -> verify_signature() returns 0. Exercises
-     * locate_cosign() success (lines 513-534), posix_spawnp() success
-     * (line 648), waitpid() (line 653), and the WIFEXITED+0 success
-     * tail (lines 657-659). */
+    /* The fixture puts sigstore_bundle before onnx. Verification reaches the stub. */
     return run_with_fake_cosign(&valid_signer, NULL);
 }
 
@@ -952,107 +952,44 @@ static char *test_tmpdir_rejects_other_owner(void)
     return result;
 }
 
-/* Scratch-dir + registry + bundle + onnx setup shared by
- * test_verify_cosign_not_on_path. Extracted for the branch-budget reason
- * noted on setup_fake_cosign_fixture above. */
-static char *setup_cosign_not_on_path_fixture(char *dir, size_t dir_sz)
+/* NULL searches the scratch directory after removing its cosign executable. */
+static char *verify_cosign_search(const char *search_path, int expected)
 {
-    mu_assert("setup scratch dir", setup_scratch_dir(dir, dir_sz, "nopath") == 0);
-    const char *reg_body = "{\"models\":[{\"id\":\"q\",\"onnx\":\"q.onnx\",\"sha256\":\"00\","
-                           "\"sigstore_bundle\":\"q.onnx.sigstore.json\"}]}";
-    mu_assert("write registry", write_in_dir(dir, "registry.json", reg_body) == 0);
-    mu_assert("write bundle", write_in_dir(dir, "q.onnx.sigstore.json", "{}") == 0);
-    mu_assert("write onnx", write_in_dir(dir, "q.onnx", "fake") == 0);
+    char dir[256];
+    mu_assert("setup scratch dir", setup_scratch_dir(dir, sizeof(dir), "search") == 0);
+    char *msg = setup_fake_cosign_fixture(dir, &valid_signer);
+    if (!msg && cleanup_in_dir(dir, "cosign") != 0)
+        msg = "remove cosign";
+    int status = 0;
+    if (!msg)
+        msg = verify_on_path(dir, search_path ? search_path : dir, &status);
+    mu_assert("remove search fixture", cleanup_fake_cosign_fixture(dir) == 0);
+    if (msg)
+        return msg;
+    mu_assert("unexpected cosign search status", status == expected);
     return NULL;
 }
 
 static char *test_verify_cosign_not_on_path(void)
 {
-    /* PATH set to an empty directory with no `cosign` binary. The
-     * locate_cosign() walk completes without finding a match and
-     * returns -EACCES, which propagates through verify_signature().
-     * Exercises the locate_cosign() failure tail (line 534). */
-    char dir[256];
-    char *setup_msg = setup_cosign_not_on_path_fixture(dir, sizeof(dir));
-    if (setup_msg)
-        return setup_msg;
-
-    char path_save[2048];
-    const char *path_env = getenv("PATH");
-    const int pn = snprintf(path_save, sizeof(path_save), "%s", path_env ? path_env : "");
-    mu_assert("snprintf PATH save", pn >= 0 && (size_t)pn < sizeof(path_save));
-    /* Point PATH at a directory we control that does NOT contain
-     * cosign. (Using "" would tickle the empty-string short-circuit
-     * at the top of locate_cosign — we want the full PATH walk to
-     * exit without a hit.) */
-    mu_assert("setenv PATH override", setenv("PATH", dir, 1) == 0);
-
-    char onnx_path[512];
-    const int n = snprintf(onnx_path, sizeof(onnx_path), "%s/q.onnx", dir);
-    mu_assert("snprintf onnx_path", n > 0 && (size_t)n < (int)sizeof(onnx_path));
-    char reg_path[512];
-    const int rn = snprintf(reg_path, sizeof(reg_path), "%s/registry.json", dir);
-    mu_assert("snprintf reg_path", rn > 0 && (size_t)rn < (int)sizeof(reg_path));
-
-    const int err = vmaf_dnn_verify_signature(onnx_path, reg_path);
-
-    (void)setenv("PATH", path_save, 1);
-    cleanup_in_dir(dir, "registry.json");
-    cleanup_in_dir(dir, "q.onnx.sigstore.json");
-    cleanup_in_dir(dir, "q.onnx");
-    (void)rmdir(dir);
-
-    mu_assert("cosign not on PATH -> -EACCES", err == -EACCES);
-    return NULL;
-}
-
-/* Scratch-dir + registry + bundle + onnx setup shared by
- * test_verify_cosign_path_empty_string. Extracted for the branch-budget
- * reason noted on setup_fake_cosign_fixture above. */
-static char *setup_cosign_empty_path_fixture(char *dir, size_t dir_sz)
-{
-    mu_assert("setup scratch dir", setup_scratch_dir(dir, dir_sz, "emptypath") == 0);
-    const char *reg_body = "{\"models\":[{\"id\":\"e\",\"onnx\":\"e.onnx\",\"sha256\":\"00\","
-                           "\"sigstore_bundle\":\"e.onnx.sigstore.json\"}]}";
-    mu_assert("write registry", write_in_dir(dir, "registry.json", reg_body) == 0);
-    mu_assert("write bundle", write_in_dir(dir, "e.onnx.sigstore.json", "{}") == 0);
-    mu_assert("write onnx", write_in_dir(dir, "e.onnx", "fake") == 0);
-    return NULL;
+    return verify_cosign_search(NULL, -EACCES);
 }
 
 static char *test_verify_cosign_path_empty_string(void)
 {
-    /* Empty PATH string short-circuits locate_cosign() at line 517 with
-     * -EACCES before any directory walk. Distinct branch from the
-     * "PATH set but cosign not present" case above. */
-    char dir[256];
-    char *setup_msg = setup_cosign_empty_path_fixture(dir, sizeof(dir));
-    if (setup_msg)
-        return setup_msg;
+    return verify_cosign_search("", -EACCES);
+}
 
-    char path_save[2048];
-    const char *path_env = getenv("PATH");
-    const int pn = snprintf(path_save, sizeof(path_save), "%s", path_env ? path_env : "");
-    mu_assert("snprintf PATH save", pn >= 0 && (size_t)pn < sizeof(path_save));
-    mu_assert("setenv PATH=''", setenv("PATH", "", 1) == 0);
-
-    char onnx_path[512];
-    const int n = snprintf(onnx_path, sizeof(onnx_path), "%s/e.onnx", dir);
-    mu_assert("snprintf onnx_path", n > 0 && (size_t)n < (int)sizeof(onnx_path));
-    char reg_path[512];
-    const int rn = snprintf(reg_path, sizeof(reg_path), "%s/registry.json", dir);
-    mu_assert("snprintf reg_path", rn > 0 && (size_t)rn < (int)sizeof(reg_path));
-
-    const int err = vmaf_dnn_verify_signature(onnx_path, reg_path);
-
-    (void)setenv("PATH", path_save, 1);
-    cleanup_in_dir(dir, "registry.json");
-    cleanup_in_dir(dir, "e.onnx.sigstore.json");
-    cleanup_in_dir(dir, "e.onnx");
-    (void)rmdir(dir);
-
-    mu_assert("empty PATH -> -EACCES", err == -EACCES);
-    return NULL;
+static char *test_verify_cosign_path_too_long(void)
+{
+    char *path = calloc(VMAF_DNN_COSIGN_PATH_MAX + 2u, 1u);
+    if (!path)
+        return "allocation failed";
+    for (size_t i = 0u; i <= VMAF_DNN_COSIGN_PATH_MAX; i++)
+        path[i] = ':';
+    char *msg = verify_cosign_search(path, -ENAMETOOLONG);
+    free(path);
+    return msg;
 }
 
 static char *test_verify_malformed_onnx_no_colon(void)
@@ -1106,9 +1043,6 @@ static char *test_verify_malformed_bundle_no_close_quote(void)
 
 static char *test_verify_bundle_is_directory_with_buffers(char *dir, char *onnx, char *bundle)
 {
-    /* Bundle path resolves to a directory (not a regular file). Exercises
-     * the !S_ISREG branch (line 616) — distinct from the stat-fails
-     * branch already covered by test_verify_missing_bundle. */
     mu_assert("create private root", setup_scratch_dir(dir, TEST_BUFFER_256, "bundle_isdir") == 0);
     const char *registry = "{\"models\":[{\"onnx\":\"d.onnx\","
                            "\"sigstore_bundle\":\"d.onnx.sigstore.json\"}]}";
@@ -1120,12 +1054,53 @@ static char *test_verify_bundle_is_directory_with_buffers(char *dir, char *onnx,
     mu_assert("create directory at bundle path", mkdir(bundle, S_IRWXU) == 0);
 
     const int err = vmaf_dnn_verify_signature(onnx, NULL);
-    cleanup_in_dir(dir, "registry.json");
+    mu_assert("remove fixture file", cleanup_in_dir(dir, "registry.json") == 0);
     const int removed_bundle = rmdir(bundle);
     const int removed_root = rmdir(dir);
     mu_assert("remove fixture", removed_bundle == 0 && removed_root == 0);
-    mu_assert("bundle is directory -> -ENOENT", err == -ENOENT);
+    mu_assert("bundle is directory -> -EINVAL", err == -EINVAL);
     return NULL;
+}
+
+static char *check_fifo_bundle(const char *dir, char *path, char *record)
+{
+    const int n = snprintf(path, TEST_BUFFER_512, "%s/%s", dir, k_bundle_name);
+    mu_assert("bundle path fits", n > 0 && (size_t)n < TEST_BUFFER_512);
+    mu_assert("remove regular fixture bundle", unlink(path) == 0);
+    if (mkfifo(path, S_IRUSR | S_IWUSR) != 0) {
+        if (errno != ENOSYS && errno != EOPNOTSUPP)
+            return "create FIFO";
+        return fprintf(stderr, "SKIP FIFO: mkfifo unavailable on fixture filesystem\n") < 0 ?
+                   "write FIFO skip reason" :
+                   NULL;
+    }
+    int status = 0;
+    mu_assert_msg(verify_on_path(dir, dir, &status));
+    mu_assert_msg(check_invocation(dir, NO_SPAWN, path, record));
+    mu_assert("FIFO -> -EINVAL", status == -EINVAL);
+    return NULL;
+}
+
+static char *test_verify_fifo_bundle(void)
+{
+    char *dir = calloc(TEST_BUFFER_256, 1u);
+    char *path = calloc(TEST_BUFFER_512, 1u);
+    char *record = calloc(sizeof("1"), 1u);
+    char *msg = "allocation failed";
+    if (dir && path && record) {
+        msg = "create private root";
+        if (setup_scratch_dir(dir, TEST_BUFFER_256, "fifo") == 0) {
+            msg = setup_fake_cosign_fixture(dir, &valid_signer);
+            if (!msg)
+                msg = check_fifo_bundle(dir, path, record);
+            if (cleanup_fake_cosign_fixture(dir) != 0)
+                msg = "remove FIFO fixture";
+        }
+    }
+    free(record);
+    free(path);
+    free(dir);
+    return msg;
 }
 
 static char *test_verify_bundle_is_directory(void)
@@ -1165,39 +1140,78 @@ static char *test_verify_bundle_rejects_absolute_path(void)
     return run_with_registry_body(body, "/tmp/m.onnx", -EINVAL, "abs_bundle.json");
 }
 
-static char *test_verify_bundle_path_at_length_limit_with_buffers(char *rel, char *body)
+static char *test_verify_bundle_suffix_overflow_with_buffers(char *rel, char *body)
 {
-    /* The derived name fits the buffer; adding the registry directory exceeds it. */
-    const size_t stem_len = TEST_BUFFER_4096 - sizeof(".onnx.sigstore.json") - 1u;
+    /* The ONNX basename fits, but the derived name needs PATH_MAX + 1 bytes. */
+    const size_t stem_len = PATH_MAX - sizeof(".onnx.sigstore.json") + 1u;
     memset(rel, 'a', stem_len);
-    const size_t remaining = TEST_BUFFER_4096 - stem_len;
-    // SAFETY: stem_len is below TEST_BUFFER_4096, with remaining bytes available in rel.
+    const size_t remaining = PATH_MAX - stem_len;
+    // SAFETY: stem_len is below PATH_MAX, with remaining bytes available in rel.
     const int suffix_len = snprintf(rel + stem_len, remaining, ".onnx");
     mu_assert("ONNX suffix fits", suffix_len >= 0 && (size_t)suffix_len < remaining);
-    const size_t cap = (size_t)TEST_BUFFER_4096 * 3u;
+    const size_t cap = (size_t)PATH_MAX * 3u;
     const int n =
         snprintf(body, cap, "{\"onnx\":\"%s\",\"sigstore_bundle\":\"%s.sigstore.json\"}", rel, rel);
     mu_assert("registry body fits", n > 0 && (size_t)n < cap);
     return run_with_registry_body(body, rel, -ENAMETOOLONG, "long_bundle.json");
 }
 
-static char *test_verify_bundle_path_at_length_limit(void)
+static char *test_verify_bundle_suffix_overflow(void)
 {
-    char *rel = calloc(TEST_BUFFER_4096, 1u);
-    char *body = calloc((size_t)TEST_BUFFER_4096 * 3u, 1u);
+    char *rel = calloc(PATH_MAX, 1u);
+    char *body = calloc((size_t)PATH_MAX * 3u, 1u);
     if (!rel || !body) {
         free(rel);
         free(body);
         return "allocation failed";
     }
-    char *result = test_verify_bundle_path_at_length_limit_with_buffers(rel, body);
+    char *result = test_verify_bundle_suffix_overflow_with_buffers(rel, body);
     free(rel);
     free(body);
     return result;
 }
+
+static char *check_registry_join_overflow(char *dir, char *path)
+{
+    mu_assert("create private root", setup_scratch_dir(dir, TEST_BUFFER_256, "long_join") == 0);
+    const char *body = "{\"onnx\":\"x.onnx\",\"sigstore_bundle\":\"x.onnx.sigstore.json\"}";
+    char *msg = "write registry";
+    if (write_in_dir(dir, "r", body) == 0) {
+        /* Redundant slashes keep both leaf names short enough for the filesystem. */
+        const int n = snprintf(path, PATH_MAX, "%s", dir);
+        msg = "registry path too long";
+        if (n > 0 && (size_t)n < PATH_MAX - 2u) {
+            for (size_t i = (size_t)n; i < PATH_MAX - 2u; i++)
+                path[i] = '/';
+            path[PATH_MAX - 2u] = 'r';
+            path[PATH_MAX - 1u] = '\0';
+            const int err = vmaf_dnn_verify_signature("x.onnx", path);
+            msg = err == -ENAMETOOLONG ? NULL : "directory plus derived name must overflow";
+        }
+    }
+    mu_assert("remove registry", cleanup_in_dir(dir, "r") == 0);
+    mu_assert("remove private root", rmdir(dir) == 0);
+    return msg;
+}
+
+static char *test_verify_bundle_join_overflow(void)
+{
+    char *dir = calloc(TEST_BUFFER_256, 1u);
+    char *path = calloc(PATH_MAX, 1u);
+    char *msg = dir && path ? check_registry_join_overflow(dir, path) : "allocation failed";
+    free(path);
+    free(dir);
+    return msg;
+}
 #endif /* !_WIN32 */
 
 #ifdef _WIN32
+static char *test_verify_fifo_bundle(void)
+{
+    return fprintf(stderr, "SKIP FIFO: Windows lacks mkfifo\n") < 0 ? "write FIFO skip reason" :
+                                                                      NULL;
+}
+
 static char *test_verify_windows_returns_enosys(void)
 {
     const int err = vmaf_dnn_verify_signature("C:\\fake.onnx", NULL);
@@ -1208,6 +1222,7 @@ static char *test_verify_windows_returns_enosys(void)
 
 static const MuTest common_tests[] = {
     MU_TEST(test_verify_null_path),
+    MU_TEST(test_verify_fifo_bundle),
 };
 
 #ifndef _WIN32
@@ -1216,6 +1231,8 @@ static const MuTest platform_tests[] = {
     MU_TEST(test_verify_no_matching_entry),
     MU_TEST(test_verify_missing_bundle),
     MU_TEST(test_verify_entry_without_bundle),
+    MU_TEST(test_verify_ignores_next_objects_bundle),
+    MU_TEST(test_verify_whitespace_to_end),
     MU_TEST(test_verify_default_registry_missing),
     MU_TEST(test_verify_default_registry_no_slash_in_onnx),
     MU_TEST(test_verify_registry_no_slash_in_path),
@@ -1228,6 +1245,7 @@ static const MuTest platform_tests[] = {
     MU_TEST(test_verify_malformed_bundle_no_close_quote),
     MU_TEST(test_verify_cosign_path_empty_string),
     MU_TEST(test_verify_cosign_not_on_path),
+    MU_TEST(test_verify_cosign_path_too_long),
     MU_TEST(test_rejection_detects_invocation),
     MU_TEST(test_cleanup_requires_enoent),
     MU_TEST(test_verify_copy_uses_private_directory),
@@ -1250,7 +1268,8 @@ static const MuTest platform_tests[] = {
     MU_TEST(test_tmpdir_rejects_other_owner),
     MU_TEST(test_verify_rejects_mismatched_bundle_name),
     MU_TEST(test_verify_bundle_rejects_absolute_path),
-    MU_TEST(test_verify_bundle_path_at_length_limit),
+    MU_TEST(test_verify_bundle_suffix_overflow),
+    MU_TEST(test_verify_bundle_join_overflow),
 };
 #else
 static const MuTest platform_tests[] = {

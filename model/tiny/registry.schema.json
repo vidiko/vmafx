@@ -103,7 +103,7 @@
         "sigstore_bundle": {
           "description": "The ONNX file name plus .sigstore.json, with no directory component. The bundle lives beside the registry. Generated at release time by .github/workflows/supply-chain.yml — placeholder bundles may exist in-tree before the first release; the runtime verifier (`--tiny-model-verify`) refuses to load when the path is set but the file is missing or `cosign verify-blob` exits non-zero. Optional; absence means the model is unsigned and `--tiny-model-verify` will reject it.",
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9_.-]*\\.onnx\\.sigstore\\.json$",
+          "pattern": "^[a-z0-9][a-z0-9_.-]*\\.onnx\\.sigstore\\.json(?![\\s\\S])",
           "maxLength": 256
         },
         "description": {

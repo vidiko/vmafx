@@ -165,18 +165,33 @@ identity with anything before or after it.
 The identity includes the organisation's login, `vidiko`. The certificate's
 numeric owner ID, `340303765`, binds the certificate to the organisation even
 if GitHub reassigns the login. After `cosign verify-blob` succeeds, check that
-ID in the same bundle's signing certificate with `jq` and OpenSSL. This uses
-the bundle certificate check from the
+ID in the same bundle's signing certificate with `jq` and Python 3. The
+recipe uses `pyasn1` and `pyasn1-modules`, as in the
 [release guide](../development/release.md#check-the-signers-owner-id). Run it
 in the same shell so `jq` reads the same `"$work/bundle.json"` copy.
 
 ```bash
 set -o pipefail
-jq -er '.verificationMaterial.certificate.rawBytes' "$work/bundle.json" \
-  | base64 -d \
-  | openssl x509 -inform DER -noout -text \
-  | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' \
-  | tail -n 1 | grep -Eq '^ *\.\.340303765$'
+if jq -er '.verificationMaterial.certificate.rawBytes' "$work/bundle.json" | python3 -c '
+import base64, sys
+from pyasn1.codec.der.decoder import decode
+from pyasn1.type.char import UTF8String
+from pyasn1_modules.rfc5280 import Certificate
+
+der = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+cert, rest = decode(der, asn1Spec=Certificate())
+owners = [ext["extnValue"].asOctets() for ext in cert["tbsCertificate"]["extensions"]
+          if str(ext["extnID"]) == "1.3.6.1.4.1.57264.1.17"]
+if rest or len(owners) != 1:
+    sys.exit(1)
+owner, rest = decode(owners[0], asn1Spec=UTF8String())
+sys.exit(bool(rest) or str(owner) != "340303765")
+'; then
+  echo "owner ID OK"
+else
+  echo "owner ID mismatch" >&2
+  false
+fi
 ```
 
 Load the model only after both commands succeed.

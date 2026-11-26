@@ -28,10 +28,9 @@ HEADER = ROOT / "core" / "src" / "dnn" / "signer_identity.h"
 LOADER = ROOT / "core" / "src" / "dnn" / "model_loader.c"
 # Records of past decisions and findings keep the expressions they quoted.
 HISTORY = ("docs/research/", "docs/adr/", "docs/changelog-archive/")
-FLAG_OCCURRENCE = re.compile(
-    r"(?:--certificate-identity-regexp|--cert-identity-regex)(?=[= ]\s*[^\s`…])"
-)
-FLAG = re.compile(r"(?:--certificate-identity-regexp|--cert-identity-regex)[= ]\s*(['\"])(.+?)\1")
+FLAG_PREFIX = r"(?:--certificate-identity-regexp|--cert-identity-regex)(?:=|[ \t]+)"
+FLAG_OCCURRENCE = re.compile(FLAG_PREFIX + r"(?=[ \t]*[^\s`…])")
+FLAG = re.compile(FLAG_PREFIX + r"[ \t]*(['\"])(.+?)\1")
 # Documents whose expression must be the library's (release files of supply-chain.yml).
 SUPPLY_CHAIN_DOCS = (
     "docs/ai/security.md",
@@ -186,6 +185,11 @@ class SignerIdentityExpressionTest(unittest.TestCase):
         extracted = scan_line_expressions(line)
         self.assertEqual(extracted, [None])
         self.assertTrue(form_errors(extracted[0]))
+
+    def test_scanner_rejects_tab_separated_unanchored_value(self) -> None:
+        expressions = scan_line_expressions("cosign --certificate-identity-regexp\t'workflow'")
+        self.assertEqual(expressions, ["workflow"])
+        self.assertIn("not anchored with ^ and $", form_errors(expressions[0]))
 
     def test_form_check_rejects_top_level_alternation(self) -> None:
         ungrouped = (

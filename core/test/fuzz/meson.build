@@ -97,6 +97,7 @@ if get_option('default_library') == 'shared'
     fuzz_json_model_objects += [
         log_cpp23_test_objects,
         predict_c_lib.extract_objects(src_dir + 'model_lifetime.c', src_dir + 'predict.c'),
+        platform_specific_cpu_objects,
         libvmaf_feature_static_lib.extract_all_objects(recursive: true),
         libvmaf_cpu_static_lib.extract_all_objects(recursive: true),
         libvmafx.extract_objects(
@@ -137,6 +138,7 @@ fuzz_dnn_sidecar = executable('fuzz_dnn_sidecar',
      '../../src/dnn/op_allowlist.c',
      '../../src/compat/path_utf8.c'],
     objects : log_cpp23_test_objects,
+    link_with : pdjson_default_impl,
     include_directories : [libvmaf_inc, test_inc, include_directories('../../src'),
                            include_directories('../../src/dnn')],
     c_args : fuzz_flags + dnn_defines,

@@ -27,6 +27,9 @@ extern "C" {
  *  use case genuinely needs a larger envelope. */
 #define VMAF_DNN_DEFAULT_MAX_BYTES ((size_t)50u * 1024u * 1024u)
 
+/** Maximum byte length of PATH searched for cosign. */
+#define VMAF_DNN_COSIGN_PATH_MAX (64u * 1024u)
+
 /** Compile-time cap for the companion JSON sidecar file (1 MiB = 2^20 bytes).
  *  The sidecar carries only metadata (kind, opset, feature_order, etc.);
  *  a 1 MiB limit is already very generous.  All three guard points in
@@ -194,28 +197,9 @@ void vmaf_dnn_sidecar_free(VmafModelSidecar *s);
 /** Validate an ONNX file on disk: size cap + operator allowlist. */
 int vmaf_dnn_validate_onnx(const char *path, size_t max_bytes);
 
-/** Verify an ONNX file's Sigstore bundle by shelling out to `cosign
- *  verify-blob` (T6-9 / ADR-0211). Wired through the CLI by
- *  ``--tiny-model-verify``. The function:
- *
- *    1. Locates the registry entry whose ``onnx`` field has the same
- *       basename as ``onnx_path`` (registry path defaults to
- *       ``model/tiny/registry.json`` next to ``onnx_path`` unless the
- *       caller passes a different ``registry_path``).
- *    2. Reads the entry's ``sigstore_bundle`` path (relative to
- *       ``model/tiny/``).
- *    3. Spawns ``cosign verify-blob --bundle=<bundle> --certificate-identity-regexp …
- *       <onnx>`` via ``posix_spawnp`` (NOT ``system(3)`` — banned by
- *       CLAUDE.md §6) and waits for completion.
- *
- *  Returns 0 on success, ``-ENOENT`` when the registry / bundle is
- *  missing, ``-EACCES`` when ``cosign`` is unavailable on PATH, and
- *  ``-EPROTO`` when the verifier exits non-zero. Designed to fail
- *  closed: any error short-circuits model load.
- *
- *  ``registry_path`` may be NULL — the loader then computes
- *  ``<dirname(onnx_path)>/registry.json``. */
-/* Public API — must be visible in the shared library (ADR-0379). */
+/** Verify a private copy of the registry entry's derived Sigstore bundle.
+ *  See libvmaf/dnn.h for name binding, temporary-directory requirements
+ *  and return codes (ADR-0211, ADR-2985). */
 VMAF_EXPORT int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path);
 
 #ifndef _WIN32

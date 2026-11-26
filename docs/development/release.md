@@ -879,16 +879,33 @@ and use `288567244` in both the attestation and blob certificate owner checks.
 This checks the attestation certificate, not the separate cosign blob signature.
 For a cosign bundle (`<artifact>.bundle`), read the owner ID from the bundle's
 signing certificate after `cosign verify-blob` passes. The command needs `jq`
-and OpenSSL and checks the Fulcio extension `1.3.6.1.4.1.57264.1.17` (source
-repository owner identifier). Run it in the same shell so `jq` reads the copy
+and Python 3 with `pyasn1` and `pyasn1-modules`. It checks Fulcio extension
+`1.3.6.1.4.1.57264.1.17` (source repository owner identifier). Run it in the
+same shell so `jq` reads the copy
 in `$work`:
 
 ```bash
 set -o pipefail
-jq -er '.verificationMaterial.certificate.rawBytes' "$work/vmaf.bundle" | base64 -d \
-  | openssl x509 -inform DER -noout -text \
-  | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
-  && echo "owner ID OK" || { echo "owner ID mismatch" >&2; false; }
+if jq -er '.verificationMaterial.certificate.rawBytes' "$work/vmaf.bundle" | python3 -c '
+import base64, sys
+from pyasn1.codec.der.decoder import decode
+from pyasn1.type.char import UTF8String
+from pyasn1_modules.rfc5280 import Certificate
+
+der = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+cert, rest = decode(der, asn1Spec=Certificate())
+owners = [ext["extnValue"].asOctets() for ext in cert["tbsCertificate"]["extensions"]
+          if str(ext["extnID"]) == "1.3.6.1.4.1.57264.1.17"]
+if rest or len(owners) != 1:
+    sys.exit(1)
+owner, rest = decode(owners[0], asn1Spec=UTF8String())
+sys.exit(bool(rest) or str(owner) != "340303765")
+'; then
+  echo "owner ID OK"
+else
+  echo "owner ID mismatch" >&2
+  false
+fi
 ```
 
 The command exits with a nonzero status via `false` on a mismatch.

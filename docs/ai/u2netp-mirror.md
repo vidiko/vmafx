@@ -147,18 +147,34 @@ Verified OK
 Any other output (especially `Error: failed to verify`) means
 the binary is not the one this fork released. Do not load it.
 
-Then check the owner ID. The command needs `jq` and OpenSSL. It reads the
-Fulcio certificate extension `1.3.6.1.4.1.57264.1.17` (source repository
-owner identifier) and requires `340303765`, the numeric ID of `vidiko`. Run it
-in the same shell so `jq` reads the same
+Then check the owner ID using `jq` and Python 3 with `pyasn1` and
+`pyasn1-modules`. The command reads Fulcio extension `1.3.6.1.4.1.57264.1.17`
+(source repository owner identifier) and requires `340303765`, the numeric ID
+of `vidiko`. Run it in the same shell so `jq` reads the same
 `"$work/u2netp_mirror_v1.onnx.bundle"` copy:
 
 ```bash
 set -o pipefail
-jq -er '.verificationMaterial.certificate.rawBytes' "$work/u2netp_mirror_v1.onnx.bundle" | base64 -d \
-  | openssl x509 -inform DER -noout -text \
-  | grep -A1 -F '1.3.6.1.4.1.57264.1.17:' | tail -n 1 | grep -Eq '^ *\.\.340303765$' \
-  && echo "owner ID OK" || { echo "owner ID mismatch: do not load" >&2; false; }
+if jq -er '.verificationMaterial.certificate.rawBytes' "$work/u2netp_mirror_v1.onnx.bundle" | python3 -c '
+import base64, sys
+from pyasn1.codec.der.decoder import decode
+from pyasn1.type.char import UTF8String
+from pyasn1_modules.rfc5280 import Certificate
+
+der = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+cert, rest = decode(der, asn1Spec=Certificate())
+owners = [ext["extnValue"].asOctets() for ext in cert["tbsCertificate"]["extensions"]
+          if str(ext["extnID"]) == "1.3.6.1.4.1.57264.1.17"]
+if rest or len(owners) != 1:
+    sys.exit(1)
+owner, rest = decode(owners[0], asn1Spec=UTF8String())
+sys.exit(bool(rest) or str(owner) != "340303765")
+'; then
+  echo "owner ID OK"
+else
+  echo "owner ID mismatch: do not load" >&2
+  false
+fi
 ```
 
 The command exits with a nonzero status via `false` on a mismatch. Any nonzero
