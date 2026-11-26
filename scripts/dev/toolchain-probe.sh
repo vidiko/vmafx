@@ -55,7 +55,7 @@ Usage: scripts/dev/toolchain-probe.sh [--prefix PATH]
 Probes host compilers (icpx, icx, nvcc, hipcc, glslc, glslangValidator, metal)
 and the MinGW cross driver (x86_64-w64-mingw32-gcc: thread model, runtime DLL
 pairing via -print-file-name and objdump). MINGW_CROSS_PREFIX overrides where
-the cross driver is looked up.
+the cross driver is looked up. TOOLCHAIN_PROBE_HOST overrides the header hostname.
 Exit code 0 on normal completion, 1 on a MinGW cross runtime resolution or
 thread-model pairing failure, 2 on usage error.
 EOF
@@ -71,7 +71,11 @@ done
 ONEAPI_PREFIX="${oneapi_prefix_arg:-${ONEAPI_PREFIX:-}}"
 
 # First line: fenced-block header
-host_name="$(uname -n)"
+host_name="${TOOLCHAIN_PROBE_HOST-$(uname -n)}"
+if [[ ! "${host_name}" =~ ^${probe_host_chars}+$ ]]; then
+  echo "toolchain-probe: hostname '${host_name}' has characters outside ${probe_host_chars}; set TOOLCHAIN_PROBE_HOST" >&2
+  exit 2
+fi
 os_name="$(uname -s)"
 now_utc="$(date -u +%FT%TZ)"
 probe_header_row "$host_name" "$os_name" "$now_utc"
@@ -498,7 +502,7 @@ probe_mingw_cross() {
   # pasted block carries the whole evidence.
   for lib in "libstdc++-6.dll" "${libgcc}"; do
     if rp="$(mingw_resolve_runtime "${p}" "${lib}")"; then
-      printf "toolchain-probe: %s runtime %s=%s\n" "${driver}" "${lib}" "${rp}"
+      printf "toolchain-probe: %s runtime %s=%s\n" "${driver}" "${lib}" "$(probe_encode_field "${rp}")"
       if [ "${lib}" = "libstdc++-6.dll" ]; then
         stdcxx="${rp}"
       fi
@@ -515,7 +519,7 @@ probe_mingw_cross() {
   # Evidence only: not every flavour ships libwinpthread, so its resolution
   # never fails the entry.
   if rp="$(mingw_resolve_runtime "${p}" "libwinpthread-1.dll")"; then
-    printf "toolchain-probe: %s runtime libwinpthread-1.dll=%s\n" "${driver}" "${rp}"
+    printf "toolchain-probe: %s runtime libwinpthread-1.dll=%s\n" "${driver}" "$(probe_encode_field "${rp}")"
   else
     printf "toolchain-probe: %s runtime libwinpthread-1.dll unresolved (evidence only; not every flavour ships it)\n" "${driver}"
   fi

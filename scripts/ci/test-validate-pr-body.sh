@@ -298,6 +298,7 @@ trap 'git worktree remove --force "${render_fixture}" >/dev/null 2>&1 || true; r
 cp "${repo_root}/scripts/ci/validate-pr-body.sh" "${repo_root}/scripts/ci/deliverables-check.sh" \
   "${repo_root}/scripts/ci/check-toolchain-claims.sh" \
   "${render_fixture}/scripts/ci/"
+cp "${repo_root}/scripts/dev/toolchain-probe-format.sh" "${render_fixture}/scripts/dev/"
 make -s -C "${render_fixture}" docs-render >/dev/null
 git -C "${render_fixture}" add -A
 fixture_tree="$(git -C "${render_fixture}" write-tree)"

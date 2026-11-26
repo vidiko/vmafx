@@ -19,6 +19,8 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 gate="${repo_root}/scripts/ci/check-toolchain-claims.sh"
 probe="${repo_root}/scripts/dev/toolchain-probe.sh"
+# shellcheck source=scripts/dev/toolchain-probe-format.sh
+. "${repo_root}/scripts/dev/toolchain-probe-format.sh"
 
 if [ ! -x "${gate}" ]; then
   echo "test-check-toolchain-claims: gate script missing or non-executable: ${gate}" >&2
@@ -259,7 +261,7 @@ probe_empty_out="$("${probe}" --prefix "${empty_dir}" 2>&1)" || {
   fail_count=$((fail_count + 1))
 }
 
-if printf '%s\n' "${probe_empty_out}" | grep -q "toolchain-probe: icpx absent searched=${empty_dir}"; then
+if [[ "${probe_empty_out}" == *"$(probe_absent_row icpx "${empty_dir}")"* ]]; then
   echo "PASS: probe with empty prefix reported icpx absent"
   pass_count=$((pass_count + 1))
 else
@@ -470,7 +472,7 @@ toolchain-probe v1 host=test-box os=Linux
 ${absent_nvcc}
 ${fence}"
 expect_body "Vulkan family: explicit glslangValidator overrides vulkan alias when absent" 0 \
-  "Vulkan was not compiled locally: no glslangValidator
+  "Vulkan (glslangValidator) was not compiled locally: no glslangValidator
 
 ${fence}text
 ${header}
@@ -478,7 +480,7 @@ toolchain-probe: glslc found /usr/bin/glslc 2026.1
 toolchain-probe: glslangValidator absent searched=PATH
 ${fence}"
 expect_body "Vulkan family: explicit glslangValidator contradicted when found" 1 \
-  "Vulkan was not compiled locally: no glslangValidator
+  "Vulkan (glslangValidator) was not compiled locally: no glslangValidator
 
 ${fence}text
 ${header}
@@ -621,7 +623,12 @@ expect_body "scope boundary: 32 scoped matches in one clause pass" 0 "${scope_32
 expect_body "scope boundary: 33 scoped matches exceed cap and fail closed" 1 \
   "${scope_32}, no SYCL changes"
 
+expect_body "unscoped claim first at scope cap" 1 "no nvcc here, ${scope_32}, no SYCL changes
+${header}
+toolchain-probe: icpx absent searched=PATH" "missing probe results for claimed toolchains: nvcc"
+
 # Round 3: evidence belongs to one invocation and host scope to one absence.
+expect_body "available changed" 1 'Having no nvcc available changed our build plan.'
 expect_body "availability before changed" 1 'Having no nvcc installed changed our build plan.'
 expect_body "two change objects" 0 'This PR has no CUDA build flag changes.'
 expect_body "compiler with two change objects" 0 'no nvcc build flag changes were made'
@@ -648,17 +655,17 @@ two_tools='No nvcc or hipcc on this host.'
 expect_body "split blocks lack joint coverage" 1 "${two_tools}
 ${header}
 ${absent_nvcc}
-${header_b}
+${header}
 ${absent_hipcc}" "missing probe results for claimed toolchains: hipcc"
-expect_body "coordinated absences require one block" 1 "No nvcc and no hipcc on this host.
+expect_body "coordinated unbound absences with multiple hosts" 1 "No nvcc and no hipcc on this host.
 ${header}
 ${absent_nvcc}
 ${header_b}
-${absent_hipcc}" "missing probe results for claimed toolchains: hipcc"
+${absent_hipcc}" "name the probed host"
 expect_body "closest block determines missing results" 1 "No nvcc or hipcc or icpx on this host.
 ${header}
 ${absent_nvcc}
-${header_b}
+${header}
 ${absent_hipcc}
 toolchain-probe: icpx absent searched=PATH" "missing probe results for claimed toolchains: nvcc"
 expect_body "invalid header ends previous block" 1 "${two_tools}
@@ -673,27 +680,27 @@ ${absent_hipcc}"
 expect_body "second covering block agrees" 0 "No nvcc on this host.
 ${header}
 ${found_nvcc}
-${header_b}
+${header}
 ${absent_nvcc}"
 expect_body "every covering block contradicts" 1 "No nvcc on this host.
 ${header}
 ${found_nvcc}
-${header_b}
+${header}
 ${found_nvcc}" "claims 'nvcc' is missing"
 expect_body "mixed result contradicts a host claim" 1 "${two_tools}
 ${header}
 ${absent_nvcc}
 ${found_hipcc}"
 
-spaced_prefix="${work}/oneAPI SDK%20"
+spaced_prefix="${work}/oneAPI SDK%20"$'\t\n\v\f\r'end
 spaced_out="$(ONEAPI_PREFIX="${spaced_prefix}" "${probe}")"
 expect_body "encoded producer prefix covers icpx" 0 "No icpx on this host.
 ${spaced_out}"
-if [[ "${spaced_out}" == *"icpx absent searched=${work}/oneAPI%20SDK%2520"* ]]; then
-  echo "PASS: space and percent are encoded independently"
+if [[ "${spaced_out}" == *"/oneAPI%20SDK%2520%09%0A%0B%0C%0Dend"* ]]; then
+  echo "PASS: producer encodes percent and six whitespace characters"
   pass_count=$((pass_count + 1))
 else
-  echo "FAIL: space and percent are encoded independently"
+  echo "FAIL: producer encodes percent and six whitespace characters"
   fail_count=$((fail_count + 1))
 fi
 
@@ -718,8 +725,201 @@ ${found_nvcc}
 ${found_hipcc}"
 expect_body "mixed subject contradiction names only hipcc" 1 "${mixed_body}" "claims 'hipcc' is missing" "claims 'nvcc"
 
+# Host binding, independent predicates, and format agreement.
+header_a="${header/test-box/build-a}"
+header_b="${header/test-box/build-b}"
+blocks="${header_a}
+${found_nvcc}
+${header_b}
+${absent_nvcc}"
+expect_body "named host contradiction" 1 "No nvcc on BUILD-A.
+${blocks}" "host=build-a, header line 2"
+expect_body "named host agrees" 0 "No nvcc on build-a.
+${blocks/"${found_nvcc}"/"${absent_nvcc}"}"
+expect_body "named second host agrees" 0 "No nvcc on build-b.
+${blocks}"
+expect_body "named host missing results" 1 "No hipcc on build-b.
+${header_a}
+${absent_hipcc}
+${header_b}" "missing probe results for claimed toolchains: hipcc (host=build-b, header line 4)"
+expect_body "unbound host ambiguity" 1 "No nvcc on this host.
+${blocks}" "name the probed host"
+expect_body "hostname prefix cannot bind" 1 "No nvcc on build-a.lab.
+${blocks}" "name the probed host"
+expect_body "literal dotted hostname" 0 "No nvcc on BUILD.B.
+${blocks/build-b/build.b}"
+expect_body "dot cannot bind another hostname" 1 "No nvcc on buildXb.
+${blocks/build-b/build.b}" "name the probed host"
+expect_body "named host checks all matching blocks" 1 "No nvcc on build-a.
+${header_a}
+${absent_nvcc}
+${header_a}
+${found_nvcc}" "host=build-a, header line 4"
+
+icx_found='toolchain-probe: icx found /bin/icx'
+icpx_absent='toolchain-probe: icpx absent searched=PATH'
+sycl_ci='No SYCL on this host, but the CI runner lacks icx.'
+expect_body "segment alias needs icpx" 1 "${sycl_ci}
+${header}
+${icx_found}" "missing probe results for claimed toolchains: icpx"
+expect_body "segment alias covered" 0 "${sycl_ci}
+${header}
+${icx_found}
+${icpx_absent}"
+expect_body "compilation alias cannot borrow next compiler" 1 "Vulkan was not compiled locally: no glslangValidator.
+${header}
+toolchain-probe: glslc found /bin/glslc
+toolchain-probe: glslangValidator absent searched=PATH" "claims 'glslc' is missing"
+joins=(but while whereas although)
+for ((i = 0; i < ${#joins[@]}; i++)); do
+  expect_body "contrast boundary ${joins[i]}" 0 "CI has icx, ${joins[i]} no SYCL here.
+${header}
+${icpx_absent}"
+done
+expect_body "same clause segment alias" 1 "No SYCL here and the runner lacks icx.
+${header}
+${icx_found}" "missing probe results for claimed toolchains: icpx"
+expect_body "explicit compiler in next subject" 1 "No SYCL here and icx is missing in the CI image.
+${header}
+${icx_found}" "missing probe results for claimed toolchains: icpx"
+expect_body "compound compilation contradiction" 1 "CUDA was not compiled locally, but the CI image has no hipcc.
+${header}
+${found_nvcc}
+${absent_hipcc}" "claims 'nvcc' is missing"
+expect_body "compiler in host qualifier" 0 "No SYCL on this host (icx).
+${header}
+toolchain-probe: icx absent searched=PATH"
+expect_body "qualifier before causal subject" 0 "No nvcc here because the CI runner lacks hipcc.
+${header}
+${absent_nvcc}
+${found_hipcc}"
+expect_body "compile then absence without contrast" 1 "CUDA was not compiled locally and the CI image has no hipcc.
+${header}
+${found_nvcc}
+${absent_hipcc}" "claims 'nvcc' is missing"
+expect_body "runner on this host absent" 0 "The runner on this host has no nvcc.
+${header}
+${absent_nvcc}"
+expect_body "runner on this host contradicted" 1 "The runner on this host has no nvcc.
+${header}
+${found_nvcc}" "claims 'nvcc' is missing"
+expect_body "CI and local absences agree" 0 "The CI image has no nvcc, but this host has no hipcc.
+${header}
+${found_nvcc}
+${absent_hipcc}"
+expect_body "Darwin rejects Linux metal row" 1 "No metal locally.
+${header/os=Linux/os=Darwin}
+toolchain-probe: metal absent searched=none os=Linux" "missing probe results for claimed toolchains: metal"
+
+mkdir "${work}/stub-uname"
+cat >"${work}/stub-uname/uname" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -n) echo 'build@box' ;;
+  -s) echo Linux ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "${work}/stub-uname/uname"
+bad_host_rc=0
+bad_host="$(
+  unset TOOLCHAIN_PROBE_HOST
+  PATH="${work}/stub-uname:${PATH}" "${probe}" --prefix "${empty_dir}" 2>&1
+)" || bad_host_rc=$?
+if [[ ${bad_host_rc} == 2 && "${bad_host}" == "toolchain-probe: hostname 'build@box' has characters outside [A-Za-z0-9._-]; set TOOLCHAIN_PROBE_HOST" ]]; then
+  echo "PASS: invalid producer hostname"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: invalid producer hostname (rc=${bad_host_rc})"
+  fail_count=$((fail_count + 1))
+fi
+invalid_override_rc=0
+invalid_override="$(TOOLCHAIN_PROBE_HOST='bad host' "${probe}" --prefix "${empty_dir}" 2>&1)" || invalid_override_rc=$?
+if [[ ${invalid_override_rc} != 2 || "${invalid_override}" != *"hostname 'bad host' has characters outside"* ]]; then
+  echo "FAIL: invalid hostname override (rc=${invalid_override_rc})"
+  fail_count=$((fail_count + 1))
+fi
+override_out="$(PATH="${work}/stub-uname:${PATH}" TOOLCHAIN_PROBE_HOST=build-box "${probe}" --prefix "${empty_dir}")"
+expect_body "producer hostname override" 0 "No icpx on build-box.
+${header_a}
+toolchain-probe: icpx found /bin/icpx
+${override_out}"
+
+# Exercise the producer on an empty compiler PATH. Ignore vendor globs only
+# inside this subshell so installed off-PATH SDKs cannot mask absent rows.
+search_bin="${work}/search-bin"
+mkdir "${search_bin}"
+utilities=(bash date dirname)
+for ((i = 0; i < ${#utilities[@]}; i++)); do
+  utility="${utilities[i]}"
+  ln -s "$(command -v "${utility}")" "${search_bin}/${utility}"
+done
+cp "${work}/stub-uname/uname" "${search_bin}/uname"
+search_prefix="${work}/vendor SDK%20"$'\t\n\v\f\r'end
+search_out="$(
+  PATH="${search_bin}"
+  GLOBIGNORE='*'
+  TOOLCHAIN_PROBE_HOST=build-box
+  ONEAPI_PREFIX="${search_prefix}" CUDA_PATH="${search_prefix}" ROCM_PATH="${search_prefix}"
+  VULKAN_SDK="${search_prefix}" MINGW_CROSS_PREFIX="${search_prefix}"
+  # shellcheck source=scripts/dev/toolchain-probe.sh
+  . "${probe}"
+)"
+encoded_prefix="$(probe_encode_field "${work}")/vendor%20SDK%2520%09%0A%0B%0C%0Dend"
+search_tools=(icpx icx nvcc hipcc glslc glslangValidator x86_64-w64-mingw32-gcc)
+for ((i = 0; i < ${#search_tools[@]}; i++)); do
+  name="${search_tools[i]}"
+  case "${name}" in
+    icpx | icx) searched="${encoded_prefix}" ;;
+    nvcc) searched="PATH,${encoded_prefix},/opt/cuda,/usr/local/cuda" ;;
+    hipcc) searched="PATH,${encoded_prefix},/opt/rocm" ;;
+    glslc | glslangValidator) searched="PATH,${encoded_prefix}/bin" ;;
+    *) searched="${encoded_prefix}/bin" ;;
+  esac
+  if [[ "${search_out}"$'\n' != *"toolchain-probe: ${name} absent searched=${searched}"$'\n'* ]]; then
+    echo "FAIL: producer searched field for ${name}"
+    fail_count=$((fail_count + 1))
+  fi
+  expect_body "producer searched field for ${name}" 0 "No ${name}.
+${search_out}"
+done
+
+# A real runtime path can contain semicolons and a space. Only a recognized
+# detail row is exempt from the prose clause cap. Pair it with an invalid row.
+printf -v separators '%064d' 0
+separators="${separators//0/;}"
+runtime="${work}/runtime SDK/${separators}"
+mingw="${work}/mingw/bin/x86_64-w64-mingw32"
+mkdir -p "${runtime}" "${work}/mingw/bin"
+touch "${runtime}/"{libstdc++-6.dll,libgcc_s_seh-1.dll,libwinpthread-1.dll}
+cat >"${mingw}-gcc" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -print-file-name=*) printf '%s/%s\n' "$RUNTIME_FIXTURE" "${1#*=}" ;;
+  -v) echo 'Thread model: win32' ;;
+  *) echo 13 ;;
+esac
+EOF
+printf '#!/bin/sh\nexit 0\n' >"${mingw}-objdump"
+chmod +x "${mingw}-gcc" "${mingw}-objdump"
+mingw_out="$(MINGW_CROSS_PREFIX="${work}/mingw" RUNTIME_FIXTURE="${runtime}" "${probe}" --prefix "${empty_dir}")"
+detail="toolchain-probe: x86_64-w64-mingw32-gcc runtime libstdc++-6.dll=$(probe_encode_field "${work}")/runtime%20SDK/${separators}/libstdc++-6.dll"
+if [[ "${mingw_out}" != *"${detail}"* ]]; then
+  echo "FAIL: producer encoded runtime detail"
+  fail_count=$((fail_count + 1))
+fi
+expect_body "MinGW detail exempt from prose" 0 "${mingw_out}"
+expect_body "detail-looking prose checked" 1 "${header}
+${detail} no nvcc" "clauses per line"
+expect_body "clause cap plus one" 1 "a${separators//;/;a}" "clauses per line"
+expect_body "clause cap inclusive" 0 "a${separators:1}"
+printf -v padding '%04096d' 0
+padding="${padding//0/$'\n'}"
+expect_body "body cap plus one" 1 "${padding}end" "4096 lines"
+expect_body "body cap inclusive" 0 "${padding:1}end"
+
 syntax_rc=0
-grep -En '((declare|local)[[:space:]]+-A|mapfile|readarray|,,}|\^\^}|declare[[:space:]]+-n)' "${gate}" || syntax_rc=$?
+grep -En '((declare|local)[[:space:]]+-A|mapfile|readarray|,,}|\^\^}|declare[[:space:]]+-n|\|&|\[[[:space:]]*-[0-9]+[[:space:]]*\])' "${gate}" "${probe}" "${repo_root}/scripts/dev/toolchain-probe-format.sh" || syntax_rc=$?
 if [ "${syntax_rc}" -eq 1 ]; then
   echo "PASS: Bash 3.2 checker syntax contract"
   pass_count=$((pass_count + 1))

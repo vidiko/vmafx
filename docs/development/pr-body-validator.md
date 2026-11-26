@@ -326,20 +326,23 @@ toolchain-probe: metal absent searched=none os=Linux
 
 The producer and checker share the v1 format in
 `scripts/dev/toolchain-probe-format.sh`. The header carries the hostname
-(letters, digits, dots, hyphens, and underscores), the kernel name from
+(ASCII letters, digits, dots, hyphens, and underscores), the kernel name from
 `uname -s`, and a UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` format. Recognized
 kernel names are `Linux`, `Darwin`, `FreeBSD`, `NetBSD`, `OpenBSD`, `DragonFly`,
 `SunOS`, `AIX`, and the versioned Windows names beginning with `MINGW32_NT-`,
 `MINGW64_NT-`, `MSYS_NT-`, or `CYGWIN_NT-`. The pasted block is
 **unauthenticated**. Anyone can forge it. The checker catches claims with
-missing or contradictory evidence.
+missing or contradictory evidence. If `uname -n` contains other characters,
+set `TOOLCHAIN_PROBE_HOST` to an identifying name in the accepted alphabet.
+The probe validates the override before printing its header.
 
 Probe rows count as evidence after a valid header in the same fence, or on
 consecutive nonblank lines after an unfenced header. A `found` row carries a
 path and optional version text. An `absent` row ends with one `searched=`
 field. The producer percent-encodes ASCII whitespace and the percent sign, so
 `/tmp/oneAPI SDK%20` becomes `/tmp/oneAPI%20SDK%2520`. The non-Darwin Metal
-row ends with `searched=none os=<kernel>`. MinGW detail rows (`dumpversion`,
+row ends with `searched=none os=<kernel>` and must match the header kernel.
+MinGW runtime paths use the same percent encoding. MinGW detail rows (`dumpversion`,
 `thread-model`, `runtime`, `runtime-unresolved`, and `pairing*`) describe the
 cross compiler. The checker skips valid probe rows inside a block and checks
 claims in ordinary fenced text, blockquotes, same-line backtick spans such as
@@ -347,14 +350,20 @@ claims in ordinary fenced text, blockquotes, same-line backtick spans such as
 contains a backtick), and prose mixed into probe output.
 
 `scripts/ci/check-toolchain-claims.sh` splits each checked line into clauses at
-`;` and at sentence ends (`.`, `!`, or `?` followed by whitespace) and takes
-claimed tools only from the clause carrying the claim. It recognizes `no <tool>`,
+semicolons, sentence ends (`.`, `!`, or `?` followed by whitespace), and
+contrastive joins such as `, but`, `, while`, `, whereas`, or `, although`.
+It checks each predicate with its own subject, trailing tool list, and host
+qualifier. In `No SYCL here and the CI runner lacks icx`, the first predicate
+requires a local `icpx` absence and the second requires an `icx` result.
+Descriptions over 4096 lines or prose lines over 64 clauses produce a finding.
+
+The checker recognizes `no <tool>`,
 `(lacks|lacking) <tool>` (with an optional article), and
 `<tool> (is|are|was|were)? <status>`, where `<status>` can be `not installed`,
 `not found`, `not available`, `missing`, `unavailable`, or `absent`. It also
 recognizes `without <tool>` with a nearby host qualifier (`on this host`,
 `this host`, `on the host`, `here`, or `locally`), and compilation claims when
-a tool or backend appears in the same clause as `not compiled`,
+a tool or backend appears in the same segment as `not compiled`,
 `did not compile`, `did not build`, `(was|were) not built`, or
 `compilation (was|were)? skipped`. One `toolchain_map` vocabulary in
 `scripts/ci/check-toolchain-claims.sh` covers both absence and compilation
@@ -381,28 +390,29 @@ the remaining text. A second, unscoped mention of the same tool still needs
 evidence. If a 33rd change-scope match remains, the checker uses the original
 clause for evidence checking.
 
-For absence claims, a runner, image, container, CI, or golden-build subject
-directly before `has no`, `have no`, or `lacks` takes precedence. For example,
-`I verified locally that the CI runner has no nvcc` describes the runner.
-The subjects `this host`, `the host`, `this machine`, and `my machine` bind
-the same verbs to the host. A host qualifier in the absence phrase or within
-the four words on either side also identifies a host claim. Other absence
-claims default to the host unless the clause names a non-host scope.
-Compilation claims require host agreement only when their clause names the
-host.
+A runner, image, container, CI, or golden-build subject identifies a
+non-host claim. For example, `I verified locally that the CI runner has no
+nvcc` describes the runner. In `The runner on this host has no nvcc`, the
+qualifier identifies the local host. Other absence claims default to the host.
+A compilation claim needs host agreement when its own subject or qualifier
+identifies the host.
 
-Each claim needs **one probe block covering every tool it names**. For a host
-claim, one covering block must also report all those tools absent. For a CI
-claim, a found compiler can still supply evidence. When no block covers all
-tools, the error lists the missing results from the closest block (the first
-in a tie). When every covering block contradicts the claim, the error names
-the tools found in the first covering block.
+Each segment needs **one probe block covering every tool it claims**. In
+`No nvcc on build-01`, only blocks whose `host=` matches `build-01` count.
+Names match whole words, case-insensitively. Any matching block reporting a
+claimed tool found contradicts that named-host claim. When a host claim leaves
+the host unnamed, one complete agreeing block suffices if all headers name the
+same host. If the headers name different hosts, name the probed host in the
+claim. For a CI claim, a found compiler can supply the required result.
 
-`scripts/ci/check-toolchain-claims.sh` uses `toolchain_map` for both required
-results and contradictions. Explicit compiler names take precedence over
-backend aliases per family (`icpx`/`icx` over `sycl`/`oneapi`, `nvcc` over
-`cuda`/`cuda toolkit`, `hipcc`/`hip cc` over `hip`/`rocm`, and
-`glslc`/`glslangValidator` over `vulkan`), not globally across families.
+Missing-result diagnostics identify the closest eligible block (first in a
+tie). Contradictions identify the block that reported the compiler found.
+Both include its hostname and header line in the description.
+
+Explicit compiler names take precedence over backend aliases in their own
+segment and family (`icpx`/`icx` for `sycl`/`oneapi`, `nvcc` for `cuda`/`cuda
+toolkit`, `hipcc`/`hip cc` for `hip`/`rocm`, and `glslc`/`glslangValidator`
+for `vulkan`).
 
 | Probe result name | Claim words mapped to it |
 | --- | --- |
