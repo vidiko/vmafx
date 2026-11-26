@@ -160,7 +160,7 @@ class TestOrtGuard(unittest.TestCase):
         }
         cpu = 'python3 ort_nuget_install.py --prefix "a;b" --version 1.0'
         gpu = 'python3 ort_nuget_install.py --package "gpu" --version '
-        for separator in ("; ", " && ", " || ", " && " + chr(92) + "\n    "):
+        for separator in ("; ", " && ", " || ", " | ", " && " + chr(92) + "\n    "):
             with self.subTest(separator=separator):
                 command = "- run: |\n    " + cpu + separator + gpu
                 workflow.write_text(command + "2.0\n", encoding="utf-8")
@@ -182,6 +182,8 @@ class TestOrtGuard(unittest.TestCase):
             ("    ORT_VERSION=1.0\n", False),
             ("    ORT_VERSION=9.0\n", True),
             ('    ORT_VERSION="$NEXT_VERSION"\n', True),
+            ('    ORT_VERSION="$(cat version)"\n', True),
+            ('    ORT_VERSION="${NEXT_VERSION:-1.0}"\n', True),
             ("    # ORT_VERSION=9.0\n", False),
         ):
             with self.subTest(assignment=assignment):
@@ -190,6 +192,44 @@ class TestOrtGuard(unittest.TestCase):
                 self.assertEqual(bool(findings), expected, findings)
                 if expected:
                     self.assertIn(":6: ambiguous ORT_VERSION in step", findings[0])
+
+    def test_inline_nonliteral_helper_version(self) -> None:
+        workflow = Path(self.temp.name) / "inline.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        tail = 'python3 ort_nuget_install.py --version "$ORT_VERSION"\n'
+        cases = (
+            (
+                f'- run: |\n    ORT_VERSION=1.0 && ORT_VERSION="$NEXT_VERSION" && {tail}',
+                ":2: unpinned ORT_VERSION '\"$NEXT_VERSION\"' for package 'cpu'",
+            ),
+            (
+                '- name: install\n  env:\n    ORT_VERSION: "1.0"\n  run: |\n'
+                f'    true && ORT_VERSION="$NEXT_VERSION" && {tail}',
+                ":5: unpinned ORT_VERSION '\"$NEXT_VERSION\"' for package 'cpu'",
+            ),
+            (
+                f'- run: |\n    ORT_VERSION="1.0$NEXT_VERSION" {tail}',
+                ":2: unpinned ORT_VERSION '\"1.0$NEXT_VERSION\"' for package 'cpu'",
+            ),
+            (
+                f"- run: |\n    ORT_VERSION=1.0#$NEXT_VERSION {tail}",
+                ":2: unpinned ORT_VERSION '1.0#$NEXT_VERSION' for package 'cpu'",
+            ),
+            (
+                f"- run: |\n    ORT_VERSION=1.0$(echo ORT_VERSION=1.0 ) {tail}",
+                ":2: unpinned ORT_VERSION '1.0$(echo ORT_VERSION=1.0 )' for package 'cpu'",
+            ),
+            (
+                f'- run: |\n    ORT_VERSION="--version 1.0" && {tail}',
+                ":2: unpinned ORT_VERSION '\"--version 1.0\"' for package 'cpu'",
+            ),
+            (f'- run: |\n    ORT_VERSION="1.0" {tail}', None),
+        )
+        for text, expected in cases[: guard.MAX_COMMAND_LINES]:
+            with self.subTest(text=text):
+                workflow.write_text(text, encoding="utf-8")
+                findings = guard.scan_file(workflow, packages)[0]
+                self.assertEqual(findings, [f"{workflow}{expected}"] if expected else [])
 
     def test_nuget_package_identity(self) -> None:
         workflow = Path(self.temp.name) / "downloads.yml"
@@ -200,14 +240,35 @@ class TestOrtGuard(unittest.TestCase):
                 f"ORT_PACKAGE: microsoft.ml.onnxruntime\n  run: curl {address}${{ORT_PACKAGE}}/file",
                 "must use helper",
             ),
+            (
+                "- name: dl\n  env:\n    ORT: microsoft.ml.onnxruntime\n"
+                f'  run: curl {address}"${{ORT}}"/file',
+                "ONNX Runtime download must use helper",
+            ),
+            (
+                "- name: dl\n  env:\n    ORT: microsoft.ml.onnxruntime\n"
+                f'  run: curl {address}"$ORT"/file',
+                "ONNX Runtime download must use helper",
+            ),
+            (
+                f'- run: curl {address}"microsoft.ml".onnxruntime/file',
+                "ONNX Runtime download must use helper",
+            ),
+            (
+                f"- run: curl {address}'microsoft.ml'.onnxruntime/file",
+                "ONNX Runtime download must use helper",
+            ),
+            (f'- run: curl {address}"$(cat pkg)"/file', "NuGet download with unresolved package"),
             (f"run: wget {address}$UNKNOWN/file", "NuGet download with unresolved package"),
             (f"run: curl {address}other.package/file", None),
             (f"# curl {address}${{UNKNOWN}}/file", None),
             (f"OTHER: unrelated\n  run: curl {address}$OTHER/file", None),
+            (f'OTHER: unrelated\n  run: curl {address}"$OTHER"/file', None),
         )
         for text, expected in cases:
             with self.subTest(text=text):
-                workflow.write_text("- name: download\n  " + text + "\n")
+                body = text if text.startswith("- ") else f"- name: download\n  {text}"
+                workflow.write_text(f"{body}\n", encoding="utf-8")
                 findings = guard.scan_file(workflow, {})[0]
                 if expected:
                     self.assertIn(expected, "\n".join(findings))

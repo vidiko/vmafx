@@ -38,7 +38,11 @@ WORKFLOW_BOUNDARY_RE = re.compile(
 )
 BINDING_RE = re.compile(r"^\s*(?:(?:export|ARG|ENV)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*)$")
 LITERAL_BINDING_RE = re.compile(r"""(["']?)([A-Za-z0-9_.+-]+)\1(?:\s+#.*)?""")
-INLINE_BINDING_RE = re.compile(r"(?:^|[\s;&|])([A-Za-z_][A-Za-z0-9_]*)=[\"']?([^\"'\s#\\;$}]+)")
+INLINE_BINDING_RE = re.compile(
+    r"""(?:^|[\s;&|])([A-Za-z_][A-Za-z0-9_]*)="""
+    r"""((?:\\.|'[^']*'|"(?:\\.|[^"\\]++)*"|`(?:\\.|[^`\\]++)*`"""
+    r"""|\$\([^()]*\)|\$\{[^}]*\}|\$|[^\s"'`\\;&|$]++)*+)"""
+)
 HELPER_FLAGS: frozenset[str] = frozenset(
     {
         "--package",
@@ -67,7 +71,7 @@ CONTAINER_VERSION_ARG_RE = re.compile(
 )
 CONTAINER_FLAG_VALUE_RE = re.compile(r"^[A-Za-z0-9_./][A-Za-z0-9_./-]*$")
 NUGET_ADDRESS_RE = re.compile(
-    r"(?:api\.nuget\.org/v3-flatcontainer/|nuget\.org/api/v2/package/)" r"([^/\s\"']+)",
+    r"(?:api\.nuget\.org/v3-flatcontainer/|nuget\.org/api/v2/package/)([^/\s]+)",
     re.I,
 )
 ORT_PACKAGE_RE = re.compile(r"microsoft\.ml\.onnxruntime(?:[.a-z0-9_-]*)", re.I)
@@ -461,7 +465,7 @@ def _workflow_helper_calls(command: str, first_line_end: int) -> list[str] | Non
         else:
             shell = re.sub(r"^(?:-\s+)?run:\s*", "", clause.strip())
             binding = BINDING_RE.fullmatch(shell)
-            if binding and binding[1] == "ORT_VERSION" and LITERAL_BINDING_RE.fullmatch(binding[2]):
+            if binding and binding[1] == "ORT_VERSION":
                 assignment = shell
         if match["stop"].startswith("#") or match.end() >= first_line_end:
             break
@@ -491,14 +495,16 @@ def _resolve_helper_version(
     call_text: str,
 ) -> tuple[str | None, str]:
     """Resolve the literal or bound ORT_VERSION for a helper call."""
-    ver_match = VERSION_FLAG_RE.search(call_text)
+    prefix, _, tail = call_text.partition("ort_nuget_install.py")
+    ver_match = VERSION_FLAG_RE.search(tail)
     version = ver_match.group(1) if ver_match else None
     if version not in ("$ORT_VERSION", "${ORT_VERSION}"):
         return version, ""
-    prefix = call_text.partition("ort_nuget_install.py")[0]
     inline = dict(INLINE_BINDING_RE.findall(prefix))
     if "ORT_VERSION" in inline:
-        return inline["ORT_VERSION"], ""
+        raw = inline["ORT_VERSION"]
+        literal = LITERAL_BINDING_RE.fullmatch(raw)
+        return (literal[2] if literal else raw), ""
     bindings = _step_bindings(lines[start_idx : site_idx + 1])
     if bindings is None:
         return None, "step binding limit exceeded"
@@ -557,15 +563,22 @@ def _check_helper_step(
     return findings
 
 
-def _nuget_binding_problem(names: list[str], bindings: dict[str, set[str]]) -> str:
-    """Require each referenced package variable to resolve to unrelated literal IDs."""
-    for name in names:
+def _nuget_binding_problem(segments: list[str], bindings: dict[str, set[str]]) -> str:
+    """Require each dynamic NuGet package segment to resolve to unrelated literal IDs."""
+    var_re = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+    invalid = False
+    names: list[str] = []
+    for seg in segments[:MAX_COMMAND_LINES]:
+        refs = var_re.findall(seg)
+        names.extend(g1 or g2 for g1, g2 in refs[:MAX_COMMAND_LINES])
+        invalid = invalid or len(refs) != 1 or bool(var_re.sub("", seg))
+    for name in names[:MAX_COMMAND_LINES]:
         values = bindings.get(name, set())
-        if any(ORT_PACKAGE_RE.fullmatch(value) for value in values):
+        if any(ORT_PACKAGE_RE.fullmatch(val.replace('"', "").replace("'", "")) for val in values):
             return "ONNX Runtime download must use helper"
         if not values or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", value) for value in values):
             return "NuGet download with unresolved package"
-    return ""
+    return "NuGet download with unresolved package" if invalid else ""
 
 
 def _check_nuget_download(
@@ -573,21 +586,24 @@ def _check_nuget_download(
 ) -> list[str]:
     """Reject direct runtime downloads and unresolved NuGet package variables."""
     lower = line.lower()
-    if not any(marker in lower for marker in ("curl ", "wget ", "https://")):
+    if "curl " not in lower and "wget " not in lower and "https://" not in lower:
         return []
-    if ORT_PACKAGE_RE.search(line):
-        return [f"{path}:{idx + 1}: ONNX Runtime download must use helper"]
-    packages = NUGET_ADDRESS_RE.findall(line)
-    if len(packages) > MAX_COMMAND_LINES:
+    raw_packages = NUGET_ADDRESS_RE.findall(line)
+    if len(raw_packages) > MAX_COMMAND_LINES:
         return [f"{path}:{idx + 1}: NuGet address limit exceeded"]
-    names = [package.removeprefix("$").strip("{}") for package in packages if "$" in package]
-    if not names:
+    packages = [pkg.replace('"', "").replace("'", "") for pkg in raw_packages[:MAX_COMMAND_LINES]]
+    if ORT_PACKAGE_RE.search(" ".join([line, *packages])):
+        return [f"{path}:{idx + 1}: ONNX Runtime download must use helper"]
+    dynamic = [
+        pkg for pkg in packages[:MAX_COMMAND_LINES] if not re.fullmatch(r"[A-Za-z0-9_.-]+", pkg)
+    ]
+    if not dynamic:
         return []
     start_idx, end_idx = find_block_for_site(lines, idx, is_workflow)
     bindings = _step_bindings(lines[start_idx : end_idx + 1])
     if bindings is None:
         return [f"{path}:{idx + 1}: step binding limit exceeded"]
-    problem = _nuget_binding_problem(names, bindings)
+    problem = _nuget_binding_problem(dynamic, bindings)
     return [f"{path}:{idx + 1}: {problem}"] if problem else []
 
 
