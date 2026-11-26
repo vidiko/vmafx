@@ -1085,7 +1085,7 @@ static char *test_verify_fifo_bundle(void)
 {
     char *dir = calloc(TEST_BUFFER_256, 1u);
     char *path = calloc(TEST_BUFFER_512, 1u);
-    char *record = calloc(sizeof("1"), 1u);
+    char *record = calloc(1u, sizeof("1"));
     char *msg = "allocation failed";
     if (dir && path && record) {
         msg = "create private root";
