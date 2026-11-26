@@ -19,10 +19,12 @@
 # queued pull request based on that tip stays queued. If master has moved, compare
 # its fresh render with master first. If master is current, dequeue and close
 # the stale pull request. Otherwise, leave matching queued files in place or
-# dequeue and confirm removal before pushing and arming auto-merge again. A failed
-# queue read stops the run. If interrupted after dequeue and before push, the next
-# run refreshes the unqueued branch. With RENDER_DUE=false (master's render is
-# current) an open render pull request of this workflow is closed instead.
+# dequeue and confirm removal before pushing and arming auto-merge again. The
+# queue re-read before the push narrows but does not close the window between
+# that read and the push. A failed queue read stops the run. If interrupted after
+# dequeue and before push, the next run refreshes the unqueued branch. With
+# RENDER_DUE=false (master's render is current) an open render pull request of
+# this workflow is closed instead.
 # Inputs (environment): GH_TOKEN (App installation token), APP_SLUG,
 # GITHUB_REPOSITORY, RENDER_BRANCH, RENDER_DUE, RUNNER_TEMP, OWED_SINCE,
 # RENDER_DEQUEUE_POLLS (default 12), RENDER_DEQUEUE_SLEEP_S (default 5).
@@ -59,9 +61,14 @@ read_queue_state() {
 }
 
 dequeue_render_pr() {
-  local pr="$1" polls="${RENDER_DEQUEUE_POLLS:-12}" i
-  if [[ ! "$polls" =~ ^[0-9]+$ ]]; then
+  local pr="$1" polls="${RENDER_DEQUEUE_POLLS-12}" sleep_s="${RENDER_DEQUEUE_SLEEP_S-5}"
+  local max_polls=120 i
+  if [[ ! "$polls" =~ ^[1-9][0-9]{0,2}$ ]] || ((polls > max_polls)); then
     echo "open-render-pr.sh: invalid RENDER_DEQUEUE_POLLS for pull request #$pr" >&2
+    return 1
+  fi
+  if [[ ! "$sleep_s" =~ ^[0-9]{1,3}$ ]]; then
+    echo "open-render-pr.sh: invalid RENDER_DEQUEUE_SLEEP_S for pull request #$pr" >&2
     return 1
   fi
   if ! gh api graphql \
@@ -70,9 +77,9 @@ dequeue_render_pr() {
     echo "open-render-pr.sh: dequeue failed for pull request #$pr" >&2
     return 1
   fi
-  for ((i = 0; i < 10#$polls; i++)); do
+  for ((i = 0; i < polls; i++)); do
     if ((i > 0)); then
-      sleep "${RENDER_DEQUEUE_SLEEP_S:-5}"
+      sleep "$sleep_s"
     fi
     read_queue_state "$pr"
     if [[ "$queued" == false ]]; then
@@ -97,14 +104,18 @@ close_render_pr() {
 
 base="$(git rev-parse HEAD)"
 open_pr="$(find_open_pr)"
+queued=false
 if [[ "$RENDER_DUE" != true ]]; then
   if [[ -n "$open_pr" ]]; then
+    read_queue_state "$open_pr"
+    if [[ "$queued" == true ]]; then
+      dequeue_render_pr "$open_pr"
+    fi
     close_render_pr "$open_pr"
   fi
   exit 0
 fi
 
-queued=false
 parent=""
 if [[ -n "$open_pr" ]]; then
   read_queue_state "$open_pr"
@@ -171,6 +182,13 @@ printf 'chore(docs): render generated changelog and ADR index\n\n%s\n\nSigned-of
   "$bot" "$email" >"$msg"
 git switch -q -C "$RENDER_BRANCH"
 git -c user.name="$bot" -c user.email="$email" commit -q -F "$msg"
+if [[ -n "$open_pr" ]]; then
+  read_queue_state "$open_pr"
+  if [[ "$queued" == true ]]; then
+    echo "open-render-pr.sh: pull request #$open_pr was queued again before the push; not pushing" >&2
+    exit 1
+  fi
+fi
 git push -q --force "$remote_url" "HEAD:refs/heads/$RENDER_BRANCH"
 
 if [[ -z "$open_pr" ]]; then

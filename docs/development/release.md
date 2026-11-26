@@ -638,11 +638,13 @@ them next to any other file. The outputs are written by one command,
   auto-merge. A queued render based on the master tip stays queued. If master
   moves, the workflow renders again and compares the generated files with the
   queued branch. A match stays queued. If the files differ, the workflow
-  dequeues the pull request, confirms removal, pushes the fresh render and
-  arms auto-merge again. When the fresh render matches master, the workflow
+  checks poll and sleep bounds before dequeuing the pull request, confirms
+  removal, re-reads the queue before pushing the fresh render and arms
+  auto-merge again. When the fresh render matches master, the workflow
   closes the open render pull request instead of pushing.
   A failed queue query stops the workflow before it
-  can push. When master's render is current it closes its own pull request
+  can push. When master's render is current it dequeues first if queued and
+  closes its own pull request
   ([ADR-3373](../adr/3373-scheduled-render-pull-request.md),
   [ADR-3552](../adr/3552-docs-render-on-master-push.md),
   [ADR-3627](../adr/3627-render-check-in-the-merge-group.md)). To run it at
