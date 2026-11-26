@@ -348,6 +348,64 @@ class HookInstallTests(unittest.TestCase):
         self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
         self.assertTrue(any(event[0] == "commit-msg" for event in self.events()))
 
+    def test_shipped_commit_msg_policy_rejects_nonconventional_messages(self) -> None:
+        raw = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+        self.assertIsInstance(raw, dict)
+        repos = raw.get("repos")
+        self.assertIsInstance(repos, list)
+        entries = [
+            repo
+            for repo in repos[:200]
+            if isinstance(repo, dict)
+            and isinstance(repo.get("hooks"), list)
+            and any(
+                isinstance(hook, dict) and hook.get("id") == "conventional-pre-commit"
+                for hook in repo["hooks"][:200]
+            )
+        ]
+        self.assertEqual(len(entries), 1, "expected one conventional-pre-commit repo entry")
+        config = self.repo / ".pre-commit-config.yaml"
+        config.write_text(yaml.safe_dump({"repos": entries}, sort_keys=False), encoding="utf-8")
+        self.run_git("add", ".pre-commit-config.yaml")
+        message = self.repo / ".git/COMMIT_EDITMSG"
+        # Reuse the caller's store so a cached v4.5.0 hook environment needs no network clone.
+        store = os.environ.get("PRE_COMMIT_HOME") or str(Path("~/.cache/pre-commit").expanduser())
+        cases = (
+            ("negative", "update stuff\n", 1),
+            ("positive", "fix: good\n", 0),
+            ("boundary_fork_type", "simd: vectorise the sum\n", 0),
+            ("boundary_absent_type", "bogus: x\n", 1),
+        )
+        for label, text, expected_rc in cases:
+            with self.subTest(case=label):
+                message.write_text(text, encoding="utf-8")
+                result = run_command(
+                    [
+                        "pre-commit",
+                        "run",
+                        "--config",
+                        str(config),
+                        "--hook-stage",
+                        "commit-msg",
+                        "--commit-msg-filename",
+                        str(message),
+                        "conventional-pre-commit",
+                    ],
+                    allowed_executables=("pre-commit",),
+                    cwd=self.repo,
+                    env={**self.env, "PRE_COMMIT_HOME": store},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout_seconds=300,
+                )
+                output = (result.stdout + result.stderr).replace("\r\n", "\n")
+                self.assertEqual(result.returncode, expected_rc, output)
+                expected_line = (
+                    "Passed" if expected_rc == 0 else "Failed\n- hook id: conventional-pre-commit"
+                )
+                self.assertRegex(output, rf"(?m)^Conventional Commit\.+{expected_line}$")
+
     def test_missing_mkdocs_blocks_selected_docs_but_not_direct_non_docs(self) -> None:
         self.install()
         (self.bin / "mkdocs").unlink()
