@@ -8,6 +8,8 @@ import hashlib
 import http.client
 import io
 import json
+import re
+import shlex
 import zipfile
 from pathlib import Path
 from typing import BinaryIO
@@ -197,6 +199,28 @@ def test_print_pin_writes_nothing_under_prefix(
     assert out == {"1.99.0": {"sha256": sha, "size": len(data)}}
     assert not prefix.exists()
     assert ort.PINS.read_text(encoding="utf-8") == pins_before
+
+
+def test_documented_print_pin_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    root = Path(__file__).resolve().parents[3]
+    adr = (root / "docs/adr/3561-ort-nuget.md").read_text(encoding="utf-8")
+    examples = adr.partition("## Raising the version\n")[2].partition("\n## ")[0]
+    commands = examples.partition("```bash\n")[2].partition("\n```")[0].splitlines()
+    package_names = ("cpu", "gpu")
+    assert len(commands) == len(package_names)
+    measured = set()
+    for command in commands:
+        interpreter, script, *arguments = shlex.split(command)
+        assert (interpreter, script) == ("python3", "scripts/ci/ort_nuget_install.py")
+        assert "--print-pin" in arguments
+        with patch.object(ort, "measure_pin", return_value=("a" * 64, 10)) as measure:
+            assert ort.main(arguments) == 0
+        entry = json.loads(capsys.readouterr().out)
+        (version,) = entry
+        assert re.fullmatch(r"\d+(?:\.\d+){2}", version), version
+        assert entry[version] == {"sha256": "a" * 64, "size": 10}
+        measured.add(measure.call_args.args[0].replace(version, "{version}"))
+    assert measured == {ort._load_package(name)["source"] for name in package_names}
 
 
 def test_download_digest_and_size_refused(tmp_path: Path) -> None:

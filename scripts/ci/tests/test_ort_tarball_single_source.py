@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,10 +18,46 @@ ROOT = Path(__file__).resolve().parents[3]
 SHAPE_FINDING = "container ort_nuget_install.py instruction violates canonical RUN shape"
 
 
+class TestOrtDocumentation(unittest.TestCase):
+    adr = ROOT / "docs/adr/3561-ort-nuget.md"
+    notes = ROOT / "docs/development/ci-workflow-notes/tests-and-quality-gates.md"
+
+    def test_index_tags_match_decision(self) -> None:
+        header = self.adr.read_text(encoding="utf-8").partition("- **Tags**: ")[2].splitlines()[0]
+        fragment = self.adr.parent / "_index_fragments" / self.adr.name
+        tags = fragment.read_text(encoding="utf-8").strip().strip("|").rsplit("|", 1)[1]
+        self.assertEqual(set(tags.strip().split(", ")), set(header.replace("`", "").split(", ")))
+
+    def test_decision_cites_maintainer_request(self) -> None:
+        references = self.adr.read_text(encoding="utf-8").partition("## References\n")[2]
+        self.assertRegex(references, r"(?m)^- (?:req|Q\d+\.\d+) \(paraphrased")
+        self.assertIn("NuGet", references)
+
+    def coverage_notes(self) -> str:
+        text = self.notes.read_text(encoding="utf-8").partition("## coverage\n")[2]
+        return " ".join(text.partition("\n## ")[0].split())
+
+    def test_coverage_documents_driverless_provider_limit(self) -> None:
+        self.assertRegex(self.coverage_notes(), r"does not assert that the CUDA provider attaches")
+
+    def test_coverage_documents_cache_repair_scope(self) -> None:
+        notes = self.coverage_notes()
+        self.assertIn("repairs the current run only", notes)
+        self.assertIn("gh cache delete", notes)
+        self.assertIn("pin catalog rotates the key", notes)
+
+
 class TestOrtGuard(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+
+    def test_local_unittest_discovery_includes_all_guard_cases(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        expected = len(re.findall(r"^(?:    )?def test_\w+\(", source, re.MULTILINE))
+        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+        self.assertGreater(expected, 0)
+        self.assertEqual(suite.countTestCases(), expected)
 
     def test_old_source_and_direct_nuget_refused(self) -> None:
         tmp_path = Path(self.temp.name)
@@ -115,6 +152,26 @@ class TestOrtGuard(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn(":3: unpinned ORT_VERSION '1.0' for package 'gpu'", findings[0])
 
+    def test_cpu_and_gpu_calls_share_a_shell_line(self) -> None:
+        workflow = Path(self.temp.name) / "commands.yml"
+        packages: dict[str, dict[str, Any]] = {
+            "cpu": {"versions": {"1.0": {}}},
+            "gpu": {"versions": {"2.0": {}}},
+        }
+        cpu = 'python3 ort_nuget_install.py --prefix "a;b" --version 1.0'
+        gpu = 'python3 ort_nuget_install.py --package "gpu" --version '
+        for separator in ("; ", " && ", " || ", " && " + chr(92) + "\n    "):
+            with self.subTest(separator=separator):
+                command = "- run: |\n    " + cpu + separator + gpu
+                workflow.write_text(command + "2.0\n", encoding="utf-8")
+                self.assertEqual(guard.scan_file(workflow, packages)[0], [])
+                workflow.write_text(command + "9.9\n", encoding="utf-8")
+                line = 2 + separator.count("\n")
+                self.assertEqual(
+                    guard.scan_file(workflow, packages)[0],
+                    [f"{workflow}:{line}: unpinned ORT_VERSION '9.9' for package 'gpu'"],
+                )
+
     def test_helper_version_bindings(self) -> None:
         workflow = Path(self.temp.name) / "bindings.yml"
         packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
@@ -124,6 +181,7 @@ class TestOrtGuard(unittest.TestCase):
             ("", False),
             ("    ORT_VERSION=1.0\n", False),
             ("    ORT_VERSION=9.0\n", True),
+            ('    ORT_VERSION="$NEXT_VERSION"\n', True),
             ("    # ORT_VERSION=9.0\n", False),
         ):
             with self.subTest(assignment=assignment):
@@ -155,6 +213,33 @@ class TestOrtGuard(unittest.TestCase):
                     self.assertIn(expected, "\n".join(findings))
                 else:
                     self.assertEqual(findings, [])
+
+    def test_download_checks_only_the_referenced_package_binding(self) -> None:
+        workflow = Path(self.temp.name) / "packages.yml"
+        step = (
+            "- name: download\n  env:\n    ORT: microsoft.ml.onnxruntime\n"
+            "    OTHER: unrelated.package\n  run: curl https://api.nuget.org/v3-flatcontainer/"
+        )
+        workflow.write_text(step + "${OTHER}/file\n", encoding="utf-8")
+        self.assertEqual(guard.scan_file(workflow, {})[0], [])
+        workflow.write_text(step + "${ORT}/file\n", encoding="utf-8")
+        self.assertEqual(
+            guard.scan_file(workflow, {})[0],
+            [f"{workflow}:5: ONNX Runtime download must use helper"],
+        )
+
+        workflow.write_text(
+            step + "${OTHER}/file https://api.nuget.org/v3-flatcontainer/$ORT/file\n"
+        )
+        self.assertEqual(
+            guard.scan_file(workflow, {})[0],
+            [f"{workflow}:5: ONNX Runtime download must use helper"],
+        )
+        workflow.write_text(step.replace("unrelated.package", "$SOURCE") + "${OTHER}/file\n")
+        self.assertEqual(
+            guard.scan_file(workflow, {})[0],
+            [f"{workflow}:5: NuGet download with unresolved package"],
+        )
 
     def test_container_sources_and_pins(self) -> None:
         container = Path(self.temp.name) / "Containerfile"

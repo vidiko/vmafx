@@ -2199,6 +2199,13 @@ class FailClosedCIContract(unittest.TestCase):
         self.assertIn("depends = py314", coverage)
         self.assertNotRegex(coverage, r"(?m)^\s*coverage (?:report|xml|html) .*\s-i(?:\s|$)")
 
+    def test_ort_cache_key_tracks_pin_catalog(self) -> None:
+        workflow = (WORKFLOWS / "tests-and-quality-gates.yml").read_text(encoding="utf-8")
+        step = workflow_step(workflow_job(workflow, "coverage"), "Cache ONNX Runtime package")
+        cache = yaml.safe_load(step)[0]
+        self.assertRegex(cache["uses"], r"^actions/cache@")
+        self.assertIn("${{ hashFiles('scripts/ci/ort-nuget-pins.json') }}", cache["with"]["key"])
+
     def test_cpu_coverage_records_and_reasserts_pytest_failure(self) -> None:
         workflow = (WORKFLOWS / "tests-and-quality-gates.yml").read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"(?m)^    if: false\s*$")
@@ -2627,6 +2634,20 @@ class InstallStepContract(unittest.TestCase):
 
     def installer(self) -> str:
         return (ROOT / "scripts/ci/install-llvm.sh").read_text(encoding="utf-8")
+
+    def test_installer_fixture_keeps_lf_with_windows_default(self) -> None:
+        write_text = Path.write_text
+
+        def windows_write(
+            path: Path, data: str, *, encoding: str, newline: str | None = None
+        ) -> int:
+            if path.name == "install-llvm.sh" and newline is None:
+                newline = "\r\n"
+            return write_text(path, data, encoding=encoding, newline=newline)
+
+        with mock.patch.object(Path, "write_text", windows_write):
+            status, output, _ = self.run_installer("printf %s ok\n")
+        self.assertEqual((status, output), (0, "ok"))
 
     def test_runner_sources_removed_before_refresh_in_both_modes(self) -> None:
         for source in ("--source=archive-first", "--source=apt.llvm.org"):

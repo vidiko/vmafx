@@ -32,9 +32,12 @@ PACKAGE_FLAG_RE = re.compile(r"--package(?:=|\s+)[\"']?([A-Za-z0-9_-]+)")
 VERSION_FLAG_RE = re.compile(r"--version(?:=|\s+)[\"']?([^\"'\s#\\]+)")
 MAX_COMMAND_LINES = 256
 MAX_STEP_LINES = 10000
-BINDING_RE = re.compile(
-    r"^\s*(?:(?:export|ARG|ENV)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*[\"']?([^\"'\s#\\$}]+)"
+# Skip quoted and escaped characters when finding shell command boundaries.
+WORKFLOW_BOUNDARY_RE = re.compile(
+    r"""\\.|'[^']*'|"(?:\\.|[^"\\]++)*"|(?P<stop>[;|]|&&|(?<![<>])&(?!>)|(?<!\S)\#.*|\Z)"""
 )
+BINDING_RE = re.compile(r"^\s*(?:(?:export|ARG|ENV)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*)$")
+LITERAL_BINDING_RE = re.compile(r"""(["']?)([A-Za-z0-9_.+-]+)\1(?:\s+#.*)?""")
 INLINE_BINDING_RE = re.compile(r"(?:^|[\s;&|])([A-Za-z_][A-Za-z0-9_]*)=[\"']?([^\"'\s#\\;$}]+)")
 HELPER_FLAGS: frozenset[str] = frozenset(
     {
@@ -64,8 +67,7 @@ CONTAINER_VERSION_ARG_RE = re.compile(
 )
 CONTAINER_FLAG_VALUE_RE = re.compile(r"^[A-Za-z0-9_./][A-Za-z0-9_./-]*$")
 NUGET_ADDRESS_RE = re.compile(
-    r"(?:api\.nuget\.org/v3-flatcontainer/|nuget\.org/api/v2/package/)"
-    r"(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|[^/\s\"']+)",
+    r"(?:api\.nuget\.org/v3-flatcontainer/|nuget\.org/api/v2/package/)" r"([^/\s\"']+)",
     re.I,
 )
 ORT_PACKAGE_RE = re.compile(r"microsoft\.ml\.onnxruntime(?:[.a-z0-9_-]*)", re.I)
@@ -333,14 +335,15 @@ def _validate_pin_table(pin_file: Path) -> tuple[dict[str, dict[str, Any]], list
 
 
 def _step_bindings(lines: list[str]) -> dict[str, set[str]] | None:
-    """Collect literal YAML and shell bindings, ignoring comments."""
+    """Collect bindings, retaining nonliteral values so they cannot look unassigned."""
     if len(lines) > MAX_STEP_LINES:
         return None
     bindings: dict[str, set[str]] = {}
     for line in lines:
         match = BINDING_RE.match(line)
         if match:
-            bindings.setdefault(match.group(1), set()).add(match.group(2))
+            literal = LITERAL_BINDING_RE.fullmatch(match[2].rstrip())
+            bindings.setdefault(match[1], set()).add(literal[2] if literal else match[2])
     return bindings
 
 
@@ -441,6 +444,31 @@ def _container_helper_calls(lines: list[str], site_idx: int) -> list[str] | None
     return selected if len(selected) == count else None
 
 
+def _workflow_helper_calls(command: str, first_line_end: int) -> list[str] | None:
+    """Select calls starting on this physical line, including their continued arguments."""
+    calls = []
+    start = 0
+    assignment = ""
+    for index, match in enumerate(WORKFLOW_BOUNDARY_RE.finditer(command)):
+        if index == MAX_STEP_LINES:
+            return None
+        if match["stop"] is None:
+            continue
+        clause = command[start : match.start()]
+        # Each following physical line is visited separately by scan_file.
+        if "ort_nuget_install.py" in command[start : min(first_line_end, match.start())]:
+            calls.append(f"{assignment} {clause}")
+        else:
+            shell = re.sub(r"^(?:-\s+)?run:\s*", "", clause.strip())
+            binding = BINDING_RE.fullmatch(shell)
+            if binding and binding[1] == "ORT_VERSION" and LITERAL_BINDING_RE.fullmatch(binding[2]):
+                assignment = shell
+        if match["stop"].startswith("#") or match.end() >= first_line_end:
+            break
+        start = match.end()
+    return calls
+
+
 def _helper_command(
     lines: list[str], site_idx: int, end_idx: int, is_workflow: bool = True
 ) -> list[str] | None:
@@ -452,7 +480,7 @@ def _helper_command(
         line = lines[idx].strip()
         parts.append(line.rstrip("\\"))
         if not line.endswith("\\"):
-            return [" ".join(parts)]
+            return _workflow_helper_calls(" ".join(parts), len(parts[0]))
     return None
 
 
@@ -529,6 +557,17 @@ def _check_helper_step(
     return findings
 
 
+def _nuget_binding_problem(names: list[str], bindings: dict[str, set[str]]) -> str:
+    """Require each referenced package variable to resolve to unrelated literal IDs."""
+    for name in names:
+        values = bindings.get(name, set())
+        if any(ORT_PACKAGE_RE.fullmatch(value) for value in values):
+            return "ONNX Runtime download must use helper"
+        if not values or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", value) for value in values):
+            return "NuGet download with unresolved package"
+    return ""
+
+
 def _check_nuget_download(
     lines: list[str], idx: int, path: Path, line: str, is_workflow: bool
 ) -> list[str]:
@@ -538,21 +577,18 @@ def _check_nuget_download(
         return []
     if ORT_PACKAGE_RE.search(line):
         return [f"{path}:{idx + 1}: ONNX Runtime download must use helper"]
-    match = NUGET_ADDRESS_RE.search(line)
-    if not match or not match.group(1).startswith("$"):
+    packages = NUGET_ADDRESS_RE.findall(line)
+    if len(packages) > MAX_COMMAND_LINES:
+        return [f"{path}:{idx + 1}: NuGet address limit exceeded"]
+    names = [package.removeprefix("$").strip("{}") for package in packages if "$" in package]
+    if not names:
         return []
-    name = match.group(1)[1:].strip("{}")
     start_idx, end_idx = find_block_for_site(lines, idx, is_workflow)
     bindings = _step_bindings(lines[start_idx : end_idx + 1])
     if bindings is None:
         return [f"{path}:{idx + 1}: step binding limit exceeded"]
-    if any(ORT_PACKAGE_RE.fullmatch(value) for values in bindings.values() for value in values):
-        return [f"{path}:{idx + 1}: ONNX Runtime download must use helper"]
-    return (
-        [f"{path}:{idx + 1}: NuGet download with unresolved package"]
-        if name not in bindings
-        else []
-    )
+    problem = _nuget_binding_problem(names, bindings)
+    return [f"{path}:{idx + 1}: {problem}"] if problem else []
 
 
 def _scan_workflow_line(
