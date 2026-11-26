@@ -1,0 +1,1 @@
+- Windows CI now accepts Renovate updates to `TheMrMilchmann/setup-msvc-dev` when every workflow uses the same full lowercase commit SHA. Partial updates still fail the toolset contract.
