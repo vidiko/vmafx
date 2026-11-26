@@ -8,6 +8,7 @@ Separate tokens with ASCII space or tab. Only column-zero # starts a list commen
 Tokens are [a-z0-9][a-z0-9+.-]* with optional :[a-z0-9]+, then optional
 =[A-Za-z0-9.+~:-]+ or /[a-z0-9.-]+. Caps bound YAML files, nodes, bytes and install
 calls per file, and bytes per list. More-indented and backslash-continued forms fail closed.
+Invalid UTF-8 in a workflow or package list is reported at its byte offset.
 A call that never writes apt-install-cached on one line goes unseen. A form inside a
 Bash quoted string or heredoc is accepted with the arguments it shows.
 """
@@ -64,12 +65,15 @@ def workflow_under_test() -> Path:
 
 
 def read_bounded_utf8(path: Path, max_bytes: int) -> tuple[str | None, str | None]:
-    """Read at most max_bytes + 1 bytes and report an oversized file."""
+    """Read at most max_bytes + 1 bytes and report size or UTF-8 errors."""
     with path.open("rb") as handle:
         raw = handle.read(max_bytes + 1)
     if len(raw) > max_bytes:
         return None, f"{path}: exceeds {max_bytes} bytes"
-    return raw.decode("utf-8"), None
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError as error:
+        return None, f"{path}: invalid UTF-8 at byte {error.start}"
 
 
 def _requires_flag(token: str, driver_recommending: AbstractSet[str]) -> bool:
@@ -299,6 +303,17 @@ class AptInstallRecommendsTest(unittest.TestCase):
                     [f"fixture.yml:3: {UNSUPPORTED_FORM}"] if count % 2 else [],
                 )
 
+    def test_backslash_with_intervening_line(self) -> None:
+        self.assertEqual(self.check(f"run: |\n  printf x | xargs \\\n\n  {self.refresh}\n"), [])
+        self.assertEqual(
+            self.check(f"run: |\n  printf x | xargs \\\n  # note\n  {self.refresh}\n"), []
+        )
+        # Bash ends the comment at the newline. This finding is a fail-closed false positive.
+        self.assertEqual(
+            self.check(f"run: |\n  printf x | xargs\n  # note \\\n  {self.refresh}\n"),
+            [f"fixture.yml:4: {UNSUPPORTED_FORM}"],
+        )
+
     def test_list_without_driver_passes_without_flag(self) -> None:
         self.list_path.write_text("# libcudart12\n\nninja-build libcudart12-\n", encoding="utf-8")
         self.assertEqual(self.check(f"run: |\n  {self.call}"), [])
@@ -346,6 +361,13 @@ class AptInstallRecommendsTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.check(text), [f"fixture.yml:{lineno}: {UNSUPPORTED_FORM}"])
 
+    def test_source_mismatch_rejects_rest_of_literal(self) -> None:
+        text = f"run: &script\n  |\n    true\n    {self.configure}\n    {self.configure}\n"
+        self.assertEqual(
+            self.check(text),
+            [f"fixture.yml:4: {UNSUPPORTED_FORM}", f"fixture.yml:5: {UNSUPPORTED_FORM}"],
+        )
+
     def test_literal_header_inside_another_scalar(self) -> None:
         flagged = self.call + " --no-install-recommends"
         for text in (
@@ -368,6 +390,11 @@ class AptInstallRecommendsTest(unittest.TestCase):
         ):
             with self.subTest(error=error):
                 self.assertEqual(self.check(text), [f"fixture.yml: unparseable YAML: {error}"])
+
+    def test_deeply_nested_yaml_reports_recursion_error(self) -> None:
+        self.assertEqual(
+            self.check("[" * 3000 + "]" * 3000), ["fixture.yml: unparseable YAML: RecursionError"]
+        )
 
     def test_yaml_node_cap(self) -> None:
         # The sequence root is one node in addition to its scalar children.
@@ -443,6 +470,21 @@ class AptInstallRecommendsTest(unittest.TestCase):
                 self.assertEqual(
                     self.check(f"run: |\n  {line}\n"), [f"fixture.yml:2: {UNSUPPORTED_FORM}"]
                 )
+
+    def test_invalid_utf8_in_workflow(self) -> None:
+        path = self.root / ".github/workflows/bad.yml"
+        path.parent.mkdir()
+        path.write_bytes(b"steps:\n  - run: echo \xff\n")
+        expected = [f"{path}: invalid UTF-8 at byte 21"]
+        self.assertEqual(check_workflow(path, self.root), expected)
+        self.assertEqual(check_yaml_files(self.root), expected)
+
+    def test_invalid_utf8_in_list_reports_install_line(self) -> None:
+        self.list_path.write_bytes(b"ninja-build\n\xff\n")
+        self.assertEqual(
+            self.check(f"run: |\n  {self.call} --no-install-recommends\n"),
+            [f"fixture.yml:2: {self.list_path}: invalid UTF-8 at byte 12"],
+        )
 
     def test_workflow_byte_cap(self) -> None:
         path = self.root / "workflow.yml"
