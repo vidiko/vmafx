@@ -21,12 +21,9 @@
 # noticed first: the defect was in a copied idiom, so a test naming only the
 # scripts already fixed would have gone on passing while gates still hung.
 #
-# The two pairs answer an absent body differently, and the expectations below
-# encode that on purpose. deliverables-check.sh and validate-pr-body.sh exist
-# only to parse a body, so no body is a usage error (exit 2). The surface and
-# state.md gates also have a diff to check, so no body means the opt-out is
-# unclaimable and they fall through to that diff — passing when it is clean,
-# failing when it is not. Neither pair may hang.
+# The deliverables, validator, and toolchain-claims gates require a body
+# source. The surface and state.md gates also have a diff to check. With
+# no body they decide on the diff alone. All five must return promptly.
 #
 # The shapes:
 #
@@ -192,6 +189,19 @@ expect_output "deliverables: the piped body reached the parser and passed" \
 run_case 0 "deliverables: a file redirected onto stdin still reaches the parser" \
   "${same_rev} bash '${deliverables}' <'${work}/body.md'"
 
+# Pad with interior blank lines so the last content line has exactly one
+# newline. Append ten further blank lines only in the overflowing fixture.
+awk '{print} END {for (i=NR+1; i<4090; i++) print ""; print "."}' "${work}/body.md" >"${work}/4090.md"
+run_case 1 "deliverables: trailing blanks exceed the wrapper limit" \
+  "{ cat '${work}/4090.md'; printf '%0.s\\n' {1..10}; } | ${same_rev} bash '${deliverables}'"
+expect_output "deliverables: wrapper preserves trailing blanks" \
+  'check-toolchain-claims: PR body exceeds 4096 lines'
+awk '{print} END {for (i=NR+1; i<4096; i++) print ""; print "."}' "${work}/body.md" >"${work}/4096.md"
+run_case 0 "deliverables: 4096 lines with final newline" \
+  "cat '${work}/4096.md' | ${same_rev} bash '${deliverables}'"
+expect_no_output "deliverables: wrapper accepts the exact line limit" \
+  'check-toolchain-claims: PR body exceeds 4096 lines'
+
 echo "--- scripts/ci/validate-pr-body.sh ---"
 
 run_case 2 "validator: closed fd 0 is a usage error, not a hang" \
@@ -330,6 +340,13 @@ run_case 0 "toolchain-claims: a real pipe still reaches the parser" \
 
 run_case 0 "toolchain-claims: \$PR_BODY still reaches the parser with fd 0 on /dev/null" \
   "PR_BODY=\"\$(cat '${work}/body.md')\" bash '${toolchain_claims}' </dev/null"
+
+run_case 1 "toolchain-claims: piped claim survives input selection" \
+  "printf 'No nvcc here.\\n' | bash '${toolchain_claims}'"
+expect_output "toolchain-claims: piped claim needs evidence" 'missing-toolchain claim'
+run_case 1 "toolchain-claims: env claim survives input selection" \
+  "PR_BODY='No nvcc here.' bash '${toolchain_claims}' </dev/null"
+expect_output "toolchain-claims: env claim needs evidence" 'missing-toolchain claim'
 
 echo "--- scripts/ci/pr-body-input.sh (descriptor hygiene) ---"
 

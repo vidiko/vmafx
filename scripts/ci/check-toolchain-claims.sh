@@ -135,23 +135,41 @@ is_fence_marker() {
   after_header=0
 }
 
-record_probe_row() {
-  local line="$1" idx="$2" name
-  if [[ "${line}" =~ ${probe_found} ]]; then
-    name="${BASH_REMATCH[1]}"
-    probed_tools[block_count]+=" ${name} "
-    found_tools[block_count]+=" ${name} "
-    exempt_lines[idx]=1
-  elif [[ "${line}" =~ ${probe_absent} ]]; then
-    name="${BASH_REMATCH[1]}"
-    probed_tools[block_count]+=" ${name} "
-    exempt_lines[idx]=1
-  elif [[ "${line}" =~ ${probe_metal_os} && "${BASH_REMATCH[1]}" == "${block_os[block_count]}" ]]; then
-    probed_tools[block_count]+=" metal "
-    exempt_lines[idx]=1
-  elif [[ "${line}" =~ ${probe_mingw_detail} ]]; then
-    exempt_lines[idx]=1
+# Classify strict rows as found, absent, or informational. A row outside
+# the producer grammar remains prose, even when it starts with a tool name.
+classify_probe_row() {
+  local row="$1" tool="$2" os="$3"
+  row_kind=prose
+  case "${tool}:${os}" in
+    metal:Darwin) ;;
+    metal:*)
+      if [[ "${row}" =~ ${probe_metal_os} && "${BASH_REMATCH[1]}" == "${os}" ]]; then
+        row_kind=absent
+      elif [[ "${row}" =~ ${probe_found} || "${row}" =~ ${probe_absent} || "${row}" =~ ${probe_metal_os} ]]; then
+        row_kind=detail
+      fi
+      return 0
+      ;;
+  esac
+  if [[ "${row}" =~ ${probe_found} ]]; then
+    row_kind=found
+  elif [[ "${row}" =~ ${probe_absent} ]]; then
+    row_kind=absent
+  elif [[ "${row}" =~ ${probe_mingw_detail} || "${row}" =~ ${probe_metal_os} ]]; then
+    row_kind=detail
   fi
+}
+
+record_probe_row() {
+  local line="$1" idx="$2" name='' row_kind
+  if [[ "${line}" =~ ${probe_row_start} ]]; then name="${BASH_REMATCH[1]}"; fi
+  classify_probe_row "${line}" "${name}" "${block_os[block_count]}"
+  case "${row_kind}" in
+    prose) return 0 ;;
+    found) found_tools[block_count]+=" ${name} " ;;
+  esac
+  if [[ "${row_kind}" != detail ]]; then probed_tools[block_count]+=" ${name} "; fi
+  exempt_lines[idx]=1
 }
 
 read_probe_line() {
@@ -214,16 +232,23 @@ p_no_scope_after="no${space}\`*(${claim_words})\`*${space}(${p_scope_object}${sp
 p_no_scope_before="(touch|touches|touched|change|changes|changed|edit|edits|edited|modify|modifies|modified)${space}no${space}\`*(${claim_words})\`*${wb_tok_r}"
 p_no_scope="${wb_l}(${p_no_scope_after}|${p_no_scope_before})"
 tool_word="\`*(${claim_words})\`*"
-no_tool="no${space}${tool_word}"
-lacks_tool="(lacks|lacking)${space}((a|an|the)${space})?${tool_word}"
-tool_status="${tool_word}(${space}(is|are|was|were))?${space}(not${space}(installed|found|available)|missing|unavailable|absent)"
-without_tool="without${space}${tool_word}"
+join_tools='([[:space:]]*,[[:space:]]*((and|or)[[:space:]]+)?|[[:space:]]+(and|or)[[:space:]]+)'
+compiler_note="[(][[:space:]]*${tool_word}[[:space:]]*[)]"
+qualified_tool="${tool_word}(${space}(compiler${space}${tool_word}|${compiler_note}))?"
+tool_group="${qualified_tool}(${join_tools}${qualified_tool})*"
+no_tool="no${space}${qualified_tool}"
+lacks_tool="(lacks|lacking)${space}((a|an|the)${space})?${qualified_tool}"
+status_subject="(${qualified_tool}${space}(is|was)|${tool_group}(${space}(are|were))?)"
+tool_status="${status_subject}${space}(not${space}(installed|found|available)|missing|unavailable|absent)"
+without_tool="without${space}${qualified_tool}"
 compile="not${space}compiled|(was|were)${space}not${space}built|did${space}not${space}(compile|build)|compilation(${space}(was|were))?${space}skipped"
 predicate="(${wb_tok_l}\`*)(${no_tool}|${lacks_tool}|${tool_status}|${without_tool}|${compile})${wb_tok_r}"
 clause_break=';|[.!?][[:space:]]+|,[[:space:]]*(but|while|whereas|although)([[:space:]]+|$)'
-join_tools='([[:space:]]*,[[:space:]]*((and|or)[[:space:]]+)?|[[:space:]]+(and|or)[[:space:]]+)'
-tool_list="^((${join_tools}${tool_word})+)${wb_tok_r}"
-compile_object="^(${space}${tool_word})${wb_tok_r}"
+tool_list="^((${join_tools}${qualified_tool})+)${wb_tok_r}"
+compile_object="^(${space}${qualified_tool})${wb_tok_r}"
+compile_noun="(${space}(backend|compiler|toolchain))?"
+compile_subject="${wb_tok_l}(${tool_group})${compile_noun}(${space}(were|are))?[[:space:]]*$"
+singular_compile_subject="${wb_tok_l}(${qualified_tool})${compile_noun}${space}(was|is)[[:space:]]*$"
 p_host="${wb_l}(on${space}(this|the)${space}host|(this|the)${space}host|(this|my)${space}machine|here|locally)${wb_r}"
 nonhost="ci|runners?|images?|containers?|golden(${space}|-)builds?"
 p_nonhost="${wb_l}(${nonhost})${wb_r}"
@@ -232,8 +257,46 @@ nonhost_subject="${wb_l}(${nonhost})(${space}(has|have|is|are|was|were))?[[:spac
 # introductions. A directly named runner or host takes priority.
 explicit_host_subject="${wb_l}((this|the)${space}host|(this|my)${space}machine)(${space}(has|have|is|are|was|were))?[[:space:]]*$"
 subject_local="${wb_l}(locally|here)([^[:alnum:]_-]+[[:alnum:]_-]+){0,3}[^[:alnum:]_-]*$"
-qualifier_start="^[[:space:]]+((found|installed|available)[[:space:]]+)?(on|in|inside|under|at|for|from|here|locally)${wb_r}"
+qualifier_start="^[[:space:]]+((found|installed|available)[[:space:]]+)?(on|in|inside|under|at|for|from|host|here|locally)${wb_r}"
 next_subject='[[:space:]]+(and|or|but|while|whereas|although|because|since|as|yet)[[:space:]]+|[:,]'
+
+# Parse names from the prose before consulting any evidence. Keep the
+# delimiter after each match available to the next qualifier.
+host_token="(${tick}${probe_host_chars}+${tick}|${probe_host_chars}+)"
+host_prep="(on|at|for)"
+host_verb="(has|have|lacks|is)"
+unnamed_host="((this|the)${space}host|(this|my)${space}machine|here|locally)"
+host_intro="(host|${host_prep}(${space}host)?)${space}${host_token}"
+host_phrase="((${host_prep}${space})?${unnamed_host}|${host_intro}|${host_token}${space}${host_verb})"
+host_match="${wb_tok_l}${host_phrase}${wb_tok_r}"
+host_location="(${host_intro}|(${host_prep}${space})?${unnamed_host})"
+joined_locations="^${space}${host_location}(${space}(and|or)${space}${host_location})+"
+
+parse_claim_hosts() {
+  local tail="$1" phrase consumed token name steps
+  named_hosts=()
+  for ((steps = ${#tail}; steps > 0; steps--)); do
+    [[ "${tail}" =~ ${host_match} ]] || break
+    phrase="${BASH_REMATCH[2]}"
+    consumed="${BASH_REMATCH[1]}${phrase}"
+    tail="${tail#*"${consumed}"}"
+    if [[ "${phrase}" =~ ^(${host_prep}${space})?(${unnamed_host}|host${space}${host_verb})$ ]]; then continue; fi
+    if [[ "${phrase}" =~ ^${host_token}${space}${host_verb}$ ]]; then
+      token="${BASH_REMATCH[1]}"
+      [[ "${token}" =~ ^${tool_word}$ ]] && continue
+    else
+      token="${phrase##*[[:space:]]}"
+    fi
+    # A period outside backticks at the end of a sentence is punctuation.
+    token="${token%.}"
+    name="${token#"${tick}"}"
+    name="${name%"${tick}"}"
+    case "${name}" in '' | host | here | locally) continue ;; esac
+    if [[ "${phrase}" =~ ^(${host_prep}${space})?host${space} || "${token}" == "${tick}"* || "${name}" == *[0-9.-]* ]]; then
+      named_hosts+=("${name}")
+    fi
+  done
+}
 
 claim_tools() {
   local segment="$1" spec family name compiler_alias backend_alias families=' '
@@ -310,29 +373,47 @@ check_evidence() {
       best_count=${count} best_block=${block} best_missing="${missing}" best_contradicted="${contradicted}"
     fi
   done
+  if ((best_block == 0)); then
+    echo "check-toolchain-claims: line ${idx}: no toolchain-probe block for host '${bound_host}'" >&2
+    return 1
+  fi
   if ((agreed)); then return 0; fi
   if ((best_count > 0)); then best_contradicted=''; fi
   emit_claim_errors "${idx}" "${line}" "${best_missing}" "${best_contradicted}" "${best_block}"
 }
 
+# Active compilation takes a following object ("did not build HIP").
+# Passive compilation takes the tool group immediately before its verb.
+resolve_predicate_tools() {
+  local subject="$1" action="$2" list="$3" qualifier="$4"
+  local object="${action}${list}"
+  local host_note="^${space}(${compiler_note})[[:space:].]*$"
+  if [[ "${action}" =~ ^(${compile})$ ]]; then
+    object="${list}"
+    if [[ "${subject}" =~ ${singular_compile_subject} || "${subject}" =~ ${compile_subject} ]]; then
+      object="${BASH_REMATCH[2]}${list}"
+    fi
+  elif [[ "${qualifier}" =~ ^${space}${host_location} ]]; then
+    qualifier="${qualifier#"${BASH_REMATCH[0]}"}"
+    if [[ "${qualifier}" =~ ${host_note} ]]; then object+=" ${BASH_REMATCH[1]}"; fi
+  fi
+  claim_tools "${object}"
+}
+
 check_segment() {
   local subject="$1" action="$2" list="$3" qualifier="$4"
   local segment="${subject}${action}${list}${qualifier}" context="${subject} ${qualifier}"
-  local block host host_pattern checked=' ' scope=host multiple=0 rc=0
-  local -a tools=()
-  claim_tools "${segment}"
+  local block i scope=host rc=0
+  local -a tools=() named_hosts=()
+  resolve_predicate_tools "${subject}" "${action}" "${list}" "${qualifier}"
   [[ -n "${tools[*]-}" ]] || return 0
-  for ((block = 1; block <= block_count; block++)); do
-    host="${block_host[block]}"
-    if [[ "${host}" != "${block_host[1]}" ]]; then multiple=1; fi
-    # Dots inside a hostname are literal. A final sentence period is punctuation.
-    host_pattern="(^|[^[:alnum:]_.-])${host//./\\.}([.]?([^[:alnum:]_.-]|$))"
-    if [[ "${context}" =~ ${host_pattern} && "${checked}" != *" ${host} "* ]]; then
-      checked+="${host} "
-      check_evidence host "${host}" || rc=1
-    fi
-  done
-  if [[ "${checked}" != ' ' ]]; then return "${rc}"; fi
+  parse_claim_hosts "${segment}"
+  if [[ -n "${named_hosts[*]-}" ]]; then
+    for ((i = 0; i < ${#named_hosts[@]}; i++)); do
+      check_evidence host "${named_hosts[i]}" || rc=1
+    done
+    return "${rc}"
+  fi
 
   if [[ "${action}" =~ ^${without_tool}$ && ! "${context}" =~ ${p_host} ]]; then return 0; fi
   if [[ "${qualifier}" =~ ${p_host} ]]; then
@@ -349,9 +430,13 @@ check_segment() {
     emit_missing_probe "${idx}" "${line}"
     return 1
   fi
-  if [[ "${scope}" == host && "${multiple}" == 1 ]]; then
-    echo "check-toolchain-claims: line ${idx}: name the probed host for '${segment}'" >&2
-    return 1
+  if [[ "${scope}" == host ]]; then
+    for ((block = 2; block <= block_count; block++)); do
+      if [[ "${block_host[block]}" != "${block_host[1]}" ]]; then
+        echo "check-toolchain-claims: line ${idx}: name the probed host for '${segment}'" >&2
+        return 1
+      fi
+    done
   fi
   check_evidence "${scope}" ''
 }
@@ -380,7 +465,11 @@ check_clause() {
     fi
     if [[ "${before_next}" =~ ${qualifier_start} ]]; then
       qualifier="${before_next}"
-      if [[ "${qualifier}" =~ ${next_subject} ]]; then qualifier="${qualifier%%"${BASH_REMATCH[0]}"*}"; fi
+      if [[ "${qualifier}" =~ ${joined_locations} ]]; then
+        qualifier="${BASH_REMATCH[0]}"
+      elif [[ "${qualifier}" =~ ${next_subject} ]]; then
+        qualifier="${qualifier%%"${BASH_REMATCH[0]}"*}"
+      fi
     fi
     check_segment "${subject}" "${action}" "${list}" "${qualifier}" || rc=1
     tail="${rest#"${list}${qualifier}"}"

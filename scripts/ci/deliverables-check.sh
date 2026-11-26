@@ -65,7 +65,8 @@ else
   # scripts/ci/pr-body-input.sh — reading a closed fd 0 deadlocks.
   pr_body_classify_stdin
   if [ "${PR_BODY_STDIN_KIND}" = "stream" ]; then
-    PR_BODY="$(pr_body_read_stdin)"
+    PR_BODY="$(pr_body_read_stdin && printf .)"
+    PR_BODY="${PR_BODY%.}"
     pr_body_close_stdin
     body_src="stdin"
   else

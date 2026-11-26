@@ -224,7 +224,7 @@ EOF
 expect_gate_exit "glslc claim with glslc found -> exit 1" 1 "${work}/case8_glslc_found.md"
 
 # ---------- Case 9: toolchain-probe.sh stub dir test (fake setvars.sh exporting PATH to stub icpx) ----------
-stub_dir="${work}/oneapi_stub"
+stub_dir="${work}/oneAPI SDK"
 mkdir -p "${stub_dir}/bin"
 cat >"${stub_dir}/bin/icpx" <<'EOF'
 #!/bin/sh
@@ -241,7 +241,7 @@ probe_stub_out="$("${probe}" --prefix "${stub_dir}" 2>&1)" || {
   fail_count=$((fail_count + 1))
 }
 
-if printf '%s\n' "${probe_stub_out}" | grep -q "toolchain-probe: icpx found .*${stub_dir}/bin/icpx"; then
+if printf '%s\n' "${probe_stub_out}" | grep -qF "toolchain-probe: icpx found $(probe_encode_field "${work}")/oneAPI%20SDK/bin/icpx "; then
   echo "PASS: probe with stub setvars.sh reported icpx found"
   pass_count=$((pass_count + 1))
 else
@@ -732,6 +732,31 @@ blocks="${header_a}
 ${found_nvcc}
 ${header_b}
 ${absent_nvcc}"
+only_a="${header_a}
+${absent_nvcc}"
+expect_body "unprobed named host" 1 "No nvcc on build-b.
+${only_a}" "no toolchain-probe block for host 'build-b'"
+expect_body "both named hosts need evidence" 1 "No nvcc on build-a and on build-b.
+${only_a}" "no toolchain-probe block for host 'build-b'"
+expect_body "named host added" 0 "No nvcc on build-b.
+${only_a}
+${header_b}
+${absent_nvcc}"
+expect_body "host is an unnamed qualifier" 1 "No nvcc on this host.
+${only_a}
+${header/test-box/host}
+${absent_nvcc}" "name the probed host"
+expect_body "explicit alphabetic host" 0 "No nvcc on host buildbox.
+${blocks/build-b/buildbox}"
+expect_body "quoted alphabetic host" 1 "No nvcc for ${tick}buildbox${tick}.
+${only_a}" "no toolchain-probe block for host 'buildbox'"
+expect_body "OS qualifier uses single host" 0 "No nvcc on Linux.
+${only_a}"
+expect_body "unprobed host subject" 1 "build-b has no nvcc.
+${only_a}" "no toolchain-probe block for host 'build-b'"
+expect_body "tool subject with hyphens" 0 "x86_64-w64-mingw32-gcc is missing.
+${header_a}
+toolchain-probe: x86_64-w64-mingw32-gcc absent searched=PATH"
 expect_body "named host contradiction" 1 "No nvcc on BUILD-A.
 ${blocks}" "host=build-a, header line 2"
 expect_body "named host agrees" 0 "No nvcc on build-a.
@@ -745,7 +770,7 @@ ${header_b}" "missing probe results for claimed toolchains: hipcc (host=build-b,
 expect_body "unbound host ambiguity" 1 "No nvcc on this host.
 ${blocks}" "name the probed host"
 expect_body "hostname prefix cannot bind" 1 "No nvcc on build-a.lab.
-${blocks}" "name the probed host"
+${blocks}" "no toolchain-probe block for host 'build-a.lab'"
 expect_body "literal dotted hostname" 0 "No nvcc on BUILD.B.
 ${blocks/build-b/build.b}"
 expect_body "dot cannot bind another hostname" 1 "No nvcc on buildXb.
@@ -758,6 +783,29 @@ ${found_nvcc}" "host=build-a, header line 4"
 
 icx_found='toolchain-probe: icx found /bin/icx'
 icpx_absent='toolchain-probe: icpx absent searched=PATH'
+subject_icx='I built with icx and this host lacks SYCL.'
+expect_body "compiler outside absence object" 0 "${subject_icx}
+${header}
+${icpx_absent}
+${icx_found}"
+expect_body "backend object contradicted" 1 "${subject_icx}
+${header}
+toolchain-probe: icpx found /bin/icpx
+${icx_found}" "claims 'icpx' is missing"
+expect_body "explicit compiler object" 1 "This host has no SYCL compiler icx.
+${header}
+${icx_found}" "claims 'icx' is missing"
+expect_body "parenthesized compiler object" 0 "No SYCL (icx).
+${header}
+toolchain-probe: icx absent searched=PATH"
+expect_body "compiler outside status subject" 0 "I built with icx and SYCL is missing.
+${header}
+${icpx_absent}
+${icx_found}"
+expect_body "compiler outside compilation subject" 0 "I built with icx and SYCL was not compiled locally.
+${header}
+${icpx_absent}
+${icx_found}"
 sycl_ci='No SYCL on this host, but the CI runner lacks icx.'
 expect_body "segment alias needs icpx" 1 "${sycl_ci}
 ${header}
@@ -807,6 +855,26 @@ expect_body "CI and local absences agree" 0 "The CI image has no nvcc, but this 
 ${header}
 ${found_nvcc}
 ${absent_hipcc}"
+expect_body "Linux rejects generic metal absence" 1 "No metal locally.
+${header}
+toolchain-probe: metal absent searched=xcrun,PATH" "missing probe results for claimed toolchains: metal"
+expect_body "Linux ignores metal found row" 1 "No metal locally.
+${header}
+toolchain-probe: metal found /tmp/metal no nvcc" "missing probe results for claimed toolchains: metal" "claimed toolchains: nvcc"
+expect_body "Linux rejects mismatched metal OS" 1 "No metal locally.
+${header}
+toolchain-probe: metal absent searched=none os=FreeBSD" "missing probe results for claimed toolchains: metal"
+expect_body "Linux accepts matching metal OS" 0 "No metal locally.
+${header}
+toolchain-probe: metal absent searched=none os=Linux"
+expect_body "Darwin accepts generic metal absence" 0 "No metal locally.
+${header/os=Linux/os=Darwin}
+toolchain-probe: metal absent searched=xcrun,PATH"
+expect_body "encoded found path with free version text" 1 "No icpx locally.
+${probe_stub_out}" "claims 'icpx' is missing"
+expect_body "invalid escape in found path" 1 "No icpx locally.
+${header}
+toolchain-probe: icpx found /bad%2G/path 13.0" "missing probe results for claimed toolchains: icpx"
 expect_body "Darwin rejects Linux metal row" 1 "No metal locally.
 ${header/os=Linux/os=Darwin}
 toolchain-probe: metal absent searched=none os=Linux" "missing probe results for claimed toolchains: metal"
@@ -849,7 +917,7 @@ ${override_out}"
 # inside this subshell so installed off-PATH SDKs cannot mask absent rows.
 search_bin="${work}/search-bin"
 mkdir "${search_bin}"
-utilities=(bash date dirname)
+utilities=(bash date dirname tr)
 for ((i = 0; i < ${#utilities[@]}; i++)); do
   utility="${utilities[i]}"
   ln -s "$(command -v "${utility}")" "${search_bin}/${utility}"
@@ -883,6 +951,35 @@ for ((i = 0; i < ${#search_tools[@]}; i++)); do
   expect_body "producer searched field for ${name}" 0 "No ${name}.
 ${search_out}"
 done
+
+# Relocate only the built-in vendor root in this fixture. Candidate 51
+# is executable, so an unbounded scan would report it found.
+vendor_root="${work}/intel"
+fixture_probe="${work}/toolchain-probe.sh"
+sed 's@/opt/intel/@./intel/@g' "${probe}" >"${fixture_probe}"
+cp "${repo_root}/scripts/dev/toolchain-probe-format.sh" "${work}/"
+for ((i = 1; i <= 51; i++)); do
+  printf -v version '%02d' "${i}"
+  candidate="${vendor_root}/oneapi/compiler/${version}/bin/icpx"
+  mkdir -p "${candidate%/*}"
+  printf '#!/bin/sh\necho fixture\n' >"${candidate}"
+done
+chmod +x "${candidate}"
+budget_out="$(
+  cd "${work}"
+  PATH="${search_bin}"
+  GLOBIGNORE='/opt/*:/usr/local/*'
+  TOOLCHAIN_PROBE_HOST=build-box ONEAPI_PREFIX='' ONEAPI_ROOT=''
+  CUDA_PATH="${empty_dir}" ROCM_PATH="${empty_dir}" VULKAN_SDK="${empty_dir}" MINGW_CROSS_PREFIX="${empty_dir}"
+  # shellcheck source=scripts/dev/toolchain-probe.sh
+  . "${fixture_probe}"
+)"
+if [[ "${budget_out}" != *"toolchain-probe: icpx absent searched=PATH,./intel/oneapi*,budget-exhausted"$'\n'* ]]; then
+  echo "FAIL: oneAPI fallback budget marker"
+  fail_count=$((fail_count + 1))
+fi
+expect_body "oneAPI fallback budget" 0 "No icpx on build-box.
+${budget_out}"
 
 # A real runtime path can contain semicolons and a space. Only a recognized
 # detail row is exempt from the prose clause cap. Pair it with an invalid row.

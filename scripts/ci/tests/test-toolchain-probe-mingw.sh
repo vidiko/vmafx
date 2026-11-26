@@ -325,11 +325,15 @@ build_mingw_stub() {
 }
 
 # ---------- Case 1: Positive — win32 model + win32-flavoured runtime ----------
-build_mingw_stub "${work}/case 1" win32 13.2.0 no yes
+# The opaque dumpversion token exceeds the prose clause limit. Only a
+# recognized MinGW detail row can carry it through the checker.
+printf -v separators '%064d' 0
+detail_version="13.2.0${separators//0/;}"
+build_mingw_stub "${work}/case 1" win32 "${detail_version}" no yes
 run_probe "${work}/case 1"
 expect_rc "positive: win32 driver + win32 runtime -> exit 0" 0
 expect_grep "case1 block shows the thread model" "thread-model win32"
-expect_grep "case1 block shows the flavored dumpversion" "dumpversion 13.2.0"
+expect_grep "case1 block shows the flavored dumpversion" "dumpversion ${detail_version}"
 expect_grep "case1 encoded runtime detail" "runtime libstdc++-6.dll=$(probe_encode_field "${work}")/case%201/runtime/libstdc++-6.dll"
 expect_cmd "case1 checker accepts producer detail" env PR_BODY="${probe_out}" "${repo_root}/scripts/ci/check-toolchain-claims.sh"
 expect_grep "case1 resolves libgcc_s_seh-1.dll via -print-file-name" "runtime libgcc_s_seh-1.dll="

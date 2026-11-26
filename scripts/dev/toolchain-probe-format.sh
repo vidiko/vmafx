@@ -14,7 +14,7 @@ probe_found_fields() {
 }
 
 probe_found_row() {
-  probe_found_fields "$1" "$2" " $3"
+  probe_found_fields "$1" "$(probe_encode_field "$2")" " $3"
 }
 
 probe_absent_field() {
@@ -50,9 +50,10 @@ probe_result_patterns() {
   local non_darwin="(Linux|FreeBSD|NetBSD|OpenBSD|DragonFly|SunOS|AIX|${windows})"
   local os="(Darwin|${non_darwin})" field='([^[:space:]%]|%(09|0A|0B|0C|0D|20|25))+'
   probe_header="^${pad}$(probe_header_row "(${probe_host_chars}+)" "${os}" "${stamp}")${pad}$"
-  probe_found="^${pad}$(probe_found_fields "(${names})" "${token}([[:space:]]+.*)?" '')$"
+  probe_row_start="^${pad}toolchain-probe: (${names})[[:space:]]"
+  probe_found="^${pad}$(probe_found_fields "(${names})" "${field}([[:space:]]+.*)?" '')$"
   probe_absent="^${pad}$(probe_absent_field "(${names})" "${field}")${pad}$"
-  probe_metal_os="^${pad}$(probe_metal_os_row "${non_darwin}")${pad}$"
+  probe_metal_os="^${pad}$(probe_metal_os_row "${os}")${pad}$"
   local mingw_name='x86_64-w64-mingw32-gcc'
   local mingw_rt_unres='\(gcc -print-file-name answered no absolute path; refusing instead of staging green\)'
   local mingw_opt_unres='unresolved \(evidence only; not every flavour ships it\)'

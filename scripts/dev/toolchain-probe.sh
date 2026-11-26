@@ -99,6 +99,8 @@ get_cmd_version() {
   printf "unknown(exit=%d)" "$rc"
 }
 
+readonly max_oneapi_candidates=50
+
 # Prints the oneAPI setvars.sh candidates, one per line: ONEAPI_PREFIX alone
 # when set (tests point it at a stub), else ONEAPI_ROOT, then the unversioned
 # default install, then versioned side installs (oneapi-2025.3 and the like).
@@ -116,7 +118,7 @@ oneapi_setvars_candidates() {
   local -i idx=0
   for root in "${roots[@]}"; do
     idx=$((idx + 1))
-    if [ "$idx" -gt 50 ]; then break; fi
+    if [ "$idx" -gt "$max_oneapi_candidates" ]; then break; fi
     if [ -f "${root}/setvars.sh" ]; then
       printf '%s\n' "${root}/setvars.sh"
     elif [ -f "${root}" ]; then
@@ -143,7 +145,7 @@ oneapi_tool_from_setvars() {
   )
 }
 
-probe_oneapi_tool() {
+probe_oneapi_tool() (
   local tool="$1" p="" sv
   local searched_desc="PATH"
   local -a candidates=()
@@ -157,7 +159,7 @@ probe_oneapi_tool() {
   local -i idx=0
   for sv in ${candidates[@]+"${candidates[@]}"}; do
     idx=$((idx + 1))
-    if [ "$idx" -gt 50 ]; then break; fi
+    if [ "$idx" -gt "$max_oneapi_candidates" ]; then break; fi
     searched_desc="${searched_desc},$(dirname "$sv")"
     if p="$(oneapi_tool_from_setvars "$sv" "$tool")" && [ -x "$p" ]; then
       probe_found_row "$tool" "$p" \
@@ -167,18 +169,27 @@ probe_oneapi_tool() {
   done
   if [ -z "${ONEAPI_PREFIX:-}" ]; then
     local bin
+    # Unmatched globs do not consume the budget. The option is scoped to
+    # this function's subshell.
+    shopt -s nullglob
+    idx=0
+    searched_desc="${searched_desc},/opt/intel/oneapi*"
     for bin in /opt/intel/oneapi/compiler/*/bin/"$tool" /opt/intel/oneapi-*/compiler/*/bin/"$tool"; do
+      if ((idx >= max_oneapi_candidates)); then
+        searched_desc+=",budget-exhausted"
+        break
+      fi
+      idx=$((idx + 1))
       if [ -x "$bin" ]; then
         probe_found_row "$tool" "$bin" "$(get_cmd_version "$bin" --version)"
         return 0
       fi
     done
-    searched_desc="${searched_desc},/opt/intel/oneapi*"
   else
     searched_desc="${ONEAPI_PREFIX}"
   fi
   probe_absent_row "$tool" "$searched_desc"
-}
+)
 
 # Runs a command with one setvars.sh sourced (icpx needs its environment to
 # print a version).
