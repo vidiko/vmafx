@@ -12,10 +12,11 @@ import sys
 import unittest
 from collections.abc import Iterable, Iterator
 from copy import deepcopy
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 import yaml  # type: ignore[import-untyped]
 
@@ -233,7 +234,8 @@ def _workflow_msvc_pins(path: Path) -> Iterator[str]:
 
 def _shared_msvc_pin(directory: Path) -> str:
     refs: dict[str, str] = {}
-    for path in _bounded(directory.glob("*.yml"), MAX_WORKFLOW_FILES, "workflow files"):
+    workflows = chain(directory.glob("*.yml"), directory.glob("*.yaml"))
+    for path in sorted(_bounded(workflows, MAX_WORKFLOW_FILES, "workflow files")):
         for ref in _workflow_msvc_pins(path):
             refs.setdefault(ref, path.name)
     if len(refs) != 1:
@@ -580,13 +582,40 @@ class WindowsSyclToolsetContractTest(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, f"expected action {MSVC_ACTION}"):
                 _shared_msvc_pin(directory)
 
+    def _mixed_msvc_workflows(self, first_pin: str, second_pin: str) -> Path:
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        for name, pin in (("first.yml", first_pin), ("second.yaml", second_pin)):
+            (directory / name).write_text(
+                f"jobs:\n  build:\n    steps:\n      - uses: {MSVC_ACTION}@{pin}\n",
+                encoding="utf-8",
+            )
+        return directory
+
+    def test_mixed_workflows_share_msvc_pin(self) -> None:
+        pin = "a" * 40
+        self.assertEqual(_shared_msvc_pin(self._mixed_msvc_workflows(pin, pin)), pin)
+
+    def test_mixed_workflows_reject_different_msvc_pins(self) -> None:
+        directory = self._mixed_msvc_workflows("a" * 40, "b" * 40)
+        with self.assertRaisesRegex(AssertionError, "workflows must share one"):
+            _shared_msvc_pin(directory)
+
+    def test_mixed_workflows_exceed_combined_file_limit(self) -> None:
+        directory = self._mixed_msvc_workflows("a" * 40, "a" * 40)
+        with (
+            patch.object(sys.modules[__name__], "MAX_WORKFLOW_FILES", 1),
+            self.assertRaisesRegex(AssertionError, "workflow files exceeds limit 1"),
+        ):
+            _shared_msvc_pin(directory)
+
     def test_duplicate_msvc_action_in_one_job_rejected(self) -> None:
         step = f"      - uses: {MSVC_ACTION}@{'a' * 40}\n"
-        with TemporaryDirectory() as tmp:
-            path = Path(tmp) / "build.yml"
-            path.write_text("jobs:\n  build:\n    steps:\n" + step * 2, encoding="utf-8")
-            with self.assertRaisesRegex(AssertionError, f"multiple {MSVC_ACTION} steps"):
-                _shared_msvc_pin(path.parent)
+        for name in ("build.yml", "build.yaml"):
+            with self.subTest(name=name), TemporaryDirectory() as tmp:
+                path = Path(tmp) / name
+                path.write_text("jobs:\n  build:\n    steps:\n" + step * 2, encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, f"multiple {MSVC_ACTION} steps"):
+                    _shared_msvc_pin(path.parent)
 
     def test_workflow_scan_rejects_overflow(self) -> None:
         self.assertEqual(_bounded(range(2), 2, "items"), [0, 1])
