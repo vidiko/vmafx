@@ -555,18 +555,47 @@ class OpenRenderPrTest(unittest.TestCase):
             any(c[:2] == ["pr", "merge"] and "--auto" in c and "42" in c for c in self.gh_calls())
         )
 
-    def test_case_j2_fresh_render_already_in_master(self) -> None:
+    def stage_stale_pr_with_current_master(self) -> str:
         old_head = self.stage_queued_render()
         (self.state_dir / "make_action.py").unlink()
+        return old_head
+
+    def assert_stale_pr_closed(self, old_head: str) -> None:
+        calls = self.gh_calls()
+        self.assertEqual([c[:2] for c in calls if c[0] == "pr"], [["pr", "list"], ["pr", "close"]])
+        self.assertEqual(
+            calls[-1][:6],
+            ["pr", "close", "--repo", self.github_repository, "--delete-branch", "42"],
+        )
+        self.assertEqual(self.bare_head(), old_head)
+
+    def test_case_j2_fresh_render_already_in_master(self) -> None:
+        old_head = self.stage_stale_pr_with_current_master()
         self.set_merge_queue(answers=[True, False])
-        base = git("-C", str(self.repo), "rev-parse", "HEAD").strip()
         res = self.run_script(render_due=True)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        self.assertNotEqual(self.bare_head(), old_head)
-        self.assertEqual(
-            git("-C", str(self.bare_repo), "rev-parse", f"{self.render_branch}^").strip(), base
-        )
-        self.assertEqual(git("-C", str(self.bare_repo), "diff", base, self.render_branch), "")
+        gql = self.graphql_calls()
+        self.assertEqual(len(gql), 3)
+        self.assertIn("dequeuePullRequest", " ".join(gql[1]))
+        self.assertIn("isInMergeQueue", " ".join(gql[2]))
+        self.assert_stale_pr_closed(old_head)
+
+    def test_case_j3_unqueued_stale_render_closes(self) -> None:
+        old_head = self.stage_stale_pr_with_current_master()
+        self.set_merge_queue(queued=False)
+        res = self.run_script(render_due=True)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(len(self.graphql_calls()), 1)
+        self.assert_stale_pr_closed(old_head)
+
+    def test_case_j4_dequeue_failure_stops_close(self) -> None:
+        old_head = self.stage_stale_pr_with_current_master()
+        self.set_merge_queue(queued=True, dequeue_returncode=7)
+        res = self.run_script(render_due=True)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("dequeue failed for pull request #42", res.stderr)
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in self.gh_calls()))
+        self.assertEqual(self.bare_head(), old_head)
 
     def test_case_k_matching_render_stays_queued(self) -> None:
         old_head = self.stage_queued_render(with_tag=True)

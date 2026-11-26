@@ -17,7 +17,8 @@
 #
 # An unqueued branch based on the master tip only needs auto-merge armed. A
 # queued pull request based on that tip stays queued. If master has moved, compare
-# its fresh render with the queued files. Leave a match queued. For a difference,
+# its fresh render with master first. If master is current, dequeue and close
+# the stale pull request. Otherwise, leave matching queued files in place or
 # dequeue and confirm removal before pushing and arming auto-merge again. A failed
 # queue read stops the run. If interrupted after dequeue and before push, the next
 # run refreshes the unqueued branch. With RENDER_DUE=false (master's render is
@@ -87,13 +88,18 @@ arm_auto_merge() {
   gh pr merge --repo "$GITHUB_REPOSITORY" --auto --squash "$pr" --body-file "$merge_body"
 }
 
+close_render_pr() {
+  local pr="$1"
+  gh pr close --repo "$GITHUB_REPOSITORY" --delete-branch "$pr" \
+    --comment "Master's render is current at ${base:0:12}; this render is no longer owed."
+  echo "closed render pull request #$pr: master's render is current"
+}
+
 base="$(git rev-parse HEAD)"
 open_pr="$(find_open_pr)"
 if [[ "$RENDER_DUE" != true ]]; then
   if [[ -n "$open_pr" ]]; then
-    gh pr close --repo "$GITHUB_REPOSITORY" --delete-branch "$open_pr" \
-      --comment "Master's render is current at ${base:0:12}; this render is no longer owed."
-    echo "closed render pull request #$open_pr: master's render is current"
+    close_render_pr "$open_pr"
   fi
   exit 0
 fi
@@ -125,7 +131,8 @@ if [[ "$parent" == "$base" && -n "$open_pr" ]]; then
 fi
 
 make -s docs-render
-if [[ "$queued" == false && -z "$(git status --porcelain --untracked-files=all -- "${rendered[@]}")" ]]; then
+render_status="$(git status --porcelain --untracked-files=all -- "${rendered[@]}")"
+if [[ -z "$open_pr" && -z "$render_status" ]]; then
   echo "make docs-render changed nothing at ${base:0:12}"
   exit 0
 fi
@@ -134,6 +141,14 @@ if [[ -n "$stray" ]]; then
   echo "make docs-render wrote outside the rendered paths:" >&2
   echo "$stray" >&2
   exit 1
+fi
+
+if [[ -z "$render_status" ]]; then
+  if [[ "$queued" == true ]]; then
+    dequeue_render_pr "$open_pr"
+  fi
+  close_render_pr "$open_pr"
+  exit 0
 fi
 
 git add -- "${rendered[@]}"
@@ -155,8 +170,7 @@ printf 'chore(docs): render generated changelog and ADR index\n\n%s\n\nSigned-of
   "Render-only commit (ADR-3295, ADR-3373): make docs-render at ${base:0:12}." \
   "$bot" "$email" >"$msg"
 git switch -q -C "$RENDER_BRANCH"
-# The fresh render can equal master while differing from the queued commit.
-git -c user.name="$bot" -c user.email="$email" commit -q --allow-empty -F "$msg"
+git -c user.name="$bot" -c user.email="$email" commit -q -F "$msg"
 git push -q --force "$remote_url" "HEAD:refs/heads/$RENDER_BRANCH"
 
 if [[ -z "$open_pr" ]]; then
