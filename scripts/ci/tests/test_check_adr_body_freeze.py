@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+import io
 import os
 import runpy
 import shlex
@@ -13,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest import mock
@@ -551,28 +553,20 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_hook_always_runs(self) -> None:
-        with (SCRIPT.parents[2] / ".pre-commit-config.yaml").open("rb") as stream:
-            content = stream.read(256 * 1024)
-        self.assertLess(len(content), 256 * 1024)
-        config = yaml.safe_load(content)
-        hook = next(
-            h
-            for repo in config["repos"]
-            for h in repo.get("hooks", [])
-            if h["id"] == "check-adr-body-freeze"
-        )
-        self.assertIs(hook.get("always_run"), True)
-        self.assertIs(hook.get("pass_filenames"), False)
-        self.assertEqual(hook.get("stages"), ["pre-push"])
+        commands = yaml.safe_load((SCRIPT.parents[2] / "lefthook.yml").read_bytes())["pre-push"][
+            "commands"
+        ]
+        hook = commands["adr-body-freeze"]
+        self.assertIs(hook.get("use_stdin"), True)
         self.assertEqual(
-            shlex.split(hook["entry"]),
+            shlex.split(hook["run"]),
             [
                 "python3",
                 "-B",
                 "scripts/ci/check-adr-body-freeze.py",
                 "--base",
                 "origin/master",
-                "--head-from-env",
+                "--push-refs-stdin",
             ],
         )
 
@@ -582,6 +576,199 @@ class FreezeTests(unittest.TestCase):
         self.commit()
         self.base = self.git("rev-parse", "HEAD").strip()
         self.check_change(original.replace("Old context.", "Changed context."), 1)
+
+    def install_push_fixture(self) -> None:
+        hooks = self.repo / ".git" / "fixture-hooks"
+        hooks.mkdir()
+        hook = hooks / "pre-push"
+        command = shlex.join(
+            [sys.executable, "-B", str(SCRIPT), "--base", self.base, "--push-refs-stdin"]
+        )
+        hook.write_text(f"#!/bin/sh\nexec {command}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", str(hooks))
+        remote = str(self.repo / ".git" / "remote.git")
+        self.git("init", "--bare", "-q", remote)
+        self.git("remote", "add", "fixture", remote)
+
+    def push(self, *refs: str) -> TextCommandResult:
+        return cast(
+            "TextCommandResult",
+            run(
+                [GIT, "push", "fixture", *refs],
+                allowed_executables=(GIT,),
+                cwd=self.repo,
+                env=self.env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout_seconds=30,
+            ),
+        )
+
+    def test_push_second_ref_dirty(self) -> None:
+        self.install_push_fixture()
+        self.git("branch", "clean")
+        self.git("checkout", "-qb", "dirty")
+        self.write(ADR, BASE.replace("Old decision.", "New decision."))
+        self.commit()
+        result = self.push("clean", "dirty")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertLess(
+            result.stderr.index("refs/heads/clean"), result.stderr.index("refs/heads/dirty")
+        )
+        self.assertIn("## Decision:", result.stdout + result.stderr)
+
+    def test_push_new_dirty_branch(self) -> None:
+        self.install_push_fixture()
+        self.git("checkout", "-qb", "dirty")
+        self.write(ADR, BASE.replace("Old decision.", "New decision."))
+        self.commit()
+        result = self.push("dirty")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refs/heads/dirty", result.stderr)
+        self.assertIn("## Decision:", result.stdout + result.stderr)
+
+    def test_push_clean_then_delete(self) -> None:
+        self.install_push_fixture()
+        self.git("branch", "clean")
+        pushed = self.push("clean")
+        self.assertEqual(pushed.returncode, 0, pushed.stderr)
+        self.assertIn("refs/heads/clean", pushed.stderr)
+        self.assertIn(self.base[:7], pushed.stderr)
+        deleted = self.push(":refs/heads/clean")
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        self.assertEqual(self.git("ls-remote", "fixture", "refs/heads/clean"), "")
+
+    def push_input(self, data: str, **patched: object) -> tuple[int, str]:
+        main = runpy.run_path(str(SCRIPT))["main"]
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT), "--base", "base", "--push-refs-stdin"]),
+            mock.patch.object(sys, "stdin", io.StringIO(data)),
+            mock.patch.dict(main.__globals__, patched),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            return main(), stderr.getvalue()
+
+    def test_push_empty_or_malformed(self) -> None:
+        self.assertEqual(self.push_input(""), (0, "ADR body freeze: no outgoing refs\n"))
+        zeros = "0" * 64
+        for line in ("incomplete", f"HEAD {zeros} refs/heads/topic xyz", "a xyz b " + zeros):
+            rc, stderr = self.push_input(f"(delete) {zeros} refs/heads/topic {zeros}\n{line}\n")
+            self.assertEqual(rc, 2)
+            self.assertIn("line 2", stderr)
+
+    def test_push_duplicate_sha(self) -> None:
+        check = mock.Mock(return_value=0)
+        refs = "".join(f"HEAD {self.base} refs/heads/{ref} {self.base}\n" for ref in ("one", "two"))
+        rc, stderr = self.push_input(
+            refs, check=check, git_status=mock.Mock(return_value=(0, self.base))
+        )
+        self.assertEqual(rc, 0, stderr)
+        check.assert_called_once_with("base", self.base)
+        self.assertEqual(len(stderr.splitlines()), 1)
+
+    def test_push_highest_result_and_noncommit(self) -> None:
+        refs = "".join(
+            f"refs/tags/{n} {str(n)*40} refs/tags/{n} {self.base}\n" for n in range(1, 5)
+        )
+        check = mock.Mock(side_effect=[RuntimeError("bad base"), 1, 0])
+        resolve = mock.Mock(side_effect=[(1, ""), (0, "commit"), (0, "commit"), (0, "commit")])
+        rc, stderr = self.push_input(refs, check=check, git_status=resolve)
+        self.assertEqual(rc, 2, stderr)
+        self.assertIn("refs/tags/1", stderr)
+        self.assertIn("bad base", stderr)
+        self.assertEqual(check.call_count, 3)
+
+    def test_directory_conflict_before_waiver(self) -> None:
+        self.git("checkout", "-qb", "topic")
+        (self.repo / ADR).unlink()
+        self.write(ADR + "/child", "directory on topic")
+        self.commit()
+        self.git("checkout", "-qb", "base-tip", self.base)
+        self.given(BASE + "Base change.\n")
+        self.git("checkout", "-q", "topic")
+        for message in ("ordinary commit", "fixture\n\nADR-Body-Edit: fix"):
+            self.commit(message)
+            result = self.run_check()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(f"{ADR}: merge conflict", result.stdout)
+            self.assertNotIn("ADR-Body-Edit", result.stderr)
+
+    def test_non_adr_conflict(self) -> None:
+        self.git("checkout", "-qb", "topic")
+        self.write("other.txt", "topic")
+        self.commit()
+        self.git("checkout", "-qb", "base-tip", self.base)
+        self.write("other.txt", "base")
+        self.commit()
+        result = self.run_check("topic")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_conflict_without_records(self) -> None:
+        main = runpy.run_path(str(SCRIPT))["main"]
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT), "--base", "base-tip", "--head", "topic"]),
+            mock.patch.dict(
+                main.__globals__,
+                {
+                    "git": mock.Mock(return_value="tree"),
+                    "git_status": mock.Mock(return_value=(1, "tree\0other.txt\0\0")),
+                    "changes": mock.Mock(return_value=[]),
+                    "override": mock.Mock(return_value={}),
+                },
+            ),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(main(), 2, stderr.getvalue())
+            for revision in ("base-tip", "topic"):
+                self.assertIn(revision, stderr.getvalue())
+
+    def test_retained_link_delimiter_whitespace(self) -> None:
+        for original, spaced in (
+            ("[Source](old.md)", "[Source]( old.md)"),
+            ('[Source](old.md "Title")', '[Source](old.md\t  "Title")'),
+            ("[Source](old.md)", "[Source](old.md\t)"),
+        ):
+            self.given(BASE.replace("[Source](old.md)", original))
+            self.check_change(BASE.replace("[Source](old.md)", spaced), 0)
+            update = "### Status update 2026-11-25\nUpdate.\n\n"
+            self.check_change(BASE.replace("[Source](old.md)", update + spaced), 1)
+
+    def test_transition_self_or_symlink(self) -> None:
+        (self.repo / "docs/adr/9999-link.md").symlink_to("9999-successor.md")
+        for new in (
+            NOTE.replace("9999", "1234").replace("successor", "example"),
+            NOTE.replace("successor", "link"),
+        ):
+            self.check_change(BASE.replace("Accepted\n", "Superseded\n" + new), 1, "Status")
+
+    def test_changed_successor(self) -> None:
+        original = BASE.replace("Accepted\n", "Superseded\n" + NOTE)
+        self.given(original)
+        (self.repo / "docs/adr/9999-link.md").symlink_to("9999-successor.md")
+        self.write("docs/adr/9999-other.md", BASE)
+        for target, expected in (("absent", 1), ("link", 1), ("other", 0)):
+            self.check_change(original.replace("9999-successor.md", f"9999-{target}.md"), expected)
+        displaced = original.replace("> [!NOTE]", "<!-- markdownlint-disable MD013 -->\n> [!NOTE]")
+        self.check_change(displaced.replace("9999-successor.md", "9999-absent.md"), 1)
+
+    def test_git_launch_errors_name_revision(self) -> None:
+        main = runpy.run_path(str(SCRIPT))["main"]
+        validation_error = importlib.import_module(
+            "scripts.lib.safe_subprocess"
+        ).CommandValidationError
+        for error in (OSError("launch failed"), validation_error("invalid command")):
+            with (
+                self.subTest(error=error),
+                mock.patch.object(
+                    sys, "argv", [str(SCRIPT), "--base", "base-tip", "--head", "topic"]
+                ),
+                mock.patch.dict(main.__globals__, {"run": mock.Mock(side_effect=error)}),
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.assertEqual(main(), 2)
+                self.assertIn("git rev-parse --verify base-tip^{commit}", stderr.getvalue())
 
     def test_update_inside_context_fence(self) -> None:
         original = BASE.replace("Old context.", "```text\nexample\n```\nOld context.")

@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-run = importlib.import_module("scripts.lib.safe_subprocess").run
+safe_subprocess = importlib.import_module("scripts.lib.safe_subprocess")
+run = safe_subprocess.run
 GIT = shutil.which("git") or "git"
 SECTION_LEVEL = 2
 FROZEN = {"accepted", "superseded", "deprecated"}
@@ -71,7 +72,7 @@ RENAME_MESSAGE = (
 )
 
 
-def git(*args: str, accepted: tuple[int, ...] = (0,)) -> str:
+def git_status(*args: str, accepted: tuple[int, ...] = (0,)) -> tuple[int, str]:
     """Keep the operation and revisions in every bounded Git failure."""
     operation = "git " + " ".join(args)
     try:
@@ -83,11 +84,15 @@ def git(*args: str, accepted: tuple[int, ...] = (0,)) -> str:
             timeout_seconds=120,
             check=False,
         )
-    except (TimeoutError, RuntimeError) as exc:
+    except (OSError, RuntimeError, safe_subprocess.CommandValidationError) as exc:
         raise RuntimeError(f"{operation}: {exc}") from exc
     if result.returncode not in accepted:
         raise RuntimeError(f"{operation}: {result.stderr.strip()}")
-    return str(result.stdout)
+    return result.returncode, str(result.stdout)
+
+
+def git(*args: str) -> str:
+    return git_status(*args)[1]
 
 
 @dataclass
@@ -315,13 +320,18 @@ def links(line: Line) -> Iterator[Link]:
                     stack.clear()
 
 
-def repair_key(line: Line) -> tuple[str, ...]:
-    """Remove only parsed destinations. Keep all literal text, titles and delimiters."""
+def repair_key(line: Line, *, retained: bool = False) -> tuple[str, ...]:
+    """Omit destinations. Ignore surrounding inline whitespace only for retained entries."""
     parts = []
     start = 0
     for link in links(line):
-        parts.append(line.text[start : link.target])
+        prefix = line.text[start : link.target]
         start = link.target_end
+        if retained and prefix.rstrip(" \t").endswith("]("):
+            prefix = prefix.rstrip(" \t")
+            suffix = line.text[start : link.end]
+            start += len(suffix) - len(suffix.lstrip(" \t"))
+        parts.append(prefix)
     return (*parts, line.text[start:])
 
 
@@ -357,15 +367,20 @@ def formatting(before: list[Line], after: list[Line]) -> bool:
     )
 
 
-def note_range(lines: list[Line], status: int, state: str, head: str) -> range:
-    """Check the entire new blockquote immediately after the metadata."""
+def note_start(lines: list[Line], status: int) -> int | None:
+    """Locate a note immediately below the status metadata."""
+    if status < 0:
+        return None
     for start in range(status + 1, len(lines)):
         text = lines[start].text
         if text.strip() and not re.match(r"^- \*\*[^*]+\*\*:", text):
-            break
-    else:
-        return range(0)
-    if text != "> [!NOTE]" or start + 1 >= len(lines):
+            return start if text == "> [!NOTE]" and start + 1 < len(lines) else None
+    return None
+
+
+def note_range(lines: list[Line], start: int | None, state: str, head: str, path: str) -> range:
+    """Check the entire blockquote and resolve its successor in the outgoing revision."""
+    if start is None:
         return range(0)
     successor = SUCCESSOR.fullmatch(lines[start + 1].text)
     if not successor:
@@ -378,9 +393,9 @@ def note_range(lines: list[Line], status: int, state: str, head: str) -> range:
         lines[end].depth or (lines[end].text.strip() and lines[end].kind == "prose")
     ):
         return range(0)
-    path = "docs/adr/" + successor[2]
-    entry = git("ls-tree", head, "--", path)
-    if not entry.startswith(("100644 blob ", "100755 blob ")):
+    target = "docs/adr/" + successor[2]
+    entry = git("ls-tree", head, "--", target)
+    if target == path or not entry.startswith(("100644 blob ", "100755 blob ")):
         return range(0)
     return range(start, end)
 
@@ -401,12 +416,18 @@ def reference(line: Line) -> bool:
 
 def retained_prefix(old: list[Line], new: list[Line], update: int) -> bool:
     """Retained entries precede the appended update, in their original order."""
-    entries = [repair_key(line) for line in old if reference(line) and not line.ignored]
+    entries = [
+        repair_key(line, retained=True) for line in old if reference(line) and not line.ignored
+    ]
     identities = set(entries)
-    tail = [repair_key(line) for line in new[update:] if not line.ignored]
+    tail = [repair_key(line, retained=True) for line in new[update:] if not line.ignored]
     if any(key in identities for key in tail):
         return False
-    prefix = [repair_key(line) for line in new[:update] if reference(line) and not line.ignored]
+    prefix = [
+        repair_key(line, retained=True)
+        for line in new[:update]
+        if reference(line) and not line.ignored
+    ]
     kept = [key for key in prefix if key in identities]
     candidates = iter(entries)
     return kept == prefix[: len(kept)] and all(key in candidates for key in kept)
@@ -436,7 +457,9 @@ def classification(line: Line) -> tuple[object, ...]:
     return line.kind, line.depth, line.level, line.references and not line.ignored, line.literal
 
 
-def refused(old: list[Line], new: list[Line]) -> Iterator[tuple[int, str, str]]:
+def refused(
+    old: list[Line], new: list[Line], frozen_successor: int
+) -> Iterator[tuple[int, str, str]]:
     diff = difflib.SequenceMatcher(
         None, [x.text for x in old], [x.text for x in new], autojunk=False
     )
@@ -447,6 +470,9 @@ def refused(old: list[Line], new: list[Line]) -> Iterator[tuple[int, str, str]]:
                 for x, y in zip(old[a:b], new[c:d], strict=True)
             ):
                 continue
+        elif a <= frozen_successor < b:
+            yield c + 1, "Status", "supersession note must name another regular ADR file"
+            continue
         elif permitted(old, new, a, b, c, d):
             continue
         heading = next(
@@ -456,10 +482,12 @@ def refused(old: list[Line], new: list[Line]) -> Iterator[tuple[int, str, str]]:
         yield c + 1, heading, MESSAGE
 
 
-def body_problems(old: list[Line], new: list[Line], head: str) -> Iterator[tuple[int, str, str]]:
+def body_problems(
+    old: list[Line], new: list[Line], head: str, path: str
+) -> Iterator[tuple[int, str, str]]:
     a, previous = metadata(old)
     b, current = metadata(new)
-    note = note_range(new, b, current, head) if b >= 0 else range(0)
+    note = note_range(new, note_start(new, b), current, head, path)
     if previous != current:
         if current not in {"superseded", "deprecated"} or not note:
             transition = f"{previous} -> {current or '(missing)'}"
@@ -467,12 +495,15 @@ def body_problems(old: list[Line], new: list[Line], head: str) -> Iterator[tuple
             yield max(1, b + 1), "Status", message
         elif a >= 0:
             new[b] = old[a]
-    if note:
-        # Compare the note in place if it already belonged to the frozen record.
-        old_note = note_range(old, a, previous, head)
-        if not old_note:
-            new = new[: note.start] + new[note.stop :]
-    yield from refused(old, new)
+    old_start = note_start(old, a)
+    frozen_successor = -1
+    if old_start is not None and SUCCESSOR.fullmatch(old[old_start + 1].text):
+        if not note:
+            # Link repair must not rewrite an existing note to an invalid successor.
+            frozen_successor = old_start + 1
+    elif note:
+        new = new[: note.start] + new[note.stop :]
+    yield from refused(old, new, frozen_successor)
 
 
 def changes(base: str, tree: str) -> Iterator[tuple[str, str, str]]:
@@ -507,7 +538,7 @@ def file_problems(
     if kind == "D":
         yield 1, path, MESSAGE
         return
-    yield from body_problems(old, classify(git("show", f"{tree}:{target}")), head)
+    yield from body_problems(old, classify(git("show", f"{tree}:{target}")), head, target)
 
 
 class InvalidReason(Exception):
@@ -539,6 +570,37 @@ def override(base: str, head: str) -> dict[str, tuple[str, str]]:
     return waivers
 
 
+def merge_result(base: str, head: str) -> tuple[str, list[str]]:
+    status, output = git_status(
+        "merge-tree", "--write-tree", "--name-only", "-z", base, head, accepted=(0, 1)
+    )
+    tree = output.partition("\0")[0]
+    if status == 0:
+        return tree, []
+    # Git 2.56.1 file/directory fixture: tree NUL path~side NUL NUL, then
+    # 2 NUL path~side NUL path NUL type NUL message NUL; further records follow.
+    records = output.partition("\0\0")[2].split("\0")
+    cursor = 0
+    found = False
+    paths: set[str] = set()
+    while cursor < len(records) - 1:
+        count = records[cursor]
+        if not re.fullmatch(r"[0-9]+", count):
+            break
+        kind = cursor + 1 + int(count)
+        if kind + 2 >= len(records):
+            break
+        if records[kind].startswith("CONFLICT"):
+            found = True
+            paths.update(path for path in records[cursor + 1 : kind] if ADR.fullmatch(path))
+        cursor = kind + 2
+    if not found or cursor != len(records) - 1 or records[-1]:
+        raise RuntimeError(
+            f"missing or malformed merge-tree conflict record between {base} and {head}"
+        )
+    return tree, sorted(paths)
+
+
 def check(base: str, head: str) -> int:
     """Check changed ADRs, including renames, against their base versions."""
     git("rev-parse", "--verify", f"{base}^{{commit}}")
@@ -546,18 +608,7 @@ def check(base: str, head: str) -> int:
     merge_base = git("merge-base", base, head).strip()
     if not merge_base:
         raise RuntimeError(f"no merge base for {base} and {head}")
-    merged = git(
-        "merge-tree",
-        "--write-tree",
-        "--name-only",
-        "--no-messages",
-        "-z",
-        base,
-        head,
-        accepted=(0, 1),
-    ).split("\0")
-    tree = merged[0]
-    conflicts = [path for path in merged[1:] if ADR.fullmatch(path)]
+    tree, conflicts = merge_result(base, head)
     if conflicts:
         for path in conflicts:
             print(f"{path}: merge conflict between {base} and {head}")
@@ -592,6 +643,52 @@ def report(failures: list[tuple[str, str]], waivers: dict[str, tuple[str, str]])
     return int(any(number not in waivers for number, _ in failures))
 
 
+def check_revision(base: str, head: str, ref: str = "") -> int:
+    try:
+        if ref:
+            status, _ = git_status(
+                "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", accepted=(0, 1)
+            )
+            if status:
+                print(f"ADR body freeze: skipping {ref}: no commit", file=sys.stderr)
+                return 0
+            print(f"ADR body freeze: checking {ref}", file=sys.stderr)
+        return check(base, head)
+    except InvalidReason as exc:
+        print(f"ADR body freeze: {exc}", file=sys.stderr)
+        return 1
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"ADR body freeze: {exc}", file=sys.stderr)
+        return 2
+
+
+OID = r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})"
+PUSH_REF = re.compile(rf"(\S+) ({OID}) (\S+) ({OID})")
+
+
+def check_push_refs(base: str) -> int:
+    lines = sys.stdin.readlines()
+    if not lines:
+        print("ADR body freeze: no outgoing refs", file=sys.stderr)
+    seen: set[str] = set()
+    result = 0
+    for number, line in enumerate(lines, 1):
+        match = PUSH_REF.fullmatch(line.removesuffix("\n"))
+        if not match or len(match[2]) != len(match[4]):
+            print(f"ADR body freeze: malformed push protocol line {number}", file=sys.stderr)
+            result = 2
+            continue
+        local, sha, remote, _ = match.groups()
+        sha = sha.lower()
+        if sha in seen or not sha.strip("0"):
+            continue
+        seen.add(sha)
+        ref = local if local == remote else f"{local} -> {remote}"
+        result = max(result, check_revision(base, sha, f"{ref} ({sha[:10]})"))
+        sys.stdout.flush()
+    return result
+
+
 def main() -> int:
     """Parse CLI arguments and run the ADR body freeze check."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -601,10 +698,15 @@ def main() -> int:
     revision.add_argument(
         "--head-from-env",
         action="store_true",
-        help="check the pushed PRE_COMMIT_TO_REF revision, falling back to HEAD outside a push",
+        help="manual invocation only: use PRE_COMMIT_TO_REF when set, otherwise HEAD",
+    )
+    revision.add_argument(
+        "--push-refs-stdin", action="store_true", help="check each outgoing pre-push ref on stdin"
     )
     args = parser.parse_args()
     try:
+        if args.push_refs_stdin:
+            return check_push_refs(args.base)
         head = args.head
         if args.head_from_env:
             head = os.environ.get("PRE_COMMIT_TO_REF")
@@ -614,11 +716,8 @@ def main() -> int:
                     "ADR body freeze: PRE_COMMIT_TO_REF unset (not a push); checking HEAD",
                     file=sys.stderr,
                 )
-        return check(args.base, head)
-    except InvalidReason as exc:
-        print(f"ADR body freeze: {exc}", file=sys.stderr)
-        return 1
-    except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+        return check_revision(args.base, head)
+    except (RuntimeError, OSError, ValueError) as exc:
         print(f"ADR body freeze: {exc}", file=sys.stderr)
         return 2
 

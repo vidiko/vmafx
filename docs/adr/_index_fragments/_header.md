@@ -63,9 +63,8 @@ and follows the structure in [0000-template.md](0000-template.md):
   Code spans and fenced examples preserve literal spacing.
   The check compares the base tip with the proposed merge and protects ADRs
   frozen on either the base tip or the common ancestor. The pre-push hook
-  uses `--head-from-env` to check the pushed revision in `PRE_COMMIT_TO_REF`.
-  Outside a push, the hook reports that it is checking `HEAD`. For a manual
-  check, pass `--base` and `--head` explicitly.
+  checks every pushed ref from Git's push protocol against `origin/master`.
+  For a manual check, pass `--base` and `--head` explicitly.
   A commit trailer `ADR-Body-Edit: <reason>` of at least 20 characters
   permits other edits or renames in the ADRs whose
   base `ADR-NNNN` id the reason names, and only in those; a reason that names
