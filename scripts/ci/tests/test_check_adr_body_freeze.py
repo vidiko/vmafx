@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+links = importlib.import_module("scripts.ci.tests.symlink_test_support")
 run = importlib.import_module("scripts.lib.safe_subprocess").run
 yaml = importlib.import_module("yaml")
 GIT = shutil.which("git") or "git"
@@ -758,6 +759,7 @@ class FreezeTests(unittest.TestCase):
             self.check_change(BASE.replace("[Source](old.md)", update + spaced), 1)
 
     def test_transition_self_or_symlink(self) -> None:
+        links.skip_without_symlinks(self.repo / "docs/adr")
         (self.repo / "docs/adr/9999-link.md").symlink_to("9999-successor.md")
         for new in (
             NOTE.replace("9999", "1234").replace("successor", "example"),
@@ -766,6 +768,7 @@ class FreezeTests(unittest.TestCase):
             self.check_change(BASE.replace("Accepted\n", "Superseded\n" + new), 1, "Status")
 
     def test_changed_successor(self) -> None:
+        links.skip_without_symlinks(self.repo / "docs/adr")
         original = BASE.replace("Accepted\n", "Superseded\n" + NOTE)
         self.given(original)
         (self.repo / "docs/adr/9999-link.md").symlink_to("9999-successor.md")
