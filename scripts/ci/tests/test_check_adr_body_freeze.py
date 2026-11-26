@@ -172,11 +172,21 @@ class FreezeTests(unittest.TestCase):
     def test_undated_heading(self) -> None:
         self.check_change(BASE + "\n## Status update\nNew line.\n", 1)
 
+    def commit_frozen_edit(self, path: str = ADR) -> None:
+        self.write(path, BASE.replace("Old decision.", "Changed decision."))
+        self.commit()
+
     def test_new_file_and_template(self) -> None:
         self.write("docs/adr/9999-new.md", BASE)
         self.write("docs/adr/0000-template.md", "changed\n")
         self.commit()
-        self.assertEqual(self.run_check().returncode, 0)
+        clean = self.run_check()
+        self.assertEqual((clean.returncode, clean.stdout, clean.stderr), (0, "", ""))
+
+        self.commit_frozen_edit()
+        refused = self.run_check()
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(ADR, refused.stdout)
 
     def run_check(
         self, base: str | None = None, head_args: tuple[str, ...] = ("--head", "HEAD")
@@ -348,9 +358,16 @@ class FreezeTests(unittest.TestCase):
         self.assertNotIn("note:", result.stdout)
 
     def test_rename_unchanged(self) -> None:
-        self.git("mv", ADR, "docs/adr/1234-renamed.md")
+        renamed = "docs/adr/1234-renamed.md"
+        self.git("mv", ADR, renamed)
         self.commit()
-        self.assertEqual(self.run_check().returncode, 0)
+        clean = self.run_check()
+        self.assertEqual((clean.returncode, clean.stdout, clean.stderr), (0, "", ""))
+
+        self.commit_frozen_edit(renamed)
+        refused = self.run_check()
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(renamed, refused.stdout)
 
     def test_rename_changed(self) -> None:
         self.git("mv", ADR, "docs/adr/1234-renamed.md")
@@ -702,8 +719,13 @@ class FreezeTests(unittest.TestCase):
         self.git("checkout", "-qb", "base-tip", self.base)
         self.write("other.txt", "base")
         self.commit()
-        result = self.run_check("topic")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clean = self.run_check("topic")
+        self.assertEqual((clean.returncode, clean.stdout, clean.stderr), (0, "", ""))
+
+        self.commit_frozen_edit()
+        refused = self.run_check("topic")
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(ADR, refused.stdout)
 
     def test_conflict_without_records(self) -> None:
         main = runpy.run_path(str(SCRIPT))["main"]
@@ -1025,7 +1047,13 @@ class FreezeTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_no_changes(self) -> None:
-        self.assertEqual(self.run_check().returncode, 0)
+        clean = self.run_check()
+        self.assertEqual((clean.returncode, clean.stdout, clean.stderr), (0, "", ""))
+
+        self.commit_frozen_edit()
+        refused = self.run_check()
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(ADR, refused.stdout)
 
     def test_bad_revision(self) -> None:
         self.assertEqual(self.run_check("missing-revision").returncode, 2)
