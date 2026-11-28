@@ -38,7 +38,13 @@ REPLAY_MAINTENANCE = (
     "maintenance.auto=false",
     "maintenance.autoDetach=false",
 )
-MIRRORS = ("Dockerfile", "Dockerfile.ffmpeg", "dev/Containerfile", "docker/Dockerfile.node")
+MIRRORS = (
+    "Containerfile.vmafx",
+    "Dockerfile",
+    "Dockerfile.ffmpeg",
+    "dev/Containerfile",
+    "docker/Dockerfile.node",
+)
 # The shared FFmpeg fix series every build applies before ffmpeg-patches/
 # (ADR-3143): three pins in build-config.env, one script that fetches,
 # verifies and applies it.
