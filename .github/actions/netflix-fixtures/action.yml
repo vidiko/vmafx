@@ -1,0 +1,106 @@
+# Copyright 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+name: Netflix fixtures
+description: Restore and verify Netflix test clips and optionally cache fixtures added by Python tests.
+
+inputs:
+  phase:
+    description: "'get' before consuming fixtures, 'finish' after the last consumer."
+    required: true
+  names:
+    description: "Optional whitespace-separated fixture filenames for a subset fetch."
+    required: false
+  resource:
+    description: "Set to 'true' in both phases for a job that runs the full Python fixture suite."
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # The first writer fixes each key's contents, so full gets publish canonical-v1 manifest clips and only opted-in tox jobs publish resource-v2 after testing.
+    - name: Clear the save decision and list the canonical paths
+      id: manifest
+      if: inputs.phase == 'get'
+      shell: bash
+      run: |
+        rm -f "${RUNNER_TEMP}/netflix-fixtures.save"
+        {
+          echo 'paths<<EOF_PATHS'
+          bash scripts/test/fetch-test-yuvs.sh --list-paths
+          echo 'EOF_PATHS'
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Restore the post-test resource tree
+      id: resource
+      if: inputs.phase == 'get' && inputs.resource == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: python/test/resource
+        key: vmaf-fixtures-resource-v2-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}
+        restore-keys: vmaf-fixtures-resource-v2-
+
+    # download_reactively only repairs missing files. Prune bad copies and
+    # recover the checkout's tracked files before overlaying the canonical clips.
+    - name: Drop unusable restored fixtures
+      if: inputs.phase == 'get' && inputs.resource == 'true'
+      shell: bash
+      run: bash scripts/ci/prune-corrupt-fixtures.sh --restore-tracked python/test/resource
+
+    - name: Restore the canonical clips
+      id: canonical
+      if: inputs.phase == 'get'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.manifest.outputs.paths }}
+        key: vmaf-fixtures-canonical-v1-${{ hashFiles('scripts/test/fetch-test-yuvs.sh') }}
+
+    - name: Verify and fetch the requested fixtures
+      id: fetch
+      if: inputs.phase == 'get'
+      shell: bash
+      env:
+        FIXTURE_NAMES: ${{ inputs.names }}
+        RESOURCE: ${{ inputs.resource }}
+        RESOURCE_HIT: ${{ steps.resource.outputs.cache-hit }}
+      run: |
+        read -r -d '' -a names <<< "${FIXTURE_NAMES}" || true
+        for name in ${names[@]+"${names[@]}"}; do
+          if [[ "${name}" == -* ]]; then
+            echo "::error::names accepts fixture filenames only"
+            exit 2
+          fi
+        done
+        bash scripts/test/fetch-test-yuvs.sh ${names[@]+"${names[@]}"}
+
+        if [[ "${#names[@]}" -eq 0 ]]; then
+          echo 'full=true' >> "${GITHUB_OUTPUT}"
+          if [[ "${RESOURCE}" == true && "${RESOURCE_HIT}" != true ]]; then
+            touch "${RUNNER_TEMP}/netflix-fixtures.save"
+          fi
+        fi
+
+    - name: Save the verified canonical clips
+      if: inputs.phase == 'get' && steps.fetch.outputs.full == 'true' && steps.canonical.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.manifest.outputs.paths }}
+        key: vmaf-fixtures-canonical-v1-${{ hashFiles('scripts/test/fetch-test-yuvs.sh') }}
+
+    - name: Consume the resource save decision
+      id: check_save
+      if: inputs.phase == 'finish'
+      shell: bash
+      run: |
+        marker="${RUNNER_TEMP}/netflix-fixtures.save"
+        if [[ -f "${marker}" ]]; then
+          echo 'save=true' >> "${GITHUB_OUTPUT}"
+          rm -f "${marker}"
+        fi
+
+    - name: Save the post-test resource tree
+      if: inputs.phase == 'finish' && inputs.resource == 'true' && steps.check_save.outputs.save == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: python/test/resource
+        key: vmaf-fixtures-resource-v2-${{ hashFiles('python/test/*_test.py', 'python/test/resource/test_*.py') }}

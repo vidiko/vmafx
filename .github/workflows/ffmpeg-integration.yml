@@ -585,9 +585,14 @@ jobs:
       # The 576x324 Netflix pair (D24), fetched by the script every other job
       # uses: md5 checked, a transient failure of the host retried for minutes.
       - name: Fetch the 576x324 test pair
-        run: >-
-          bash scripts/test/fetch-test-yuvs.sh
-          src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+          names: src01_hrc00_576x324.yuv src01_hrc01_576x324.yuv
+      - name: Finish provisioning Netflix fixtures
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
 
       # CPU build, no ONNX Runtime and no LTO: the consumers only need the C API.
       - name: Build and install libvmaf (this commit)

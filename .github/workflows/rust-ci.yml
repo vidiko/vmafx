@@ -191,6 +191,15 @@ jobs:
           DOCS_RS: '1'
         run: cargo publish --dry-run --locked -p vmafx-sys -p vmafx -j4
 
+      - name: Fetch the Netflix and checkerboard fixtures
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: get
+      - name: Finish provisioning Netflix fixtures
+        uses: ./.github/actions/netflix-fixtures
+        with:
+          phase: finish
+
       - name: Cargo test (unit + integration, every workspace crate)
         # --workspace: vmafx (the safe binding) and vmafx-tad carry tests too;
         # `-p vmafx-sys` ran none of them (ADR-1528).
@@ -239,9 +248,6 @@ jobs:
           # rebuild_deps); building every target here compiled the whole C test
           # suite a second time and ran the job into its 30-minute timeout.
           ninja -C build-rust tools/vmaf
-
-      - name: Fetch the Netflix and checkerboard fixtures
-        run: bash scripts/test/fetch-test-yuvs.sh
 
       - name: Rust Netflix bit-exactness contract test (#2434)
         # Verify bit-exact scoring parity between the Rust safe binding and the

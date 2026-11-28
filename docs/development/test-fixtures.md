@@ -173,12 +173,27 @@ download of https://…/src01_hrc00_576x324.yuv: attempt 1 of 7 failed (HTTP Err
 
 ## CI parity
 
-CI jobs that need the clips run the same script, and the Python tests of the
-Coverage Gate download further fixtures through `download_reactively()`. A
-workflow does not download from `Netflix/vmaf_resource` on its own
-(`scripts/ci/tests/test_fetch_test_yuvs.py` refuses that). If the canonical
-content in `Netflix/vmaf_resource` changes, update the script's expected-md5
-list.
+CI jobs provision the clips with `./.github/actions/netflix-fixtures`.
+After checkout, call it with `phase: get` before the first consumer. It
+restores the exact canonical cache and verifies each requested clip by MD5.
+A valid restored clip needs no download. Pass whitespace-separated filenames
+in `names` for a subset, or omit it to verify every clip listed by
+`bash scripts/test/fetch-test-yuvs.sh --list-paths`.
+
+The first writer fixes each cache key’s contents, so full fetches publish
+only manifest clips under `vmaf-fixtures-canonical-v1-` at get time, and
+only the Build and libvmaf matrix tox legs publish `python/test/resource`
+under `vmaf-fixtures-resource-v2-` after tests.
+The canonical key hashes the fetch script. The resource key hashes the Python
+test files and accepts prefix hits within v2. To include fixtures added by
+`download_reactively()`, those tox legs set `resource: 'true'` on both
+`get` and `finish`. They restore and prune the resource tree before
+overlaying the canonical clips, then call `finish` after tox and bundle
+cleanup. Other jobs call `finish` immediately after `get`.
+
+`scripts/ci/tests/test_fetch_test_yuvs.py` checks that workflows use the
+fixture actions for direct fetches and caching. If the canonical content
+in `Netflix/vmaf_resource` changes, update the script's expected MD5 list.
 
 ## Fixtures not covered by the script
 

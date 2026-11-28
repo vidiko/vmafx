@@ -215,7 +215,8 @@
         ".clang-format",
         ".iwyu.imp",
         ".release-please-manifest.json",
-        "release-please-config.json"
+        "release-please-config.json",
+        ".github/actions/netflix-fixtures/action.yml"
       ]
     },
     "python": {
@@ -238,7 +239,8 @@
         "pyproject.toml",
         "noxfile.py",
         "requirements/*",
-        "requirements/**"
+        "requirements/**",
+        ".github/actions/netflix-fixtures/action.yml"
       ]
     },
     "ai": {
@@ -297,7 +299,8 @@
         "core/src/feature/integer_psnr.c",
         "core/src/feature/psnr_score.h",
         "core/src/compat/libvmaf/*",
-        "core/src/compat/libvmaf/**"
+        "core/src/compat/libvmaf/**",
+        ".github/actions/netflix-fixtures/action.yml"
       ]
     },
     "docs": {
@@ -726,6 +729,7 @@
         "scripts/ci/vmafx_window_pooling.py",
         "scripts/ci/werror-args.sh",
         "scripts/test/fetch-test-yuvs.sh",
+        ".github/actions/netflix-fixtures/action.yml",
         "compat/python-vmaf/tools/retrying_download.py",
         "requirements/locks/build.txt",
         "build-config.env",
@@ -740,7 +744,8 @@
         "build-config.env",
         "scripts/ci/upstream-*.sh",
         "scripts/ci/upstream_consumer_scores.py",
-        ".github/workflows/ffmpeg-integration.yml"
+        ".github/workflows/ffmpeg-integration.yml",
+        ".github/actions/netflix-fixtures/action.yml"
       ]
     },
     "ubuntu_dev_images": {
