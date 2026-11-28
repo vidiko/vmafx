@@ -3,8 +3,9 @@
  *  SPDX-License-Identifier: EUPL-1.2
  *
  *  CUDA dispatch_strategy — translates a per-feature descriptor into
- *  a CUDA submission strategy. Today every CUDA extractor uses
- *  direct stream submission; this stub exposes the registry-aware
+ *  a CUDA submission strategy, selected at every CUDA extractor's
+ *  initialisation (ADR-1571). Today every CUDA extractor uses
+ *  direct stream submission; this interface exposes the registry-aware
  *  decision surface so a future PR can opt-in graph capture for
  *  high-dispatch-density features (ADM = 16 dispatches/frame is the
  *  obvious first candidate). See ADR-0181.
@@ -41,9 +42,10 @@ typedef enum {
  *
  * Env override: VMAF_CUDA_DISPATCH=<feature>:graph,<feature>:direct,...
  *
- * Stub: today returns DIRECT for every input pending profiler-
- * driven graph-capture follow-up (CUDA graph capture support
- * lands separately).
+ * Today returns DIRECT for every input pending the profiler-
+ * driven graph-capture follow-up: a `<feature>:graph` request logs
+ * a warning and falls back to direct, and the caller refuses any
+ * non-direct strategy (ADR-1571).
  */
 VmafCudaDispatchStrategy vmaf_cuda_select_strategy(const char *feature_name,
                                                    const VmafFeatureCharacteristics *chars,

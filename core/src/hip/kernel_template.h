@@ -13,18 +13,15 @@
  *  `hipEvent_t`, `hipMemcpyAsync` ...), so the template's shape ports
  *  one-to-one.
  *
- *  Scaffold posture: this header lands ahead of the HIP runtime
- *  (T7-10b). The struct definitions are stable C surface so consumer
+ *  Posture: the struct definitions are stable C surface so consumer
  *  TUs can compile without `<hip/hip_runtime.h>`. The lifecycle
  *  helpers `vmaf_hip_kernel_lifecycle_init/_close`,
  *  `vmaf_hip_kernel_readback_alloc/_free`,
  *  `vmaf_hip_kernel_submit_pre_launch`,
- *  `vmaf_hip_kernel_collect_wait` are declared here and stubbed in
- *  `core/src/hip/kernel_template.c`. Every helper currently returns
- *  -ENOSYS until the runtime PR replaces the bodies with real HIP
- *  calls. The consumer (`integer_psnr_hip.c`) calls them through the
- *  same call-graph the CUDA reference uses, so the runtime PR can
- *  swap bodies without touching consumers.
+ *  `vmaf_hip_kernel_collect_wait` are declared here and defined in
+ *  `core/src/hip/kernel_template.c`; since the T7-10b runtime
+ *  PR (ADR-0212) the bodies make real HIP calls. Consumers
+ *  call them through the same call-graph the CUDA reference uses.
  *
  *  Why a paired .c instead of inline `static inline` helpers like the
  *  CUDA template? Two reasons:
@@ -32,20 +29,18 @@
  *    1. The CUDA helpers are inline because they unwrap straight onto
  *       `cu_state->f->cuStreamCreateWithPriority` etc. — every call
  *       resolves at compile time against the `CudaFunctions` driver
- *       table. HIP has no equivalent driver-loader scaffolded yet
- *       (the runtime PR is still pending), so the helper bodies must
- *       carry a -ENOSYS check that callers cannot inline away. A real
- *       (non-inline) function gives one place to flip from -ENOSYS to
- *       a real `hipStreamCreate` call when the runtime arrives.
- *    2. Splitting declaration from definition lets the runtime PR
- *       replace the bodies without recompiling every consumer TU —
- *       the kernel-template ABI stays stable.
+ *       table. The HIP helpers receive their runtime handles as
+ *       `uintptr_t` (see the lifecycle struct below), so the bodies
+ *       call HIP directly; keeping them non-inline concentrates the
+ *       HIP calls in one place.
+ *    2. Splitting declaration from definition keeps the HIP calls in
+ *       one TU and every consumer on stable signatures, so a body
+ *       change does not recompile every consumer TU.
  *
- *  When the runtime PR (T7-10b) lands, the bodies in
- *  `kernel_template.c` flip from -ENOSYS to real HIP calls and the
- *  documentation here drops the "scaffold" caveats. The struct shape
- *  and helper signatures stay verbatim — that's the load-bearing
- *  contract this PR pins.
+ *  The T7-10b runtime PR (ADR-0212; ADR-0241 for the stubs it replaced)
+ *  replaced the -ENOSYS bodies with real HIP calls; the struct shape and
+ *  helper signatures stayed verbatim — that's the load-bearing
+ *  contract the first-consumer PR pinned.
  *
  *  Reference implementation (CUDA): see
  *  `core/src/cuda/kernel_template.h` and
@@ -74,8 +69,9 @@ extern "C" {
  * Mirrors `VmafCudaKernelLifecycle` field-for-field. Handles cross
  * the fork's HIP scaffold ABI as `uintptr_t` so this header stays
  * free of `<hip/hip_runtime.h>` (matches the public `libvmaf_hip.h`
- * convention; see ADR-0212). The runtime PR will store
- * `(hipStream_t)(uintptr_t)` casts under the covers.
+ * convention; see ADR-0212). The runtime converts them back through
+ * `vmaf_hip_stream_of` and `vmaf_hip_event_of`, which use a union
+ * rather than an integer-to-pointer cast.
  *
  * `str`       — private non-blocking stream for the readback path.
  * `submit`    — event recorded on the picture's stream right after
@@ -91,9 +87,9 @@ typedef struct VmafHipKernelLifecycle {
 /*
  * One device-side accumulator + one pinned host readback slot.
  *
- * Mirrors `VmafCudaKernelReadback`. The runtime PR fills `device`
- * via `hipMallocAsync` and `host_pinned` via `hipHostMalloc`; the
- * scaffold leaves both NULL.
+ * Mirrors `VmafCudaKernelReadback`. The runtime fills `device` via
+ * `hipMalloc` and `host_pinned` via `hipHostMalloc`; a failed allocation
+ * frees whatever it acquired and leaves both NULL.
  */
 typedef struct VmafHipKernelReadback {
     void *device;
@@ -102,37 +98,41 @@ typedef struct VmafHipKernelReadback {
 } VmafHipKernelReadback;
 
 /*
- * Init: stream + event-pair create. Scaffold returns -ENOSYS; the
- * runtime PR swaps in `hipStreamCreateWithFlags` +
- * `hipEventCreateWithFlags` ×2.
+ * Init: create a non-blocking private stream and two timing-disabled
+ * events (`hipStreamCreateWithFlags`, `hipEventCreateWithFlags` x2).
+ * A partial failure destroys the handles created so far before
+ * returning the mapped error.
  *
- * Caller pre-conditions: `lc` zero-initialised; `ctx` is the opaque
- * HIP context (from `vmaf_hip_context_new`). The scaffold accepts
- * NULL for `ctx` since no real HIP state exists yet — the runtime
- * PR will tighten the contract.
+ * Caller pre-conditions: `lc` is non-NULL and is zeroed by this
+ * helper. `ctx` is accepted for the shared lifecycle signature; this
+ * helper does not need it.
  *
- * Returns 0 on success or a negative errno. The scaffold returns
- * -ENOSYS unconditionally.
+ * Returns 0 on success or a negative errno.
  */
 int vmaf_hip_kernel_lifecycle_init(VmafHipKernelLifecycle *lc, VmafHipContext *ctx);
 
 /*
  * Allocate a (device, pinned-host) readback pair of `bytes` size.
+ * The implementation uses `hipMalloc` + `hipHostMalloc`; a failed
+ * allocation frees whatever it acquired and leaves `device` and
+ * `host_pinned` NULL.
+ * `bytes` must be greater than zero.
  *
- * Returns 0 on success or a negative errno. The scaffold returns
- * -ENOSYS; on failure `rb` is left zero-initialised.
+ * Returns 0 on success or a negative errno.
  */
 int vmaf_hip_kernel_readback_alloc(VmafHipKernelReadback *rb, VmafHipContext *ctx, size_t bytes);
 
 /*
  * Per-frame submit-side helper.
  *
- *   1. Zero the device accumulator on `lc->str`.
- *   2. Wait for the dist-side ready event on `picture_stream`.
+ *   1. Zero the device accumulator on `picture_stream` (or `lc->str`
+ *      when no picture stream is supplied) with `hipMemsetAsync`.
+ *   2. Wait for the dist-side ready event on `picture_stream` with
+ *      `hipStreamWaitEvent` when both handles are non-zero.
  *
- * Mirrors `vmaf_cuda_kernel_submit_pre_launch`. The runtime PR does
- * the `hipMemsetAsync` + `hipStreamWaitEvent`; the scaffold returns
- * -ENOSYS so the consumer's submit() short-circuits.
+ * Mirrors `vmaf_cuda_kernel_submit_pre_launch`. The implementation
+ * makes these real HIP calls; an unset lifecycle or readback is
+ * refused with `-EINVAL`.
  *
  * Stream + event handles cross as `uintptr_t` for the same
  * header-purity reason as the lifecycle struct.
@@ -145,25 +145,27 @@ int vmaf_hip_kernel_submit_pre_launch(VmafHipKernelLifecycle *lc, VmafHipContext
  * collect()-side wait point: drains the private stream so the host
  * pinned buffer is safe to read.
  *
- * Mirrors `vmaf_cuda_kernel_collect_wait`. Scaffold returns -ENOSYS.
+ * Mirrors `vmaf_cuda_kernel_collect_wait`. The implementation calls
+ * `hipStreamSynchronize(lc->str)`; an uninitialised lifecycle has
+ * nothing to wait on and returns 0.
  */
 int vmaf_hip_kernel_collect_wait(VmafHipKernelLifecycle *lc, VmafHipContext *ctx);
 
 /*
- * close()-side teardown: drain + destroy stream, destroy events.
+ * close()-side teardown: drain and destroy the stream, then destroy
+ * both events.
  *
- * Mirrors `vmaf_cuda_kernel_lifecycle_close`. The scaffold body is
- * a no-op (every handle is zero); the runtime PR will sequence
- * `hipStreamSynchronize` → `hipStreamDestroy` → `hipEventDestroy` ×2
- * and aggregate the first error. Safe to call on a partially-
- * initialised lifecycle.
+ * Mirrors `vmaf_cuda_kernel_lifecycle_close`. The implementation
+ * sequences `hipStreamSynchronize` -> `hipStreamDestroy` ->
+ * `hipEventDestroy` x2 and aggregates the first error. Zero handles
+ * are skipped, so a partially-initialised lifecycle is safe to close.
  */
 int vmaf_hip_kernel_lifecycle_close(VmafHipKernelLifecycle *lc, VmafHipContext *ctx);
 
 /*
- * Free the readback pair. Scaffold body is a no-op; runtime PR
- * issues `hipFreeAsync` + `hipHostFree`. Safe to call on a partially-
- * allocated readback.
+ * Free the readback pair with `hipFree` + `hipHostFree`, aggregating
+ * the first error. Zero handles are skipped, so a partially-allocated
+ * readback is safe to free.
  */
 int vmaf_hip_kernel_readback_free(VmafHipKernelReadback *rb, VmafHipContext *ctx);
 
