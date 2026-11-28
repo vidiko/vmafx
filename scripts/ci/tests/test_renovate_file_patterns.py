@@ -354,10 +354,16 @@ class CoupledPinGroups(unittest.TestCase):
         actions/checkout stay in the minor + patch group. Boundary: major updates of
         ossf/scorecard-action also land in the scorecard group after the major rule."""
         scorecard_group = "OpenSSF Scorecard action (gate identity)"
-        for update_type in ("minor", "patch", "digest", "major"):
-            with self.subTest(update_type=update_type):
+        cases = [
+            (datasource, update_type)
+            for datasource in ("github-tags", "github-digest")
+            for update_type in ("minor", "patch", "digest", "major")
+        ]
+        for datasource, update_type in cases:
+            with self.subTest(datasource=datasource, update_type=update_type):
                 dep = {
                     "matchManagers": "github-actions",
+                    "matchDatasources": datasource,
                     "matchPackageNames": "ossf/scorecard-action",
                     "matchDepNames": "ossf/scorecard-action",
                     "matchUpdateTypes": update_type,
@@ -369,6 +375,7 @@ class CoupledPinGroups(unittest.TestCase):
                 self.assertIs(winning_rule.get("automerge"), False)
         checkout = {
             "matchManagers": "github-actions",
+            "matchDatasources": "github-tags",
             "matchPackageNames": "actions/checkout",
             "matchDepNames": "actions/checkout",
             "matchUpdateTypes": "patch",
