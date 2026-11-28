@@ -13,33 +13,9 @@ import (
 	"time"
 )
 
-func TestScoreTimeout_DefaultWhenUnset(t *testing.T) {
-	t.Setenv("VMAFX_TUNE_SCORE_TIMEOUT", "")
-	got := scoreTimeout()
-	if got != defaultScoreTimeout {
-		t.Errorf("scoreTimeout() = %v, want %v", got, defaultScoreTimeout)
-	}
-}
-
-func TestScoreTimeout_HonoursEnvOverride(t *testing.T) {
-	t.Setenv("VMAFX_TUNE_SCORE_TIMEOUT", "13s")
-	got := scoreTimeout()
-	if got != 13*time.Second {
-		t.Errorf("scoreTimeout() = %v, want 13s", got)
-	}
-}
-
-func TestScoreTimeout_InvalidEnvFallsBackToDefault(t *testing.T) {
-	t.Setenv("VMAFX_TUNE_SCORE_TIMEOUT", "garbage")
-	got := scoreTimeout()
-	if got != defaultScoreTimeout {
-		t.Errorf("scoreTimeout() with invalid env = %v, want default %v", got, defaultScoreTimeout)
-	}
-}
-
 // TestVMAFScoreFunc_DoesNotHangOnMissingBinary exercises the score func
 // against an obviously-missing binary path and asserts the call returns
-// rather than blocking. Combined with the cap on scoreTimeout, this
+// rather than blocking. Combined with the scorecli.ScoreTimeout() cap, this
 // guards against the original hang-forever shape of the bug.
 func TestVMAFScoreFunc_DoesNotHangOnMissingBinary(t *testing.T) {
 	t.Setenv("VMAFX_TUNE_SCORE_TIMEOUT", "2s")
