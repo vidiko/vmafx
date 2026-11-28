@@ -29,10 +29,10 @@
 #
 #   closed fd 0   `bash gate.sh 0<&-`. The old code ran `PR_BODY="$(cat)"`,
 #                 the command substitution's pipe took the freed descriptor
-#                 0, `cat` read the pipe it was writing to, and the gate
-#                 HUNG — measured at the 12 s timeout below, unbounded in
-#                 reality. Every case here is wrapped in `timeout` and a
-#                 124 is reported as a hang, not merely as a wrong code.
+#                 0, and `cat` read the pipe it was writing to. That read
+#                 never returns. Each case gets ${hang_bound_s} seconds:
+#                 the old 12 s limit timed out a working ffmpeg-surface
+#                 gate under load (one-minute load average around 47).
 #   /dev/null     `bash gate.sh </dev/null`, the shape a CI step, a git
 #                 hook and `nohup` all produce. Not a terminal, carries no
 #                 body, and must be named as such.
@@ -75,6 +75,7 @@ trap 'rm -rf -- "${work}"' EXIT
 
 pass_count=0
 fail_count=0
+readonly hang_bound_s=120
 
 pass() {
   echo "PASS: $1"
@@ -88,16 +89,16 @@ fail() {
 
 # run_case <expected-exit> <name> <shell-snippet>
 #
-# The snippet runs under `timeout 12 bash -c`, from the repo root, with
-# PR_BODY unset unless the snippet sets it. Exit 124 is reported as a hang
+# The snippet runs from the repo root with a ${hang_bound_s}-second timeout
+# and PR_BODY unset unless the snippet sets it. Exit 124 is reported as a hang
 # because that is the regression this file exists to catch.
 run_case() {
   local expected="$1" name="$2" snippet="$3"
   local out="" code=0
-  out="$(cd "${repo_root}" && timeout 12 env -u PR_BODY bash -c "${snippet}" 2>&1)" || code=$?
+  out="$(cd "${repo_root}" && timeout "${hang_bound_s}" env -u PR_BODY bash -c "${snippet}" 2>&1)" || code=$?
   printf '%s' "${out}" >"${work}/last-output.txt"
   if [ "${code}" -eq 124 ]; then
-    fail "${name} — HUNG (killed at 12 s); the gate must decide, not block"
+    fail "${name} — HUNG (killed at ${hang_bound_s} s); the gate must decide, not block"
     return
   fi
   if [ "${code}" -ne "${expected}" ]; then
