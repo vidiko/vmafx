@@ -115,15 +115,25 @@ certificate + Rekor entry) emitted by `cosign sign-blob` v3+.
 
 ## 5. How to verify the signature
 
-This step is **mandatory** before the binary is loaded by any
-production pipeline. The verify-blob check gates on Sigstore's
-keyless OIDC identity, so a tampered or wrong-origin binary
-fails verification:
+Verification is **mandatory** before the binary is loaded by any
+production pipeline, and it takes two checks. The `cosign verify-blob`
+command below checks the signature, the workflow identity and the OIDC
+issuer. It does not check the signer's GitHub owner ID: the identity
+pattern matches the repository path, which a new account under the same
+name would also produce ([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
+The second command reads the owner ID from the bundle's signing
+certificate. Run the commands in steps 5 and 6 from the download
+directory of step 4. Copy `u2netp_mirror_v1.onnx.bundle` once into a
+private directory from `mktemp -d`:
 
 ```bash
+cd ~/Downloads/u2netp-mirror
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp u2netp_mirror_v1.onnx.bundle "$work/u2netp_mirror_v1.onnx.bundle"
 cosign verify-blob \
-  --bundle u2netp_mirror_v1.onnx.bundle \
-  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx' \
+  --bundle "$work/u2netp_mirror_v1.onnx.bundle" \
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   u2netp_mirror_v1.onnx
 ```
@@ -136,6 +146,45 @@ Verified OK
 
 Any other output (especially `Error: failed to verify`) means
 the binary is not the one this fork released. Do not load it.
+
+Then check the owner ID using `jq` and Python 3 with `pyasn1` and
+`pyasn1-modules`. The command reads Fulcio extension `1.3.6.1.4.1.57264.1.17`
+(source repository owner identifier) and requires `340303765`, the numeric ID
+of `vidiko`. Run it in the same shell so `jq` reads the same
+`"$work/u2netp_mirror_v1.onnx.bundle"` copy:
+
+```bash
+set -o pipefail
+if jq -er '.verificationMaterial.certificate.rawBytes' "$work/u2netp_mirror_v1.onnx.bundle" | python3 -c '
+import base64, sys
+from pyasn1.codec.der.decoder import decode
+from pyasn1.type.char import UTF8String
+from pyasn1_modules.rfc5280 import Certificate
+
+der = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+cert, rest = decode(der, asn1Spec=Certificate())
+owners = [ext["extnValue"].asOctets() for ext in cert["tbsCertificate"]["extensions"]
+          if str(ext["extnID"]) == "1.3.6.1.4.1.57264.1.17"]
+if rest or len(owners) != 1:
+    sys.exit(1)
+owner, rest = decode(owners[0], asn1Spec=UTF8String())
+sys.exit(bool(rest) or str(owner) != "340303765")
+'; then
+  echo "owner ID OK"
+else
+  echo "owner ID mismatch: do not load" >&2
+  false
+fi
+```
+
+The command exits with a nonzero status via `false` on a mismatch. Any nonzero
+status or output other than `owner ID OK` means the bundle was not signed from
+the `vidiko` account. Do not load the model. libvmaf's `--tiny-model-verify`
+runs both checks itself for a model listed with its `sigstore_bundle` in a
+`registry.json` next to the model; the download in step 4 has no such entry
+(see step 7). The
+[release guide](../development/release.md#check-the-signers-owner-id)
+describes the same owner-ID check for every release bundle.
 
 ## 6. How to verify the expected hash
 

@@ -103,6 +103,9 @@ cd .. && rm -rf vmafx-tester-macos-arm64-<VERSION> vmafx-tester-macos-arm64-<VER
 The checksum in step 2 comes from the same place as the archive, so it detects a broken
 download, not a forged one. Two independent checks tie the archive to the repository's
 hosted build. Either needs a tool you may not have; neither is needed to run the bundle.
+To also tie it to the vidiko GitHub account and not only its name, add the owner-ID
+check from [the signer's owner](../development/release.md#check-the-signers-owner-id)
+to the `gh attestation verify` line.
 
 ```sh
 # GitHub build provenance (needs the GitHub CLI, `gh`):
@@ -114,7 +117,7 @@ gh attestation verify vmafx-tester-macos-arm64-<VERSION>.tar.xz \
 
 # Sigstore keyless signature (needs `cosign`; the .sigstore.json file is next to the archive):
 cosign verify-blob --bundle vmafx-tester-macos-arm64-<VERSION>.tar.xz.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/vidiko/vmafx/\.github/workflows/macos-tester-bundle\.yml@refs/heads/master$' \
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/macos-tester-bundle\.yml@refs/heads/master$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   vmafx-tester-macos-arm64-<VERSION>.tar.xz
 
@@ -155,7 +158,7 @@ An image published before the move (`ghcr.io/vmafx/vmafx:<VERSION>-tester`) veri
 ```sh
 # 1. Check the signature of the image (needs `cosign`; skip if you do not have it).
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/vidiko/vmafx/\.github/workflows/docker-publish-tester\.yml@refs/(heads/master|tags/v.*)$' \
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/docker-publish-tester\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/vidiko/vmafx:<VERSION>-tester
 
@@ -704,18 +707,32 @@ before you run anything from it.
 The checksum in step 2 comes from the same place as the zip, so it detects a broken
 download, not a forged one. Two independent checks tie the zip to the repository's
 hosted build. Either needs a tool you may not have; neither is needed to run the zip.
+To also tie the zip to the vidiko GitHub account and not only its name
+([the signer's owner](../development/release.md#check-the-signers-owner-id)),
+the `gh attestation verify` commands below pass `--format json` and check with
+`ConvertFrom-Json` that every verified certificate's
+`sourceRepositoryOwnerIdentifier` is `340303765`. A zip published before the move
+to `vidiko` carries `288567244` instead.
 
 ```powershell
-# GitHub build provenance (needs the GitHub CLI, gh):
-gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip -R vidiko/vmafx
+# GitHub build provenance and owner-ID check (needs the GitHub CLI, gh):
+$att = @((gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip -R vidiko/vmafx `
+  --signer-workflow vidiko/vmafx/.github/workflows/windows-tester-bundle.yml --format json | ConvertFrom-Json))
+if ($LASTEXITCODE -ne 0 -or $att.Count -eq 0 -or ($att | Where-Object {
+    $_.verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier -ne '340303765'
+  })) { throw 'Attestation owner-ID verification failed.' }
 
 # Or verify against the attached in-toto provenance bundle (.intoto.jsonl):
-gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip `
-  --bundle vmafx-tester-windows-provenance.intoto.jsonl --repo vidiko/vmafx
+$att = @((gh attestation verify vmafx-tester-windows-<ARCH>-<VERSION>.zip `
+  --bundle vmafx-tester-windows-provenance.intoto.jsonl --repo vidiko/vmafx `
+  --signer-workflow vidiko/vmafx/.github/workflows/windows-tester-bundle.yml --format json | ConvertFrom-Json))
+if ($LASTEXITCODE -ne 0 -or $att.Count -eq 0 -or ($att | Where-Object {
+    $_.verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier -ne '340303765'
+  })) { throw 'Attestation owner-ID verification failed.' }
 
 # Sigstore keyless signature (needs cosign; the .sigstore.json file is next to the zip):
 cosign verify-blob --bundle vmafx-tester-windows-<ARCH>-<VERSION>.zip.sigstore.json `
-  --certificate-identity-regexp '^https://github.com/vidiko/vmafx/\.github/workflows/windows-tester-bundle\.yml@refs/heads/master$' `
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/windows-tester-bundle\.yml@refs/heads/master$' `
   --certificate-oidc-issuer https://token.actions.githubusercontent.com `
   vmafx-tester-windows-<ARCH>-<VERSION>.zip
 

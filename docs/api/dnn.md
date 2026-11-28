@@ -488,26 +488,30 @@ int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path);
 | Argument | Meaning |
 | --- | --- |
 | `onnx_path` | Path to the model file. Its basename is the registry key. |
-| `registry_path` | Explicit registry file, or `NULL` to use `registry.json` next to the model. |
+| `registry_path` | Explicit registry file, or `NULL` to use `registry.json` next to the model (`model/tiny/registry.json` for a bare model file name). |
 
 The function:
 
 1. Reads the registry and finds the entry for the model's basename.
-2. Reads that entry's `sigstore_bundle` field and resolves the bundle path.
-3. Runs `cosign verify-blob` through `posix_spawnp`, pinned to the identity
-   regexp `https://github.com/vidiko/vmafx/.github/workflows/.+` and the
-   issuer `https://token.actions.githubusercontent.com`.
+2. Appends `.sigstore.json` to the basename of `onnx_path` and checks that
+   `sigstore_bundle` equals that name exactly. It opens the derived regular
+   file in the registry directory without following a bundle symlink.
+3. Checks the bundle's certificate for the vidiko owner ID and supply-chain
+   workflow on a release tag or `master`. It passes a private copy of the
+   checked bytes to `cosign verify-blob` with the anchored workflow identity
+   and issuer `https://token.actions.githubusercontent.com`.
 4. Returns `0` only when cosign exits `0`. It fails closed: any error
    stops model load.
 
 | Return | Meaning |
 | --- | --- |
 | `0` | Verification passed. |
-| `-ENOENT` | Registry missing, bundle missing, or no entry for the model. |
-| `-EACCES` | `cosign` is not on `PATH`. |
-| `-EPROTO` | `cosign` exited non-zero (bad or non-matching signature). |
+| `-ENOENT` | Registry, model entry, bundle field or bundle file missing. |
+| `-EACCES` | Cosign is unavailable on `PATH`, or temporary-directory permissions prevent access or creation. The resolved `TMPDIR` (default `/tmp`) and each ancestor must belong to root or the effective user. Group- or other-writable directories require the sticky bit. |
+| `-EPROTO` | Preflight rejected the bundle format, certificate owner ID or workflow identity before cosign ran, or cosign failed to verify the signature. |
+| `-ENAMETOOLONG` | The derived bundle name, registry-directory join or temporary copy path exceeds the path buffer, or `PATH` exceeds the 64 KiB cosign search limit. |
 | `-ENOSYS` | Windows build: the supply-chain path needs POSIX process spawning. |
-| `-EINVAL` | `onnx_path` is `NULL`. This check runs before the platform check. |
+| `-EINVAL` | `onnx_path` is `NULL` (checked on every platform), the bundle name differs, the bundle is a symlink or other non-regular file, or `TMPDIR` is relative, missing or not a directory. |
 
 There is no error-text out parameter; the CLI prints the negated errno. Any
 cosign diagnostics go to the process's own stderr.

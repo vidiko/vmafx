@@ -69,6 +69,16 @@ test('test_setup_scripts_configure_hint',
     timeout : 30,
 )
 
+# ADR-2985: every Sigstore identity expression libvmaf passes to cosign or the
+# guides document is anchored, and the library's refuses prefixed, suffixed and
+# look-alike identities.
+test('test_signer_identity_regexp_contract',
+    import('python').find_installation(),
+    args : files('test_signer_identity_regexp_contract.py'),
+    suite : ['fast'],
+    timeout : 30,
+)
+
 # Execute the compiler-ID policy that selects strict floating-point flags in
 # src/meson.build. The fixture catches GCC-style flags leaking into MSVC-style
 # drivers without requiring a Windows SDK or Intel compiler on this host.
@@ -2167,6 +2177,9 @@ pdjson_default_impl = static_library('test_pdjson_impl',
     include_directories : include_directories('../src'),
     c_args : pdjson_default_impl_args,
 )
+
+# Targets compiling dnn_sources directly need the parser for registry entry lookup.
+dnn_deps += [declare_dependency(link_with : pdjson_default_impl)]
 
 test_pdjson = executable('test_pdjson',
     ['test.c', 'test_pdjson.c'],

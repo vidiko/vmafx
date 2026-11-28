@@ -149,19 +149,32 @@ compensated.
 ```bash
 # Release blob, verbatim from the bundle layout.
 cosign verify-blob --bundle vmaf.bundle vmaf \
-  --certificate-identity-regexp 'https://github.com/VMAFx/vmafx/.github/workflows/supply-chain.yml@.*' \
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # Container image, cosign route. Replace DIGEST with the actual sha256 digest.
-cosign verify ghcr.io/vmafx/vmafx@sha256:DIGEST \
-  --certificate-identity-regexp 'https://github.com/VMAFx/vmafx/.github/workflows/docker-publish-production.yml@.*' \
+cosign verify ghcr.io/vidiko/vmafx@sha256:DIGEST \
+  --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/docker-publish-production\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-# Container image, GitHub-native attestation, NEW.
-gh attestation verify oci://ghcr.io/vmafx/vmafx@sha256:DIGEST --repo VMAFx/vmafx
+# Container image, GitHub-native attestation, with the owner-ID check.
+set -o pipefail
+gh attestation verify oci://ghcr.io/vidiko/vmafx@sha256:DIGEST --repo vidiko/vmafx \
+  --cert-identity-regex '^https://github\.com/vidiko/vmafx/\.github/workflows/docker-publish-production\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
+  --format json \
+  | jq -e 'length > 0 and all(.[]; .verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier == "340303765")'
 ```
 
-The release docs carry the same recipe, kept in sync via the same PR.
+Neither cosign recipe checks the signer's owner ID: the identity pattern
+matches the repository path, not the account that owns it. For the release
+blob, also run the owner-ID check on `vmaf.bundle` from the
+[release guide](../development/release.md#check-the-signers-owner-id). Both
+container routes require `docker-publish-production.yml` on `master` or a
+release tag. The GitHub-native attestation route also checks the owner ID.
+
+These patterns match current releases. A release from before the move to
+`vidiko` (v1.0.0-rc.3 or earlier) was signed as `VMAFx/vmafx` with owner ID
+`288567244`; use that name and ID for those releases only.
 
 ## References
 

@@ -8,6 +8,9 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 
 #include "libvmaf/model.h"
 
@@ -23,6 +26,9 @@ extern "C" {
  *  truth — bump it here (and re-run the size-cap tests) if a future
  *  use case genuinely needs a larger envelope. */
 #define VMAF_DNN_DEFAULT_MAX_BYTES ((size_t)50u * 1024u * 1024u)
+
+/** Maximum byte length of PATH searched for cosign. */
+#define VMAF_DNN_COSIGN_PATH_MAX (64u * 1024u)
 
 /** Compile-time cap for the companion JSON sidecar file (1 MiB = 2^20 bytes).
  *  The sidecar carries only metadata (kind, opset, feature_order, etc.);
@@ -191,29 +197,20 @@ void vmaf_dnn_sidecar_free(VmafModelSidecar *s);
 /** Validate an ONNX file on disk: size cap + operator allowlist. */
 int vmaf_dnn_validate_onnx(const char *path, size_t max_bytes);
 
-/** Verify an ONNX file's Sigstore bundle by shelling out to `cosign
- *  verify-blob` (T6-9 / ADR-0211). Wired through the CLI by
- *  ``--tiny-model-verify``. The function:
- *
- *    1. Locates the registry entry whose ``onnx`` field has the same
- *       basename as ``onnx_path`` (registry path defaults to
- *       ``model/tiny/registry.json`` next to ``onnx_path`` unless the
- *       caller passes a different ``registry_path``).
- *    2. Reads the entry's ``sigstore_bundle`` path (relative to
- *       ``model/tiny/``).
- *    3. Spawns ``cosign verify-blob --bundle=<bundle> --certificate-identity-regexp …
- *       <onnx>`` via ``posix_spawnp`` (NOT ``system(3)`` — banned by
- *       CLAUDE.md §6) and waits for completion.
- *
- *  Returns 0 on success, ``-ENOENT`` when the registry / bundle is
- *  missing, ``-EACCES`` when ``cosign`` is unavailable on PATH, and
- *  ``-EPROTO`` when the verifier exits non-zero. Designed to fail
- *  closed: any error short-circuits model load.
- *
- *  ``registry_path`` may be NULL — the loader then computes
- *  ``<dirname(onnx_path)>/registry.json``. */
-/* Public API — must be visible in the shared library (ADR-0379). */
+/** Verify a private copy of the registry entry's derived Sigstore bundle.
+ *  See libvmaf/dnn.h for name binding, temporary-directory requirements
+ *  and return codes (ADR-0211, ADR-2985). */
 VMAF_EXPORT int vmaf_dnn_verify_signature(const char *onnx_path, const char *registry_path);
+
+#ifndef _WIN32
+/* Owner and mode rule for the cosign temporary directory chain (ADR-2985),
+ * internal and declared here for core/test/dnn/test_tiny_model_verify.c. With
+ * private_only 0 (TMPDIR and each directory above it) root or euid must own the
+ * directory and a group- or other-writable one needs the sticky bit; with
+ * private_only 1 (the mkdtemp(3) directory) euid must own it and no group or
+ * other bit may be set. Returns 0 when the rule holds, -EACCES otherwise. */
+int vmaf_dnn_temp_dir_mode_ok(uid_t owner, mode_t mode, uid_t euid, int private_only);
+#endif
 
 #ifdef __cplusplus
 }

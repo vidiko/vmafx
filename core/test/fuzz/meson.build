@@ -81,23 +81,43 @@ fuzz_cli_parse = executable('fuzz_cli_parse',
 # source directly — mirroring how `test_model` is wired upstream.
 # The libsvm static archive supplies `svm_load_model_from_string`
 # called from the embedded SV-block parser.
+fuzz_json_model_sources = [
+    'fuzz_json_model.c',
+    '../../src/read_json_model.c',
+    '../../src/pdjson.c',
+    # dict.c became dict.cpp in the C++23 rewrite (#1054). It stays listed
+    # here rather than relying on link_with so the parser under test is
+    # compiled with libFuzzer coverage instrumentation like its siblings.
+    '../../src/dict.cpp',
+    json_model_c_sources,
+]
+fuzz_json_model_objects = [libsvm_static_lib.extract_all_objects(recursive: true)]
+if get_option('default_library') == 'shared'
+    fuzz_json_model_sources += ['../../src/compat/path_utf8.c']
+    fuzz_json_model_objects += [
+        log_cpp23_test_objects,
+        predict_c_lib.extract_objects(src_dir + 'model_lifetime.c', src_dir + 'predict.c'),
+        platform_specific_cpu_objects,
+        libvmaf_feature_static_lib.extract_all_objects(recursive: true),
+        libvmaf_cpu_static_lib.extract_all_objects(recursive: true),
+        libvmafx.extract_objects(
+            src_dir + 'model.c',
+            src_dir + 'ref.cpp',
+            src_dir + 'thread_locale.cpp',
+            src_dir + 'vmafx/sha256.c',
+        ),
+    ]
+endif
+
 fuzz_json_model = executable('fuzz_json_model',
-    ['fuzz_json_model.c',
-     '../../src/read_json_model.c',
-     '../../src/pdjson.c',
-     # dict.c became dict.cpp in the C++23 rewrite (#1054). It stays listed
-     # here rather than relying on link_with so the parser under test is
-     # compiled with libFuzzer coverage instrumentation like its siblings.
-     '../../src/dict.cpp',
-     '../../src/log.c',
-     json_model_c_sources],
+    fuzz_json_model_sources,
     include_directories : [libvmaf_inc, test_inc, include_directories('../../src')],
     link_with : vmaf_test_link,
     c_args : fuzz_flags + compat_cflags,
     cpp_args : fuzz_flags,
     link_args : fuzz_flags,
     dependencies : [pthread_dependency, thread_lib, gpu_all_deps],
-    objects : libsvm_static_lib.extract_all_objects(recursive: true),
+    objects : fuzz_json_model_objects,
 )
 
 # fuzz_dnn_sidecar — wraps the tiny-AI sidecar loader
@@ -113,9 +133,12 @@ fuzz_json_model = executable('fuzz_json_model',
 fuzz_dnn_sidecar = executable('fuzz_dnn_sidecar',
     ['fuzz_dnn_sidecar.c',
      '../../src/dnn/model_loader.c',
+     '../../src/dnn/signer_identity.c',
      '../../src/dnn/onnx_scan.c',
      '../../src/dnn/op_allowlist.c',
      '../../src/compat/path_utf8.c'],
+    objects : log_cpp23_test_objects,
+    link_with : pdjson_default_impl,
     include_directories : [libvmaf_inc, test_inc, include_directories('../../src'),
                            include_directories('../../src/dnn')],
     c_args : fuzz_flags + dnn_defines,

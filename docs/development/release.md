@@ -793,15 +793,20 @@ repo or in CI secrets.
 
 The OIDC identity is the workflow path inside the repo. The release blobs
 and MCP wheel come from `supply-chain.yml`; the container images come from
-`docker-publish-production.yml`.
+`docker-publish-production.yml`. For the private bundle copy, use a base
+directory you own whose path other users cannot rename or write to.
 
 ```bash
 # The release tag to verify. v1.0.0-rc.1 and v1.0.0-rc.2 use the
 # slsa-verifier recipe further down.
 tag=v0.1.0
 
-# Release blob. Every vmaf/libvmaf.so*/libvmafx.so* asset has a matching FILE.bundle.
-cosign verify-blob --bundle vmaf.bundle vmaf \
+# Release blob. Every vmaf/libvmaf.so*/libvmafx.so* asset has a matching
+# FILE.bundle. Copy it once into a private directory from mktemp -d.
+work=$(mktemp -d "${XDG_RUNTIME_DIR:-$HOME}/vmafx-verify.XXXXXX") || exit 1
+trap 'rm -rf "$work"' EXIT
+cp vmaf.bundle "$work/vmaf.bundle"
+cosign verify-blob --bundle "$work/vmaf.bundle" vmaf \
   --certificate-identity \
     "https://github.com/vidiko/vmafx/.github/workflows/supply-chain.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
@@ -835,8 +840,16 @@ cosign verify ghcr.io/vidiko/vmafx@sha256:DIGEST \
     "https://github.com/vidiko/vmafx/.github/workflows/docker-publish-production.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-# Container image, GitHub-native attestation route (added by ADR-0902).
-gh attestation verify oci://ghcr.io/vidiko/vmafx@sha256:DIGEST --repo vidiko/vmafx
+# Container image, GitHub-native attestation route (added by ADR-0902). Pin the
+# production signer and the release tag: other workflows in the repository
+# (for example docker-publish-tester.yml) attest image digests too.
+gh attestation verify oci://ghcr.io/vidiko/vmafx@sha256:DIGEST --repo vidiko/vmafx \
+  --signer-workflow vidiko/vmafx/.github/workflows/docker-publish-production.yml \
+  --source-ref "refs/tags/${tag}"
+
+# A recovery dispatch (ADR-1347) signs from the default branch: for an image it
+# rebuilt, use refs/heads/master in place of refs/tags/${tag} in both container
+# commands above.
 
 # Go server/operator/node images use their own workflow identity.
 cosign verify ghcr.io/vidiko/vmafx-node@sha256:DIGEST \
@@ -848,6 +861,63 @@ cosign verify ghcr.io/vidiko/vmafx-node@sha256:DIGEST \
 `supply-chain.yml` runs the provenance recipe above against the attached bundle
 for every subject before the bundle can reach the release, so a release whose
 provenance does not verify is never published.
+
+#### Check the signer’s owner ID
+
+Certificate identity alone names the `vidiko` login; it does not bind the
+numeric owner ID. For a GitHub build-provenance attestation, verify its signer
+and source ref as in the recipe above, and check the owner identifier too:
+
+```bash
+set -o pipefail
+gh attestation verify vmaf --repo vidiko/vmafx \
+  --signer-workflow vidiko/vmafx/.github/workflows/supply-chain.yml \
+  --source-ref "refs/tags/${tag}" --format json \
+  | jq -e 'length > 0 and all(.[]; .verificationResult.signature.certificate.sourceRepositoryOwnerIdentifier == "340303765")'
+```
+
+For release blobs from v1.0.0-rc.3 or earlier, the certificate names the
+original organisation instead of `vidiko`. In `--certificate-identity`, `--repo`
+and `--signer-workflow`, replace `vidiko` with the organisation name in the
+[recorded rc.3 certificate](../research/2985-signer-owner-id-binding.md#findings),
+and use `288567244` in both the attestation and blob certificate owner checks.
+
+This checks the attestation certificate, not the separate cosign blob signature.
+For a cosign bundle (`<artifact>.bundle`), read the owner ID from the bundle's
+signing certificate after `cosign verify-blob` passes. The command needs `jq`
+and Python 3 with `pyasn1` and `pyasn1-modules`. It checks Fulcio extension
+`1.3.6.1.4.1.57264.1.17` (source repository owner identifier). Run it in the
+same shell so `jq` reads the copy
+in `$work`:
+
+```bash
+set -o pipefail
+if jq -er '.verificationMaterial.certificate.rawBytes' "$work/vmaf.bundle" | python3 -c '
+import base64, sys
+from pyasn1.codec.der.decoder import decode
+from pyasn1.type.char import UTF8String
+from pyasn1_modules.rfc5280 import Certificate
+
+der = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+cert, rest = decode(der, asn1Spec=Certificate())
+owners = [ext["extnValue"].asOctets() for ext in cert["tbsCertificate"]["extensions"]
+          if str(ext["extnID"]) == "1.3.6.1.4.1.57264.1.17"]
+if rest or len(owners) != 1:
+    sys.exit(1)
+owner, rest = decode(owners[0], asn1Spec=UTF8String())
+sys.exit(bool(rest) or str(owner) != "340303765")
+'; then
+  echo "owner ID OK"
+else
+  echo "owner ID mismatch" >&2
+  false
+fi
+```
+
+The command exits with a nonzero status via `false` on a mismatch.
+
+For tiny-model bundles, libvmaf runs this check itself before verification
+([ADR-2985](../adr/2985-signer-owner-id-binding.md)).
 
 ### Build provenance on release assets
 

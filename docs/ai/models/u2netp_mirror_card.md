@@ -165,14 +165,17 @@ The operator-facing fetch and verification recipe lives at
    ```bash
    cosign verify-blob \
      --bundle u2netp_mirror_v1.onnx.bundle \
-     --certificate-identity-regexp '^https://github\.com/vidiko/vmafx' \
+     --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
      u2netp_mirror_v1.onnx
    ```
 
 !!! warning
     The verify-blob step is mandatory before the binary is loaded by any
-    production pipeline.
+    production pipeline. It does not check the signer's owner ID. Also run
+    the owner-ID check in
+    [step 5 of the mirror guide](../u2netp-mirror.md#5-how-to-verify-the-signature)
+    before loading the model.
 
 ## 9. Release / promotion follow-ups
 

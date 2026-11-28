@@ -139,30 +139,85 @@ Release artifacts, including models under `model/tiny/`, are signed by
 [`.github/workflows/supply-chain.yml`](../../.github/workflows/supply-chain.yml)
 with Sigstore's keyless flow. The workflow produces a single Sigstore bundle per
 artifact (signature, certificate and Rekor entry in one file), not the legacy
-split `.sig` and `.pem` pair. The registry names a model's bundle
-`<name>.onnx.sigstore.json`, see [model-registry.md](model-registry.md).
+split `.sig` and `.pem` pair. The registry's `sigstore_bundle` must equal the
+ONNX file name plus `.sigstore.json`, including case and without a directory
+component. See [model-registry.md](model-registry.md).
 
-To verify a model by hand before loading it:
+To verify a model by hand before loading it, copy the bundle once into a
+private directory. Use a base directory you own whose path other users cannot
+rename or write to.
 
 ```bash
+work=$(mktemp -d "${XDG_RUNTIME_DIR:-$HOME}/vmafx-verify.XXXXXX") || exit 1
+trap 'rm -rf "$work"' EXIT
+cp model/tiny/vmaf_tiny_v2.onnx.sigstore.json "$work/bundle.json"
 cosign verify-blob \
-    --certificate-identity-regexp "https://github.com/vidiko/vmafx/.github/workflows/supply-chain.yml@.*" \
+    --certificate-identity-regexp '^https://github\.com/vidiko/vmafx/\.github/workflows/supply-chain\.yml@refs/(heads/master|tags/v[0-9][0-9A-Za-z.+-]*)$' \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    --bundle model/tiny/vmaf_tiny_v2.onnx.sigstore.json \
+    --bundle "$work/bundle.json" \
     model/tiny/vmaf_tiny_v2.onnx
 ```
 
-The `--tiny-model-verify` flag does the same at load time
-(T6-9, [ADR-0211](../adr/0211-model-registry-sigstore.md)):
+The expression is anchored at both ends (`^` and `$`): cosign searches the
+certificate's identity for it, so an unanchored pattern also accepts an
+identity with anything before or after it.
 
-- It invokes `cosign verify-blob` through `posix_spawnp(3p)` and fails closed
-  when the signature is missing or bad.
+The identity includes the organisation's login, `vidiko`. The certificate's
+numeric owner ID, `340303765`, binds the certificate to the organisation even
+if GitHub reassigns the login. After `cosign verify-blob` succeeds, check that
+ID in the same bundle's signing certificate with `jq` and Python 3. The
+recipe uses `pyasn1` and `pyasn1-modules`, as in the
+[release guide](../development/release.md#check-the-signers-owner-id). Run it
+in the same shell so `jq` reads the same `"$work/bundle.json"` copy.
+
+```bash
+set -o pipefail
+if jq -er '.verificationMaterial.certificate.rawBytes' "$work/bundle.json" | python3 -c '
+import base64, sys
+from pyasn1.codec.der.decoder import decode
+from pyasn1.type.char import UTF8String
+from pyasn1_modules.rfc5280 import Certificate
+
+der = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+cert, rest = decode(der, asn1Spec=Certificate())
+owners = [ext["extnValue"].asOctets() for ext in cert["tbsCertificate"]["extensions"]
+          if str(ext["extnID"]) == "1.3.6.1.4.1.57264.1.17"]
+if rest or len(owners) != 1:
+    sys.exit(1)
+owner, rest = decode(owners[0], asn1Spec=UTF8String())
+sys.exit(bool(rest) or str(owner) != "340303765")
+'; then
+  echo "owner ID OK"
+else
+  echo "owner ID mismatch" >&2
+  false
+fi
+```
+
+Load the model only after both commands succeed.
+
+The `--tiny-model-verify` flag does all of this at load time
+(T6-9, [ADR-0211](../adr/0211-model-registry-sigstore.md);
+[ADR-2985](../adr/2985-signer-owner-id-binding.md)):
+
+- It reads the bundle once and refuses it unless it holds exactly one
+  v0.3 certificate, whose identity matches the expression above and whose owner
+  ID is `340303765`; the owner before the move, `288567244`, is refused. It
+  then invokes `cosign verify-blob` through
+  `posix_spawnp(3p)` on a private copy of the bytes it checked in a mode 0700
+  temporary directory, with the same
+  anchored expression, and fails closed when the signature is missing or bad.
+  A certificate of any other identity or owner is refused like a bad
+  signature (`-EPROTO`). `TMPDIR` must be absolute and name a directory. It is
+  resolved with `realpath(3)`, and every directory from `/` down to it must be
+  owned by root or the current user; a group- or other-writable one must have
+  the sticky bit.
 - It is off by default for dev-friendliness and strongly recommended in
   production.
 - It drives `vmaf_dnn_verify_signature()` in
-  [`core/include/libvmaf/dnn.h`](../../core/include/libvmaf/dnn.h), which looks
-  up the model's `sigstore_bundle` field in
-  [`model/tiny/registry.json`](../../model/tiny/registry.json).
+  [`core/include/libvmaf/dnn.h`](../../core/include/libvmaf/dnn.h), which derives
+  the bundle path from the caller's ONNX file name and the registry directory.
+  A different `sigstore_bundle` value returns `-EINVAL` before cosign runs.
 
 ## Reporting
 
