@@ -130,11 +130,18 @@
       "matchManagers": [
         "github-actions"
       ],
+      "matchDatasources": [
+        "github-tags",
+        "github-digest"
+      ],
       "matchPackageNames": [
         "ossf/scorecard-action"
       ],
       "groupName": "OpenSSF Scorecard action (gate identity)",
-      "automerge": false
+      "automerge": false,
+      "addLabels": [
+        "hold"
+      ]
     },
     {
       "description": "Group pre-commit hook rev bumps; auto-merge — mechanical, lint catches drift.",

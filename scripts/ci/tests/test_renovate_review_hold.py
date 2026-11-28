@@ -41,6 +41,7 @@ REQUIRED_HOLD_RULES = {
     "GitHub Actions (major)",
     "Go deps (major)",
     "Intel NEO compute stack (matched set)",
+    "OpenSSF Scorecard action (gate identity)",
     "Python (minor)",
     "ROCm (hip runtime)",
     "Renovate self-hosted action",
@@ -162,25 +163,41 @@ def covers(k: Rule, r: Rule) -> bool:
     )
 
 
-def settled(rules: list[Rule], j: int, reviewed: Rule) -> bool:
-    """A still later enabled review rule covers the whole reviewed set."""
-    return any(
-        rule.get("enabled") is not False
-        and rule.get("automerge") is False
-        and covers(rule, reviewed)
-        for rule in rules[j + 1 :]
-    )
+State = tuple[bool, bool]
 
 
-def leaks(rules: list[Rule], i: int) -> bool:
-    """A later automerge rule can win without a covering review rule after it."""
-    return any(
-        rule.get("automerge") is True
-        and rule.get("enabled") is not False
-        and co_match(rules[i], rule)
-        and not settled(rules, j, rules[i])
-        for j, rule in enumerate(rules[i + 1 :], start=i + 1)
-    )
+def initial_state(config: Rule) -> State:
+    return config.get("enabled") is not False, config.get("automerge") is True
+
+
+def apply_rule(state: State, rule: Rule) -> State:
+    enabled, automerge = state
+    if isinstance(rule.get("enabled"), bool):
+        enabled = rule["enabled"]
+    if isinstance(rule.get("automerge"), bool):
+        automerge = rule["automerge"]
+    return enabled, automerge
+
+
+def outcomes(rules: list[Rule], i: int, initial: State = (True, False)) -> set[State]:
+    """Trace reachable (enabled, automerge) states across matching rules in order."""
+    target = rules[i]
+    states = {initial}
+    for k, other in enumerate(rules):
+        if k == i or covers(other, target):
+            states = {apply_rule(state, other) for state in states}
+        elif co_match(target, other):
+            states = states | {apply_rule(state, other) for state in states}
+    return states
+
+
+def is_active(states: set[State]) -> bool:
+    return any(enabled for enabled, _ in states)
+
+
+def leaks(rules: list[Rule], i: int, initial: State = (True, False)) -> bool:
+    """An enabled automerged state remains reachable after all matching rules."""
+    return (True, True) in outcomes(rules, i, initial)
 
 
 def name(rule: Rule, index: int) -> str:
@@ -188,7 +205,7 @@ def name(rule: Rule, index: int) -> str:
     return str(rule.get("groupName", rule.get("description", index)))
 
 
-def rule_findings(rules: list[Rule], i: int) -> list[str]:
+def rule_findings(rules: list[Rule], i: int, initial: State = (True, False)) -> list[str]:
     rule = rules[i]
     label = name(rule, i)
     reviewed = rule.get("automerge") is False
@@ -203,10 +220,9 @@ def rule_findings(rules: list[Rule], i: int) -> list[str]:
     held = added or HOLD in rule.get("labels", [])
     if held and not reviewed:
         errors.append(f"hold outside a reviewed rule: {label}")
-    if rule.get("enabled") is False:
-        return errors
-    leaking = leaks(rules, i)
-    if reviewed and not leaking and not added:
+    states = outcomes(rules, i, initial)
+    leaking = (True, True) in states
+    if reviewed and (True, False) in states and not leaking and not added:
         errors.append(f"reviewed rule {label} lacks addLabels hold")
     if held and leaking:
         errors.append(f"hold on {label} reaches an automerged update")
@@ -217,20 +233,23 @@ def policy_findings(config: Rule) -> list[str]:
     errors = [
         f"hold in top-level {key}" for key in ("labels", "addLabels") if HOLD in config.get(key, [])
     ]
+    initial = initial_state(config)
     rules = config["packageRules"]
     for i in range(len(rules)):
-        errors.extend(rule_findings(rules, i))
+        errors.extend(rule_findings(rules, i, initial))
     return errors
 
 
 def findings(config: Rule) -> list[str]:
     """Check label policy and the repository's inventory of reviewed rules carrying hold."""
+    initial = initial_state(config)
+    rules = config["packageRules"]
     held = {
         name(rule, i)
-        for i, rule in enumerate(config["packageRules"])
-        if rule.get("enabled") is not False
-        and rule.get("automerge") is False
+        for i, rule in enumerate(rules)
+        if rule.get("automerge") is False
         and HOLD in rule.get("addLabels", [])
+        and is_active(outcomes(rules, i, initial))
     }
     errors = policy_findings(config)
     errors.extend(
@@ -243,12 +262,13 @@ def findings(config: Rule) -> list[str]:
 
 
 def leak_exempt(config: dict[str, Any]) -> list[str]:
-    """Name enabled reviewed rules where adding hold would reach automerge."""
+    """Name active reviewed rules where adding hold would reach automerge."""
+    initial = initial_state(config)
     rules = config["packageRules"]
     return [
         name(rule, i)
         for i, rule in enumerate(rules)
-        if rule.get("enabled") is not False and rule.get("automerge") is False and leaks(rules, i)
+        if rule.get("automerge") is False and leaks(rules, i, initial)
     ]
 
 
@@ -302,9 +322,41 @@ class ReviewedRulesCarryHold(unittest.TestCase):
         )
 
     def test_regex_negated_range_overlaps_literal(self) -> None:
-        for left, right in (("/^foo[^A-Z]$/", "foob"), ("foob", "/^foo[^A-Z]$/")):
-            with self.subTest(left=left):
+        for left, right in (
+            ("/^foo[^A-Z]$/", "foob"),
+            ("foob", "/^foo[^A-Z]$/"),
+            ("/^fo[^O]$/", "foo"),
+            ("foo", "/^fo[^O]$/"),
+            ("/^fo[^O]$/", "FOO"),
+            ("FOO", "/^fo[^O]$/"),
+        ):
+            with self.subTest(left=left, right=right):
                 self.assertTrue(pair_overlap(left, right))
+        for package in ("foo", "FOO"):
+            with self.subTest(package=package):
+                rules: list[Rule] = [
+                    {
+                        "matchManagers": ["npm"],
+                        "matchDatasources": ["npm"],
+                        "matchPackageNames": ["/^fo[^O]$/"],
+                        "automerge": False,
+                        "addLabels": [HOLD],
+                    },
+                    {
+                        "matchManagers": ["npm"],
+                        "matchDatasources": ["npm"],
+                        "matchPackageNames": [package],
+                        "automerge": True,
+                    },
+                ]
+                self.assertEqual(
+                    policy_findings({"packageRules": rules}),
+                    ["hold on 0 reaches an automerged update"],
+                )
+                config = copy.deepcopy(self.config)
+                index = len(config["packageRules"])
+                config["packageRules"].extend(rules)
+                self.assertIn(f"hold on {index} reaches an automerged update", findings(config))
 
     def test_unknown_selectors_name_the_rule_and_key(self) -> None:
         for label, key in (
@@ -329,6 +381,22 @@ class ReviewedRulesCarryHold(unittest.TestCase):
         rule = next(r for r in config["packageRules"] if r.get("groupName") == label)
         rule["labels"] = [HOLD]
         self.assertIn(f"hold outside a reviewed rule: {label}", findings(config))
+
+    def test_pre_commit_labels_hold_and_reviewed_labels_only_fail(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["packageRules"].append({"matchManagers": ["pre-commit"], "labels": [HOLD]})
+        index = len(config["packageRules"]) - 1
+        self.assertIn(f"hold outside a reviewed rule: {index}", findings(config))
+
+        reviewed_config = copy.deepcopy(self.config)
+        rule = next(
+            r for r in reviewed_config["packageRules"] if r.get("groupName") == "CI Node.js"
+        )
+        rule.pop("addLabels", None)
+        rule["labels"] = [HOLD]
+        errors = findings(reviewed_config)
+        self.assertIn("reviewed rule CI Node.js lacks addLabels hold", errors)
+        self.assertIn("missing reviewed hold rule: CI Node.js", errors)
 
     def test_bump_overlaps_version_update_types(self) -> None:
         bump = {"matchUpdateTypes": ["bump"]}
@@ -442,18 +510,61 @@ class ReviewedRulesCarryHold(unittest.TestCase):
         self.assertFalse(covers(reviewed, {"matchPackageNames": ["/^foo/"]}))
         self.assertTrue(covers({"matchPackageNames": ["/^(foo|bar)$/i"]}, reviewed))
 
-    def test_disabled_rules_do_not_affect_findings_or_settle_leaks(self) -> None:
-        rules = [
+    def test_enabled_trace_follows_matching_rules_in_order(self) -> None:
+        stay_disabled: list[Rule] = [
+            {
+                "matchManagers": ["npm"],
+                "matchDatasources": ["npm"],
+                "matchPackageNames": ["foo"],
+                "enabled": False,
+                "automerge": False,
+                "addLabels": [HOLD],
+            },
+            {
+                "matchManagers": ["npm"],
+                "matchDatasources": ["npm"],
+                "matchPackageNames": ["foo"],
+                "automerge": True,
+            },
+        ]
+        reenabled = copy.deepcopy(stay_disabled)
+        reenabled[1]["enabled"] = True
+        self.assertTrue(leaks(reenabled, 0))
+        self.assertEqual(
+            policy_findings({"packageRules": reenabled}),
+            ["hold on 0 reaches an automerged update"],
+        )
+        config = copy.deepcopy(self.config)
+        index = len(config["packageRules"])
+        config["packageRules"].extend(copy.deepcopy(reenabled))
+        self.assertIn(f"hold on {index} reaches an automerged update", findings(config))
+
+        self.assertFalse(leaks(stay_disabled, 0))
+        self.assertEqual(policy_findings({"packageRules": stay_disabled}), [])
+        config["packageRules"][-1].pop("enabled")
+        self.assertEqual(findings(config), [])
+
+    def test_later_disabled_or_reenabled_rules_control_settlement(self) -> None:
+        rules: list[Rule] = [
             {"matchPackageNames": ["foo"], "automerge": False, "addLabels": [HOLD]},
             {"matchPackageNames": ["foo"], "automerge": True, "enabled": False},
         ]
+        self.assertFalse(leaks(rules, 0))
         self.assertEqual(policy_findings({"packageRules": rules}), [])
-        rules[1].pop("enabled")
-        rules.append({"matchPackageNames": ["foo"], "automerge": False, "enabled": False})
+        rules.append({"matchPackageNames": ["foo"], "enabled": True})
         self.assertTrue(leaks(rules, 0))
         self.assertEqual(
             policy_findings({"packageRules": rules}), ["hold on 0 reaches an automerged update"]
         )
+        rules.append({"matchPackageNames": ["foo"], "automerge": False, "enabled": False})
+        self.assertFalse(leaks(rules, 0))
+        self.assertEqual(policy_findings({"packageRules": rules}), [])
+
+        disabled_required = copy.deepcopy(self.config)
+        disabled_required["packageRules"].append(
+            {"matchManagers": ["custom.regex"], "matchDepNames": ["node"], "enabled": False}
+        )
+        self.assertIn("missing reviewed hold rule: CI Node.js", findings(disabled_required))
 
     def test_disjoint_file_names_still_co_match(self) -> None:
         rules: list[Rule] = [

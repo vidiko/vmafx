@@ -256,14 +256,16 @@ override `automerge`, while
 Putting `hold` on that catch-all would therefore block those automerged updates.
 
 [`test_renovate_review_hold.py`](../../scripts/ci/tests/test_renovate_review_hold.py)
-checks that every named review group or ungrouped review rule is present and
-carries its own `addLabels: ["hold"]`. It checks both `labels` and `addLabels`
-for misplaced holds and flags a hold that can reach an automerged update.
+checks that every active named review group or ungrouped review rule is present
+and carries its own `addLabels: ["hold"]`. It traces `enabled` and `automerge`
+across matching rules in order, checks both `labels` and `addLabels` for
+misplaced holds, and flags a hold that can reach an enabled automerged update.
 When a review or automerge rule introduces a selector the test cannot model,
 the diagnostic names the rule and selector. Only the catch-all rule is exempt.
 
-The numpy rule names its PyPI managers and datasource so the hold test can prove
-it disjoint from the Go, Cargo and Docker automerge rules.
+The numpy rule names its PyPI managers and datasource, and the OpenSSF Scorecard
+action rule names its GitHub tag and digest datasources, so the hold test can
+prove them disjoint from the Go, Cargo and Docker automerge rules.
 
 ```sh
 python3 -m unittest discover -s scripts/ci/tests -p 'test_renovate_review_hold.py'
