@@ -54,8 +54,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/VMAFx/vmafx/pkg/tune/predictor"
-	"github.com/VMAFx/vmafx/pkg/tune/pyjson"
+	"github.com/VMAFx/vmafx/pkg/predictor"
+	"github.com/VMAFx/vmafx/pkg/pyjson"
 )
 
 // SchemaVersion is the on-disk state schema. Bump on every
@@ -594,8 +594,20 @@ func (p *Predictor) RecordCapture(
 	if c == "" {
 		c = p.Codec
 	}
-	predicted := p.Base.PredictVMAF(f, crf, c)
-	if err := p.Model.Update(f, observedVMAF, predicted, crf); err != nil {
+	baseline := p.Base.PredictVMAF(f, crf, c)
+	return p.RecordCaptureWithBaseline(f, crf, observedVMAF, baseline, persist)
+}
+
+// RecordCaptureWithBaseline folds one observed VMAF into the sidecar fit using
+// the caller's bare-predictor baseline for the same features, CRF, and codec.
+// It persists the fit when persist is true.
+func (p *Predictor) RecordCaptureWithBaseline(
+	f predictor.ShotFeatures,
+	crf int,
+	observedVMAF, baselineVMAF float64,
+	persist bool,
+) error {
+	if err := p.Model.Update(f, observedVMAF, baselineVMAF, crf); err != nil {
 		return err
 	}
 	if persist {

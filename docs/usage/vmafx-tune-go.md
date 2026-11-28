@@ -1326,9 +1326,10 @@ vmafx-tune-go sidecar record \
 
 The residual is computed against the bare predictor, never against the
 sidecar-corrected value, so repeated captures converge rather than compounding.
+Each capture uses one bare prediction for both the fit update and the output.
 The payload (schema `vmaf-tune-sidecar-record/v1`) is the `status` payload plus
-`crf`, `observed_vmaf`, `base_vmaf` and `residual`
-(`observed_vmaf - base_vmaf`); the text form is
+`crf`, `observed_vmaf`, `base_vmaf` and `residual` (`observed_vmaf - base_vmaf`).
+The text form is
 `recorded updates=<n> residual=<r> state=<path>`.
 
 ### sidecar batch-record
@@ -1735,7 +1736,6 @@ CLI. Each package has one implementation (ADR-1137).
 | `pkg/tune/auto/` | The Phase F decision tree: source probing, the ten short-circuit predicates, the recipe table, the confidence policy, winner selection and the plan emitter. |
 | `pkg/tune/sidecar/` | The online-ridge bias-correction model (Sherman–Morrison rank-1 updates) and its cache-dir persistence. The port briefly produced a second implementation (`pkg/sidecar/`); it was removed because nothing imported it. |
 | `pkg/tune/executor/` | `--execute` mode: the libvmaf CLI driver and the JSONL results log. Its ffmpeg argv is `pkg/ffencode`'s under the executor's name. |
-| `pkg/tune/{predictor,codec,pyjson}/` | Thin aliases of `pkg/predictor`, `pkg/codecadapter` and `pkg/pyjson`. The `sidecar` subcommand and `pkg/tune/sidecar` still import them; do not add code to them. |
 
 ADR-1125 records which consumer owns which copy of the shared layers. For the
 migration rationale see [ADR-0705](../adr/0705-vmafx-tune-go-stage1.md),
@@ -1766,7 +1766,7 @@ The Go port landed in stages. Every row below is merged unless noted.
 | golusoris | Migrate the CLI root and subcommands onto the golusoris `clikit` (cobra + fx) framework; `VMAFX_`-prefixed config and injected `slog` | ADR-1119 |
 | ML-driven | `recommend`, `predict`, `recommend-saliency`, `prefilter`; codec-adapter registry, encode and score drivers, predictor, saliency pipeline, native TPE | — |
 | Encoder introspection | `benchmark` and `encode-profile`; `pkg/benchmark`, `pkg/codecadapter`, `pkg/encodeprofile`, `pkg/pyjson` | ADR-0643 (profile contract) |
-| Stage 5 (corpus, auto, sidecar) | `corpus`, `auto` and `sidecar`; `pkg/codecadapter`, `pkg/corpus`, `pkg/pyjson`, `pkg/tune/predictor`, `pkg/tune/sidecar`, `pkg/tune/auto`, `pkg/tune/executor` | ADR-1125 ([#1153](https://github.com/vidiko/vmafx/pull/1153)) |
+| Stage 5 (corpus, auto, sidecar) | `corpus`, `auto` and `sidecar`; `pkg/codecadapter`, `pkg/corpus`, `pkg/pyjson`, `pkg/predictor`, `pkg/tune/sidecar`, `pkg/tune/auto`, `pkg/tune/executor` | ADR-1125 ([#1153](https://github.com/vidiko/vmafx/pull/1153)) |
 | Stage 5 (per-shot) | `tune-per-shot`; `pkg/pershot`, `pkg/scorebackend`, the codec-adapter table, the raw-YUV scorer | ADR-1124 |
 | Stage 5b | `conformal` CLI wiring, shipped as `predict --with-uncertainty` and `recommend --with-uncertainty` | ADR-0393 |
 | Stage 6 | `fast` subcommand, `pkg/fast`, `pkg/conformal`, `pkg/scorebackend`. The smoke path is complete; the production path is blocked on ONNX named inputs ([Production-mode blocker](#production-mode-blocker-onnx-named-inputs)). | ADR-0276 / ADR-0304 |
@@ -1779,10 +1779,31 @@ an ONNX Go binding.
 
 An earlier revision of the roadmap listed `pkg/conformal` as merged under
 Stage 3. It was not: no such package existed on `master`. The package landed
-with Stage 6, and the roadmap row was corrected. The `pkg/tune/{predictor,codec,
-pyjson}` aliases were first kept for the in-flight sidecar parity fix
-([#1187](https://github.com/vidiko/vmafx/pull/1187)); that fix has landed, and
-the aliases are still imported by the sidecar.
+with Stage 6, and the roadmap row was corrected.
+
+### Migrating from the transitional Go aliases
+
+The transitional alias packages (ADR-1137) stayed in place until the sidecar
+parity fix landed in [#1187](https://github.com/vidiko/vmafx/pull/1187). Import `pkg/predictor`, `pkg/codecadapter` and
+`pkg/pyjson` directly and update these calls.
+
+- Replace the old two-argument `New(path, log)` with
+  `predictor.NewWithModel(ctx, path, log)`. Pass a context that lives as long as
+  the predictor is in use. Pass `slog.Default()` where you previously passed
+  `nil`.
+- Replace the package-level `PickCRF(p, features, target, codec)` with
+  `p.PickCRF(features, target, codec)`.
+- Replace `Marshal(v, indent)` with
+  `pyjson.Marshal(v, pyjson.Options{SortKeys: true, Indent: strings.Repeat(" ", indent)})`
+  for positive indents. The old indent helper used `indent` spaces per nesting
+  level for positive values and selected compact output for `indent <= 0`.
+  Pass `Indent: ""` for zero and negative values. The new function returns
+  `([]byte, error)`. Use `string(out)` if you need the previous string result.
+- Replace `MustMarshal(v, indent)` with a call to `pyjson.Marshal` and handle
+  the returned error.
+- The names `predictor.ResolutionClass`, `pyjson.MarshalStrict`,
+  `pyjson.FormatFloat`, `pyjson.EncodeString`, `codecadapter.Get`,
+  `codecadapter.Known` and `codecadapter.Adapter` stay the same.
 
 ## See also
 

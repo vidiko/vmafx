@@ -6,6 +6,10 @@ Go port of vmaf-tune rate-quality tuning CLI. Installed as `vmafx-tune-go`
 during migration; see Stage roadmap in
 [ADR-0705](../../docs/adr/0705-vmafx-tune-go-stage1.md).
 
+See the [transitional Go alias removal
+notice](../../changelog.d/removed/1249-tune-alias-packages.md) for migration
+steps.
+
 ## Rebase-sensitive invariants
 
 1. **JSON schema compatibility** (`pkg/report/report.go`): JSON output of
@@ -269,9 +273,9 @@ during migration; see Stage roadmap in
     line length, cannot split on lone `\r`).
 27. **`vmafx-ort-runner` is repository artefact, not environment
     assumption** (`cmd/vmafx-ort-runner`, ADR-1134): `pkg/predictor.ORTSession`
-    (one ORT-session adapter since ADR-1137; `pkg/tune/predictor` = its
-    transitional alias) execs it through `pkg/ai.Registry.Infer`; dev
-    container plus Go CI job build it from `./cmd/...`, smoke-run
+    (one ORT-session adapter since ADR-1137) execs it through
+    `pkg/ai.Registry.Infer`; dev container plus Go CI job build it from
+    `./cmd/...`, smoke-run
     it against `model/predictor_libx264.onnx`. When `predict --model`
     degrades to analytical curve, log line carries runner's
     stderr — `exit status 3` means linked libvmaf has no ONNX Runtime,

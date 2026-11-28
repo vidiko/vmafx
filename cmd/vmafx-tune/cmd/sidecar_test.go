@@ -7,16 +7,22 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
-	"github.com/VMAFx/vmafx/pkg/tune/predictor"
+	"github.com/VMAFx/vmafx/internal/execstub"
+	"github.com/VMAFx/vmafx/pkg/predictor"
+	"github.com/VMAFx/vmafx/pkg/tune/sidecar"
 )
 
 const featuresJSON = `{
@@ -42,6 +48,37 @@ func writeFixture(t *testing.T, dir, name, content string) string {
 		t.Fatalf("write %s: %v", name, err)
 	}
 	return path
+}
+
+func TestBuildSidecarPredictorKeepsCommandContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake ONNX runner is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	t.Setenv("VMAFX_MODEL_DIR", dir)
+	t.Setenv("PATH", dir)
+	writeFixture(t, dir, "custom.onnx", "")
+	execstub.Write(t, filepath.Join(dir, "vmafx-ort-runner"), []byte("#!/bin/sh\necho '[81.5]'\n"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sp, err := buildSidecarPredictor(ctx, &sidecarCommonFlags{
+		codec: "libx264", model: "custom", cacheDir: t.TempDir(),
+	}, deps{})
+	if err != nil {
+		t.Fatalf("build predictor: %v", err)
+	}
+	session, ok := sp.Base.Session.(*predictor.ORTSession)
+	if !ok {
+		t.Fatalf("session = %T, want *predictor.ORTSession", sp.Base.Session)
+	}
+	if got, err := session.Infer([]float64{1}); err != nil || got != 81.5 {
+		t.Errorf("inference after setup = (%v, %v), want (81.5, nil)", got, err)
+	}
+	cancel()
+	if _, err := session.Infer([]float64{1}); !errors.Is(err, context.Canceled) {
+		t.Errorf("inference after command cancellation = %v, want context.Canceled", err)
+	}
 }
 
 // TestSidecarSubcommandTree pins the nested command names against the Python
@@ -193,6 +230,98 @@ func TestSidecarRecordThenPredict(t *testing.T) {
 	}
 }
 
+type sidecarRecordSession struct {
+	firstVMAF float64
+	firstErr  error
+	calls     int
+}
+
+// Infer returns the configured first result and fails on subsequent calls.
+func (s *sidecarRecordSession) Infer(_ []float64) (float64, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.firstVMAF, s.firstErr
+	}
+	return 0, errors.New("unexpected second inference")
+}
+
+// TestSidecarRecordUsesSingleBaseline checks the payload and the reloaded fit.
+func TestSidecarRecordUsesSingleBaseline(t *testing.T) {
+	const codec, crf = "libx264", 26
+	features := predictor.ShotFeatures{ProbeBitrateKbps: 20}
+	analytical := predictor.New().PredictAnalytical(features, crf, codec)
+	for _, tc := range []struct {
+		name     string
+		session  sidecarRecordSession
+		observed float64
+		wantBase float64
+	}{
+		{
+			name: "learned", session: sidecarRecordSession{firstVMAF: 81.5},
+			observed: 91.5, wantBase: 81.5,
+		},
+		{
+			name: "fallback", session: sidecarRecordSession{firstErr: context.Canceled},
+			observed: 0, wantBase: analytical,
+		},
+		{
+			name: "clamped zero residual", session: sidecarRecordSession{firstVMAF: 105},
+			observed: 100, wantBase: 100,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := tc.session
+			sp, err := sidecar.ForCodec(predictor.WithSession(&session), codec, sidecar.Config{
+				CacheDir: t.TempDir(), HostUUID: "test-host",
+			})
+			if err != nil {
+				t.Fatalf("build sidecar: %v", err)
+			}
+			flags := &sidecarRecordFlags{
+				codec: codec, jsonOut: true,
+				crf: crf, observedVMAF: tc.observed,
+			}
+			out := captureStdout(t, func() {
+				if err := recordSidecarCapture(sp, flags, features); err != nil {
+					t.Fatalf("record sidecar capture: %v", err)
+				}
+			})
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(out), &payload); err != nil {
+				t.Fatalf("decode record payload: %v", err)
+			}
+			wantResidual := tc.observed - tc.wantBase
+			if payload["base_vmaf"] != tc.wantBase || payload["residual"] != wantResidual {
+				t.Errorf("payload base/residual = %v/%v, want %v/%v",
+					payload["base_vmaf"], payload["residual"], tc.wantBase, wantResidual)
+			}
+			assertSidecarRecordState(t, sp, features, crf, sidecar.HistoryRow{
+				ObservedVMAF: tc.observed, PredictedVMAF: tc.wantBase, Residual: wantResidual,
+			})
+			if session.calls != 1 {
+				t.Errorf("inference calls = %d, want 1", session.calls)
+			}
+		})
+	}
+}
+
+func assertSidecarRecordState(
+	t *testing.T, sp *sidecar.Predictor, features predictor.ShotFeatures, crf int, row sidecar.HistoryRow,
+) {
+	t.Helper()
+	saved := sidecar.Load(sp.StatePath, sp.Model.Config)
+	if saved.NUpdates != 1 || !reflect.DeepEqual(saved.History, []sidecar.HistoryRow{row}) {
+		t.Errorf("saved updates/history = %d/%+v, want 1/%+v", saved.NUpdates, saved.History, row)
+	}
+	want := sidecar.NewModel(sp.Model.Config)
+	if err := want.Update(features, row.ObservedVMAF, row.PredictedVMAF, crf); err != nil {
+		t.Fatalf("compute ridge weights from payload baseline: %v", err)
+	}
+	if !reflect.DeepEqual(saved.Weights, want.Weights) {
+		t.Errorf("saved weights = %v, want %v", saved.Weights, want.Weights)
+	}
+}
+
 // TestSidecarNoPersist covers the tests-only flag: the fit updates in memory
 // but nothing reaches disk.
 func TestSidecarNoPersist(t *testing.T) {
@@ -307,6 +436,56 @@ func TestSidecarBatchRecordAllRowsBad(t *testing.T) {
 	statePath, _ := payload["state_path"].(string)
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Errorf("no good rows means nothing to persist; %s should not exist", statePath)
+	}
+}
+
+func TestSidecarBatchRecordReportsDiagnosticWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	captures := writeFixture(t, dir, "captures.jsonl", "not json\n")
+	stderr, err := os.Open(captures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStderr := os.Stderr
+	os.Stderr = stderr
+	t.Cleanup(func() { os.Stderr = originalStderr })
+
+	root := newRoot("dev")
+	root.Cobra().SetArgs([]string{
+		"sidecar", "batch-record", "--cache-dir", dir, "--captures-jsonl", captures,
+	})
+	root.Cobra().SetErr(io.Discard)
+	if err := root.Execute(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("batch-record = %v, want closed stderr error", err)
+	}
+}
+
+type cancelAfterSidecarDiagnostic struct {
+	cancel context.CancelFunc
+}
+
+func (w cancelAfterSidecarDiagnostic) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
+}
+
+func TestSidecarBatchRecordStopsBetweenRows(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sp := &sidecar.Predictor{
+		Base: predictor.New(), Model: sidecar.NewModel(sidecar.Config{}), Codec: "libx264",
+	}
+	goodRow := `{"crf": 24, "observed_vmaf": 94.25, "features": ` +
+		strings.ReplaceAll(featuresJSON, "\n", "") + "}"
+	rows, skipped, err := recordSidecarBatchRows(ctx, sp, []string{"not json", goodRow},
+		cancelAfterSidecarDiagnostic{cancel: cancel})
+	if !errors.Is(err, context.Canceled) || rows != 0 || skipped != 1 || sp.Model.NUpdates != 0 {
+		t.Errorf("batch recorded %d, skipped %d, updated %d, err %v, want 0, 1, 0, context.Canceled",
+			rows, skipped, sp.Model.NUpdates, err)
 	}
 }
 

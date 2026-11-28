@@ -25,128 +25,159 @@ func negZero() float64 {
 	return -z
 }
 
+var marshalPythonJSONCases = []struct {
+	name string
+	in   any
+	opts Options
+	want string
+}{
+	{
+		name: "nested value with indent=2 and sort_keys",
+		in: map[string]any{
+			"a": 1, "b": []any{1, 2}, "c": 93.0,
+			"d": map[string]any{"e": nil},
+		},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": 93.0," +
+			"\n  \"d\": {\n    \"e\": null\n  }\n}",
+	},
+	{
+		name: "non-finite floats use Python's tokens",
+		in:   map[string]any{"x": math.NaN(), "y": math.Inf(1), "z": -0.5},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"x\": NaN,\n  \"y\": Infinity,\n  \"z\": -0.5\n}",
+	},
+	{
+		name: "empty containers stay on one line",
+		in:   map[string]any{"empty_obj": map[string]any{}, "empty_arr": []any{}},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"empty_arr\": [],\n  \"empty_obj\": {}\n}",
+	},
+	{
+		name: "strings escape like ensure_ascii=True",
+		in:   map[string]any{"s": `a"b`, "u": "é"},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"s\": \"a\\\"b\",\n  \"u\": \"\\u00e9\"\n}",
+	},
+	{
+		name: "compact mode uses the default separators",
+		in:   map[string]any{"b": 1, "a": 2},
+		opts: Options{SortKeys: true},
+		want: `{"a": 2, "b": 1}`,
+	},
+	{
+		name: "arrays of objects nest correctly",
+		in: map[string]any{
+			"nested": []any{map[string]any{"k": 1.0}, map[string]any{"k": 2.5}},
+		},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"nested\": [\n    {\n      \"k\": 1.0\n    },\n" +
+			"    {\n      \"k\": 2.5\n    }\n  ]\n}",
+	},
+	{"empty object", map[string]any{}, Options{Indent: "  "}, "{}"},
+	{"empty array", []any{}, Options{Indent: "  "}, "[]"},
+	{"null", nil, Options{Indent: "  "}, "null"},
+	{"bool", true, Options{Indent: "  "}, "true"},
+	{"int", 7, Options{Indent: "  "}, "7"},
+	{"int64", int64(9007199254740993), Options{}, "9007199254740993"},
+	{"float gets dot zero", 92.0, Options{}, "92.0"},
+	{"string", "hi", Options{}, `"hi"`},
+	{
+		name: "keys are sorted by code point",
+		in:   map[string]any{"b": 1, "a": 2, "C": 3},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"C\": 3,\n  \"a\": 2,\n  \"b\": 1\n}",
+	},
+	{
+		name: "scalar list",
+		in:   []any{1, 2.5, "three", nil, true},
+		opts: Options{Indent: "  "},
+		want: "[\n  1,\n  2.5,\n  \"three\",\n  null,\n  true\n]",
+	},
+	{
+		name: "nested indentation",
+		in:   map[string]any{"outer": map[string]any{"inner": []any{1, 2}}},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"outer\": {\n    \"inner\": [\n      1,\n      2\n    ]\n  }\n}",
+	},
+	{
+		name: "compact form uses a comma-space separator",
+		in:   map[string]any{"a": 1, "b": []any{2, 3}},
+		opts: Options{SortKeys: true},
+		want: `{"a": 1, "b": [2, 3]}`,
+	},
+	{
+		name: "compact string map sorts keys",
+		in:   map[string]any{"b": 2, "a": 1},
+		opts: Options{SortKeys: true},
+		want: `{"a": 1, "b": 2}`,
+	},
+	{
+		name: "typed integer map compact",
+		in:   map[string]int{"b": 2, "a": 1},
+		opts: Options{SortKeys: true},
+		want: `{"a": 1, "b": 2}`,
+	},
+	{
+		name: "typed integer map indented",
+		in:   map[string]int{"b": 2, "a": 1},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"a\": 1,\n  \"b\": 2\n}",
+	},
+	{
+		name: "typed string map compact",
+		in:   map[string]string{"key": "val"},
+		opts: Options{SortKeys: true},
+		want: `{"key": "val"}`,
+	},
+	{
+		name: "typed string map indented",
+		in:   map[string]string{"key": "val"},
+		opts: Options{SortKeys: true, Indent: "  "},
+		want: "{\n  \"key\": \"val\"\n}",
+	},
+	{
+		name: "float slices keep repr spelling and the NaN token",
+		in:   map[string]any{"xs": []any{1.0, 0.5, math.NaN()}},
+		opts: Options{SortKeys: true},
+		want: `{"xs": [1.0, 0.5, NaN]}`,
+	},
+	{
+		name: "string and typed slices",
+		in: map[string]any{
+			"extra_params": []string{"-vf", "scale=640:480"},
+			"crfs":         []int{23, 28},
+			"hdr_forced":   false,
+		},
+		opts: Options{SortKeys: true},
+		want: `{"crfs": [23, 28], "extra_params": ["-vf", "scale=640:480"], "hdr_forced": false}`,
+	},
+	{
+		name: "json.Number integral",
+		in:   map[string]any{"crf": json.Number("23")},
+		opts: Options{Indent: "  "},
+		want: "{\n  \"crf\": 23\n}",
+	},
+	{
+		name: "json.Number fractional",
+		in:   map[string]any{"crf": json.Number("23.0")},
+		opts: Options{Indent: "  "},
+		want: "{\n  \"crf\": 23.0\n}",
+	},
+	{
+		name: "json.Number exponent normalises like CPython",
+		in:   map[string]any{"crf": json.Number("2.30e1")},
+		opts: Options{Indent: "  "},
+		want: "{\n  \"crf\": 23.0\n}",
+	},
+}
+
 // TestMarshalMatchesPythonJSONDumps pins the encoder against real json.dumps
 // output across the compact and indented forms.
 func TestMarshalMatchesPythonJSONDumps(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		in   any
-		opts Options
-		want string
-	}{
-		{
-			name: "nested value with indent=2 and sort_keys",
-			in: map[string]any{
-				"a": 1, "b": []any{1, 2}, "c": 93.0,
-				"d": map[string]any{"e": nil},
-			},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": 93.0," +
-				"\n  \"d\": {\n    \"e\": null\n  }\n}",
-		},
-		{
-			name: "non-finite floats use Python's tokens",
-			in:   map[string]any{"x": math.NaN(), "y": math.Inf(1), "z": -0.5},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"x\": NaN,\n  \"y\": Infinity,\n  \"z\": -0.5\n}",
-		},
-		{
-			name: "empty containers stay on one line",
-			in:   map[string]any{"empty_obj": map[string]any{}, "empty_arr": []any{}},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"empty_arr\": [],\n  \"empty_obj\": {}\n}",
-		},
-		{
-			name: "strings escape like ensure_ascii=True",
-			in:   map[string]any{"s": `a"b`, "u": "é"},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"s\": \"a\\\"b\",\n  \"u\": \"\\u00e9\"\n}",
-		},
-		{
-			name: "compact mode uses the default separators",
-			in:   map[string]any{"b": 1, "a": 2},
-			opts: Options{SortKeys: true},
-			want: `{"a": 2, "b": 1}`,
-		},
-		{
-			name: "arrays of objects nest correctly",
-			in: map[string]any{
-				"nested": []any{map[string]any{"k": 1.0}, map[string]any{"k": 2.5}},
-			},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"nested\": [\n    {\n      \"k\": 1.0\n    },\n" +
-				"    {\n      \"k\": 2.5\n    }\n  ]\n}",
-		},
-		{"empty object", map[string]any{}, Options{Indent: "  "}, "{}"},
-		{"empty array", []any{}, Options{Indent: "  "}, "[]"},
-		{"null", nil, Options{Indent: "  "}, "null"},
-		{"bool", true, Options{Indent: "  "}, "true"},
-		{"int", 7, Options{Indent: "  "}, "7"},
-		{"int64", int64(9007199254740993), Options{}, "9007199254740993"},
-		{"float gets dot zero", 92.0, Options{}, "92.0"},
-		{"string", "hi", Options{}, `"hi"`},
-		{
-			name: "keys are sorted by code point",
-			in:   map[string]any{"b": 1, "a": 2, "C": 3},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"C\": 3,\n  \"a\": 2,\n  \"b\": 1\n}",
-		},
-		{
-			name: "scalar list",
-			in:   []any{1, 2.5, "three", nil, true},
-			opts: Options{Indent: "  "},
-			want: "[\n  1,\n  2.5,\n  \"three\",\n  null,\n  true\n]",
-		},
-		{
-			name: "nested indentation",
-			in:   map[string]any{"outer": map[string]any{"inner": []any{1, 2}}},
-			opts: Options{SortKeys: true, Indent: "  "},
-			want: "{\n  \"outer\": {\n    \"inner\": [\n      1,\n      2\n    ]\n  }\n}",
-		},
-		{
-			name: "compact form uses a comma-space separator",
-			in:   map[string]any{"a": 1, "b": []any{2, 3}},
-			opts: Options{SortKeys: true},
-			want: `{"a": 1, "b": [2, 3]}`,
-		},
-		{
-			name: "float slices keep repr spelling and the NaN token",
-			in:   map[string]any{"xs": []any{1.0, 0.5, math.NaN()}},
-			opts: Options{SortKeys: true},
-			want: `{"xs": [1.0, 0.5, NaN]}`,
-		},
-		{
-			name: "string and typed slices",
-			in: map[string]any{
-				"extra_params": []string{"-vf", "scale=640:480"},
-				"crfs":         []int{23, 28},
-				"hdr_forced":   false,
-			},
-			opts: Options{SortKeys: true},
-			want: `{"crfs": [23, 28], "extra_params": ["-vf", "scale=640:480"], "hdr_forced": false}`,
-		},
-		{
-			name: "json.Number integral",
-			in:   map[string]any{"crf": json.Number("23")},
-			opts: Options{Indent: "  "},
-			want: "{\n  \"crf\": 23\n}",
-		},
-		{
-			name: "json.Number fractional",
-			in:   map[string]any{"crf": json.Number("23.0")},
-			opts: Options{Indent: "  "},
-			want: "{\n  \"crf\": 23.0\n}",
-		},
-		{
-			name: "json.Number exponent normalises like CPython",
-			in:   map[string]any{"crf": json.Number("2.30e1")},
-			opts: Options{Indent: "  "},
-			want: "{\n  \"crf\": 23.0\n}",
-		},
-	}
-	for _, tc := range tests {
+	for _, tc := range marshalPythonJSONCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got, err := Marshal(tc.in, tc.opts)
@@ -544,6 +575,11 @@ func TestMarshalSorted(t *testing.T) {
 		row  map[string]any
 		want string
 	}{
+		{
+			name: "single string member",
+			row:  map[string]any{"key": "val"},
+			want: `{"key": "val"}`,
+		},
 		{
 			name: "keys are sorted and floats use repr",
 			row:  map[string]any{"zebra": 1, "alpha": "a", "framerate": 24.0},

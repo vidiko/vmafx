@@ -7,9 +7,9 @@
 // The fixture was dumped from vmaftune.codec_adapters: every field the auto
 // planner reads (the quality window, the default, the probe knobs, the
 // two-pass flag, the preset vocabulary) plus the argv both adapter surfaces
-// emit at the default quality for every preset. It came across from the
-// pkg/tune/codec registry when that duplicate was folded into this package
-// (ADR-1137), so the metadata contract the planner depends on stays pinned.
+// emit at the default quality for every preset. The fixture moved here when
+// ADR-1137 consolidated the codec adapter registries, preserving the metadata
+// contract the planner depends on.
 
 package codecadapter
 
