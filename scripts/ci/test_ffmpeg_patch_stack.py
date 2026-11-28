@@ -366,6 +366,8 @@ class RealReplay(unittest.TestCase):
         self.upstream = self.root / "upstream"
         self.upstream.mkdir()
         self.git(self.upstream, "init", "-q")
+        # Fixture text blobs stay LF even when Windows write_text emits CRLF.
+        self.git(self.upstream, "config", "core.autocrlf", "true")
         (self.upstream / "sample").write_text("before\n")
         self.git(self.upstream, "add", "sample")
         self.git(self.upstream, "commit", "-qm", "base")
@@ -514,10 +516,19 @@ class RealReplay(unittest.TestCase):
 
     def tag_conflicting_release(self) -> None:
         """Create a stable release that changes the same line as the integration patch."""
+
         self.git(self.upstream, "switch", "--detach", "n9.0.1")
         (self.upstream / "sample").write_text("incompatible upstream\n")
         self.git(self.upstream, "commit", "-qam", "release")
         self.git(self.upstream, "tag", "n9.1")
+
+    def test_artifact_scan_refuses_incomplete_pins_without_changing_worktree(self) -> None:
+        before = self.contents()
+        with patch.dict(os.environ, {"FFMPEG_FIX_SERIES_VERIFY": "cosign"}):
+            with self.assertRaisesRegex(ValueError, "requires all shared-series pins"):
+                STACK.maintain(self.repo, self.output, False, True, artifact_only=True)
+        self.assertEqual(self.contents(), before)
+        self.assertFalse((self.output / "proposed-refresh.patch").exists())
 
     def test_conflicting_release_preserves_every_input(self) -> None:
         self.tag_conflicting_release()
@@ -565,6 +576,7 @@ class RealReplay(unittest.TestCase):
         self.assertEqual(receipt["status"], "failed")
         self.assertEqual(receipt["error"], str(raised.exception))
         self.assertNotIn("cleanup_error", receipt)
+        self.assertFalse((self.output / "proposed-refresh.patch").exists())
         self.assertEqual(self.contents(), before)
 
     def test_receipt_write_error_preserves_replay_error(self) -> None:
@@ -1190,6 +1202,14 @@ class SharedSeriesReplay(RealReplay):
         with patch.object(STACK, "run_command", side_effect=observe_shared_series):
             receipt = STACK.maintain(self.repo, self.output, True, False)
         self.assertEqual(receipt["shared_patch_count"], 1)
+
+    def test_artifact_scan_refuses_incomplete_pins_without_changing_worktree(self) -> None:
+        before = self.contents()
+        with patch.dict(os.environ, {"FFMPEG_FIX_SERIES_VERIFY": "cosign"}):
+            with self.assertRaisesRegex(ValueError, "canonical github.com series repository"):
+                STACK.maintain(self.repo, self.output, False, True, artifact_only=True)
+        self.assertEqual(self.contents(), before)
+        self.assertEqual(json.loads((self.output / "receipt.json").read_text())["status"], "failed")
 
     def test_series_is_applied_first_and_ours_are_rendered_alone(self) -> None:
         result = STACK.maintain(self.repo, self.output, True, False)
