@@ -66,6 +66,19 @@
 #       runs it. The pull request gate below (opt-out line,
 #       consumed-surface diff) runs in CI only.
 #
+#   scripts/ci/ffmpeg-patches-surface-check.sh --skip-invariants
+#       Skips the section-0 tree checks and runs everything after them:
+#       the PR-body classification, the diff-set build and the
+#       intersection verdict run exactly as in a full pass. Only the
+#       PR-body-input selection test passes this flag: the tree checks
+#       are the seconds of real work that outran that test's 12 s hang
+#       budget under a parallel pre-push run (issue #3457), and that
+#       test measures the fd-0 decision, not the tree scans. Nothing
+#       about how the body stage answers changes, and CI never passes
+#       the flag — test_ffmpeg_patches_surface_check.py fails if any
+#       workflow, composite action, .pre-commit-config.yaml or
+#       lefthook.yml does.
+#
 # Exits 0 on PASS or no-public-surface-touched, 1 on a missing
 # patch update or a failed tree check, 2 on an environment / setup
 # error or an unknown argument.
@@ -73,15 +86,17 @@
 set -euo pipefail
 
 surface_only=0
+skip_invariants=0
 if [ "$#" -gt 1 ]; then
-  echo "ffmpeg-patches-surface-check: expected at most one argument, got $#; the only option is --surface-only." >&2
+  echo "ffmpeg-patches-surface-check: expected at most one argument, got $#; the options are --surface-only and --skip-invariants." >&2
   exit 2
 fi
 case "${1:-}" in
   "") ;;
   --surface-only) surface_only=1 ;;
+  --skip-invariants) skip_invariants=1 ;;
   *)
-    echo "ffmpeg-patches-surface-check: unknown argument '$1'; the only option is --surface-only." >&2
+    echo "ffmpeg-patches-surface-check: unknown argument '$1'; the options are --surface-only and --skip-invariants." >&2
     exit 2
     ;;
 esac
@@ -424,11 +439,14 @@ prepare_head_surface_tree() {
   fi
 }
 
-# Run #2435 invariant surface checks
+# Run #2435 invariant surface checks — skipped under --skip-invariants:
+# the scans read the checkout and are the slow part (issue #3457); the
+# body decision, the diff-set build and the verdict below still run, so
+# the flag narrows what is checked, never how the fd-0 answer is reached.
 checkout_repo_root="${REPO_ROOT}"
 checkout_patches_dir="${PATCHES_DIR}"
 surface_use_find=0
-if [ "$surface_only" -eq 0 ] && [ -n "${HEAD_SHA:-}" ]; then
+if [ "$surface_only" -eq 0 ] && [ "$skip_invariants" -eq 0 ] && [ -n "${HEAD_SHA:-}" ]; then
   prepare_head_surface_tree "${checkout_repo_root}"
   REPO_ROOT="${tmp_surface_root}"
   PATCHES_DIR="${tmp_surface_root}/ffmpeg-patches"
@@ -436,10 +454,14 @@ if [ "$surface_only" -eq 0 ] && [ -n "${HEAD_SHA:-}" ]; then
   echo "ffmpeg-patches-surface-check: tree checks read HEAD_SHA ${head_surface_sha} (extracted to ${tmp_surface_root})."
 fi
 
-check_surface_series || exit 1
-check_surface_fork_build_configs || exit 1
-check_surface_docs_examples "$surface_use_find" || exit 1
-check_surface_patch_tests || exit 1
+if [ "$skip_invariants" -eq 0 ]; then
+  check_surface_series || exit 1
+  check_surface_fork_build_configs || exit 1
+  check_surface_docs_examples "$surface_use_find" || exit 1
+  check_surface_patch_tests || exit 1
+else
+  echo "ffmpeg-patches-surface-check: --skip-invariants: the #2435 invariant surface checks are skipped; the body and diff stages still run."
+fi
 
 REPO_ROOT="${checkout_repo_root}"
 PATCHES_DIR="${checkout_patches_dir}"
