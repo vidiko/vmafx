@@ -17,13 +17,14 @@ import tempfile
 import unittest
 from collections.abc import Iterable
 from contextlib import redirect_stderr
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from scripts.lib.safe_subprocess import (
+    BinaryCommandResult,
     CommandOutputLimitExceeded,
     CommandTimedOut,
     CommandValidationError,
@@ -77,6 +78,100 @@ class InstallCommandTests(unittest.TestCase):
             )
         except TypeError:
             return cast(list[str], self.checker.scan_install_commands(Path(path), text))
+
+    def test_install_surface_byte_limit(self) -> None:
+        limit = self.checker.MAX_INSTALL_SURFACE_BYTES
+        text = "#" + "é" * ((limit - 1) // 2)
+        text += " " * (limit - len(text.encode("utf-8")))
+        self.assertEqual(self.findings(text), [])
+        with self.assertRaisesRegex(self.checker.ContractError, f"exceeds {limit} bytes"):
+            self.findings(text + " ")
+
+    def _minimal_consumer_root(self, root: Path) -> Path:
+        version = "0.12.18"
+        digest = "--hash=sha256:" + "a" * 64
+        write_uv_pin_fixture(
+            root, {"requirements/locks/tooling-tests.in": f"uv=={version}\n"}, version
+        )
+        manifest = self.checker.load_manifest(root)
+        generated = root / "generated.txt"
+        generated.write_text(f"uv=={version} {digest}\n", encoding="utf-8")
+        self.checker.stamp_lock(root, manifest, manifest["locks"][0], generated)
+        generated.unlink()
+        consumer = root / "scripts/setup/install.sh"
+        consumer.parent.mkdir(parents=True)
+        return consumer
+
+    def test_check_refuses_crlf_consumer_over_on_disk_byte_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            consumer = self._minimal_consumer_root(root)
+            limit = self.checker.MAX_INSTALL_SURFACE_BYTES
+            at_cap = b"#" + b"x" * (limit - 3) + b"\r\n"
+            self.assertEqual(len(at_cap), limit)
+            consumer.write_bytes(at_cap)
+            self.assertEqual(self.checker.check(root), 0)
+
+            over_cap = b"#" + b"x" * (limit - 2) + b"\r\n"
+            self.assertEqual(len(over_cap), limit + 1)
+            consumer.write_bytes(over_cap)
+            self.assertEqual(len(consumer.read_text(encoding="utf-8").encode("utf-8")), limit)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(self.checker.check(root), 1)
+            self.assertIn(
+                f"ERROR: scripts/setup/install.sh: install surface exceeds {limit} bytes",
+                stderr.getvalue(),
+            )
+
+    def test_check_scans_crlf_consumer_like_lf_twin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            lf_root = base / "lf"
+            crlf_root = base / "crlf"
+            lf_consumer = self._minimal_consumer_root(lf_root)
+            crlf_consumer = self._minimal_consumer_root(crlf_root)
+            lf_ok = b"# header\npython -m pip install --require-hashes \\\n  -r tooling-lock.txt\n"
+            lf_consumer.write_bytes(lf_ok)
+            crlf_consumer.write_bytes(lf_ok.replace(b"\n", b"\r\n"))
+            self.assertEqual(self.checker.check(lf_root), 0)
+            self.assertEqual(self.checker.check(crlf_root), 0)
+
+            lf_bad = lf_ok + b"# lone-cr\npython -m pip install pytest\n"
+            crlf_bad = (
+                lf_ok.replace(b"\n", b"\r\n") + b"# lone-cr\rpython -m pip install pytest\r\n"
+            )
+            lf_consumer.write_bytes(lf_bad)
+            crlf_consumer.write_bytes(crlf_bad)
+            lf_err = io.StringIO()
+            crlf_err = io.StringIO()
+            with redirect_stderr(lf_err):
+                self.assertEqual(self.checker.check(lf_root), 1)
+            with redirect_stderr(crlf_err):
+                self.assertEqual(self.checker.check(crlf_root), 1)
+            self.assertEqual(crlf_err.getvalue(), lf_err.getvalue())
+            self.assertIn(
+                "scripts/setup/install.sh:5: pip install must use --require-hashes",
+                crlf_err.getvalue(),
+            )
+
+            crlf_consumer.write_bytes(b"# \xff\r\n")
+            decode_err = io.StringIO()
+            with redirect_stderr(decode_err):
+                self.assertEqual(self.checker.check(crlf_root), 1)
+            self.assertIn("ERROR: scripts/setup/install.sh:", decode_err.getvalue())
+
+    def test_format_repo_path_uses_posix_separators(self) -> None:
+        windows_rel = PureWindowsPath("scripts", "setup", "install.sh")
+        self.assertIn("\\", str(windows_rel))
+        self.assertEqual(self.checker._format_repo_path(windows_rel), "scripts/setup/install.sh")
+
+    def test_install_surface_line_limit(self) -> None:
+        limit = self.checker.MAX_INSTALL_SURFACE_LINES
+        text = "\n" * limit
+        self.assertEqual(self.findings(text), [])
+        with self.assertRaisesRegex(self.checker.ContractError, f"exceeds {limit} physical lines"):
+            self.findings(text + "#")
 
     def test_hash_locked_requirements_install_is_accepted(self) -> None:
         text = "run: python -m pip install --require-hashes -r requirements/locks/build.txt\n"
@@ -507,6 +602,33 @@ class LockValidationTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.checker = load_checker()
 
+    def test_requirement_lines_match_pip(self) -> None:
+        """Expected records from pip 26.2.2 join_lines followed by ignore_comments."""
+        cases = (
+            (
+                "uv==1 \\\n  --hash=sha256:aa \\\n# comment \\\nother==1 \\\n  --hash=sha256:bb",
+                [(1, "uv==1   --hash=sha256:aa"), (4, "other==1   --hash=sha256:bb")],
+            ),
+            ("uv==1\\\n  # comment\nother==1", [(1, "uv==1"), (3, "other==1")]),
+            ("uv==1\\", [(1, "uv==1")]),
+            ("uv==1\\\n", [(1, "uv==1")]),
+            ("# comment \\\nother==1", [(2, "other==1")]),
+            ("uv==1 # note \\\nother==1", [(1, "uv==1")]),
+            ("uv==1\\\n\nother==1", [(1, "uv==1"), (3, "other==1")]),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    list(self.checker._requirements_file_lines(text, "pins")), expected
+                )
+
+    def test_unhashed_requirement_after_continued_comment(self) -> None:
+        text = f"uv==1 --hash=sha256:{'a' * 64}\n  # comment \\\nother==1\n"
+        self.assertEqual(
+            self.checker._validate_lock_requirements(text, "lock.txt"),
+            ["lock.txt:3: dependency has no sha256 artifact hash"],
+        )
+
     def test_unpinned_requirement_is_rejected(self) -> None:
         manifest = {"uv_version": "0.12.18", "locks": []}
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -559,7 +681,10 @@ class LockValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             problems = self.checker.validate_lock(temp_root, manifest, entry)
-            self.assertTrue(any("generator version does not match manifest" in p for p in problems))
+            self.assertIn(
+                "dummy.txt: generator version 0.11.0 does not match manifest uv_version 0.12.18",
+                problems,
+            )
 
     def test_remote_output_is_rejected(self) -> None:
         entry = {
@@ -2243,6 +2368,37 @@ class UvInputPinTests(unittest.TestCase):
         )
         self.manifest = self.checker.load_manifest(self.root)
 
+    def assert_one_pin_bump_fails(self, *, manifest_only: bool) -> None:
+        root = self.root / "pair"
+        relative = "requirements/locks/tooling-tests.in"
+        newer = "0.12.19"
+        write_uv_pin_fixture(root, {relative: f"uv=={self.version}\n"}, self.version)
+        manifest = self.checker.load_manifest(root)
+        generated = root / "generated.txt"
+        generated.write_text(f"uv=={self.version} --hash=sha256:{'a' * 64}\n", encoding="utf-8")
+        self.checker.stamp_lock(root, manifest, manifest["locks"][0], generated)
+        self.assertEqual(self.checker.check(root), 0)
+        if manifest_only:
+            manifest["uv_version"] = newer
+            (root / self.checker.MANIFEST_PATH).write_text(json.dumps(manifest), encoding="utf-8")
+            pinned, expected = self.version, newer
+        else:
+            (root / relative).write_text(f"uv=={newer}\n", encoding="utf-8")
+            pinned, expected = newer, self.version
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(self.checker.check(root), 1)
+        self.assertIn(
+            f"ERROR: {relative}:1: uv=={pinned} differs from uv_version {expected}.",
+            stderr.getvalue(),
+        )
+
+    def test_check_rejects_manifest_only_bump(self) -> None:
+        self.assert_one_pin_bump_fails(manifest_only=True)
+
+    def test_check_rejects_tooling_input_only_bump(self) -> None:
+        self.assert_one_pin_bump_fails(manifest_only=False)
+
     def test_matching_pin_passes(self) -> None:
         self.assertEqual(self.checker.check_uv_input_pins(self.root, self.manifest), [])
 
@@ -2336,6 +2492,610 @@ class UvInputPinTests(unittest.TestCase):
         self.other_input.unlink()
         with self.assertRaisesRegex(self.checker.ContractError, r"^other\.in:"):
             self.checker.check_uv_input_pins(self.root, self.manifest)
+
+
+class UvBootstrapTests(unittest.TestCase):
+    """Bootstrap the reviewed generator without changing the manifest's lock outputs."""
+
+    def setUp(self) -> None:
+        self.checker = load_checker()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "wt"
+        self.output = self.root / "bootstrap.txt"
+        self.version = "0.12.18"
+        self.old = "0.12.17"
+        self.digest = "--hash=sha256:" + "a" * 64
+        self.compiled = f"uv=={self.version} {self.digest}\n"
+        write_uv_pin_fixture(self.root, {"tools.in": f"uv=={self.version}\n"}, self.version)
+        version_patch = mock.patch.object(self.checker, "uv_version", return_value=self.old)
+        self.installed = version_patch.start()
+        self.addCleanup(version_patch.stop)
+        compile_patch = mock.patch.object(self.checker, "_run_uv", side_effect=self.compile)
+        self.run_uv = compile_patch.start()
+        self.addCleanup(compile_patch.stop)
+
+    def compile(
+        self, binary: str, args: list[str], *, cwd: Path
+    ) -> subprocess.CompletedProcess[str]:
+        Path(args[args.index("-o") + 1]).write_bytes(self.compiled.encode("utf-8"))
+        return subprocess.CompletedProcess([binary, *args], 0, "", "")
+
+    def bootstrap(self) -> int:
+        return int(self.checker.bootstrap_uv(self.root, sys.executable, self.output))
+
+    def test_old_uv_compiles_the_generator_entry(self) -> None:
+        """Positive: use the discovered entry's arguments and emit a hash-pinned lock."""
+        manifest_path = self.root / self.checker.MANIFEST_PATH
+        manifest = self.checker.load_manifest(self.root)
+        args = ["tools.in", "--universal", "--generate-hashes"]
+        manifest["locks"][0]["compile_args"] = args
+        (self.root / "other.in").write_text("pyyaml\n", encoding="utf-8")
+        manifest["locks"].insert(
+            0, {"output": "other.txt", "inputs": ["other.in"], "compile_args": ["other.in"]}
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(self.bootstrap(), 0)
+        self.run_uv.assert_called_once_with(
+            self.installed.call_args.args[0],
+            ["pip", "compile", *args, "-o", str(self.output)],
+            cwd=self.root,
+        )
+        self.assertEqual(self.output.read_text(encoding="utf-8"), self.compiled)
+        self.assertFalse((self.root / "tooling-lock.txt").exists())
+
+    def test_stale_tooling_lock_regenerates_after_bootstrap(self) -> None:
+        """A manifest bump can refresh the tooling lock that supplied the old uv."""
+
+        def pinned_version(path: Path) -> str:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            (pin,) = [line.split()[0] for line in lines if line.startswith("uv==")]
+            return pin.removeprefix("uv==")
+
+        def compile_input(
+            binary: str, args: list[str], *, cwd: Path
+        ) -> subprocess.CompletedProcess[str]:
+            pins = (cwd / args[2]).read_text(encoding="utf-8").splitlines()
+            output = Path(args[args.index("-o") + 1])
+            output.write_text("".join(f"{pin} {self.digest}\n" for pin in pins), encoding="utf-8")
+            return subprocess.CompletedProcess([binary, *args], 0, "", "")
+
+        manifest = self.checker.load_manifest(self.root)
+        entry = manifest["locks"][0]
+        tooling_lock = self.root / entry["output"]
+        tooling_input = self.root / entry["inputs"][0]
+        old_input = f"uv=={self.old}\nother==1\n"
+        tooling_input.write_text(old_input, encoding="utf-8")
+        self.run_uv.side_effect = compile_input
+        self.checker.compile_entry(self.root, sys.executable, entry, tooling_lock)
+        self.checker.stamp_lock(self.root, dict(manifest, uv_version=self.old), entry, tooling_lock)
+        tooling_input.write_text(f"uv=={self.version}\nother==1\n", encoding="utf-8")
+
+        self.installed.return_value = pinned_version(tooling_lock)
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.checker.write(self.root, sys.executable)
+        self.assertIn(self.old, str(raised.exception))
+        self.assertIn(self.version, str(raised.exception))
+
+        self.assertEqual(self.bootstrap(), 0)
+        self.assertIn(
+            f"other==1 {self.digest}", self.output.read_text(encoding="utf-8").splitlines()
+        )
+        self.installed.return_value = pinned_version(self.output)
+        self.assertEqual(self.checker.write(self.root, sys.executable), 0)
+        lock_lines = tooling_lock.read_text(encoding="utf-8").splitlines()
+        self.assertIn(f"# vmafx-uv-version: {self.version}", lock_lines)
+        self.assertIn(f"other==1 {self.digest}", lock_lines)
+        self.assertEqual(pinned_version(tooling_lock), self.version)
+
+    def test_workflow_install_requires_its_bootstrap_producer(self) -> None:
+        """Negative: a missing producer, reassignment or different consumer has no authority."""
+        path = Path(".github/workflows/python-lock-refresh.yml")
+        text = (ROOT / path).read_text(encoding="utf-8")
+        install = 'python -m pip install --no-build-isolation --require-hashes -r "$bootstrap"'
+        self.assertIn(install, text)
+        self.assertEqual(self.checker.scan_install_commands(path, text, root=ROOT), [])
+        for workflow, script in (
+            (path, text.replace("bootstrap-uv --output", "outputs --output")),
+            (path, text.replace(install, 'bootstrap="unreviewed.txt"\n            ' + install)),
+            (path, text + "\n" + install),
+            (Path("other") / path, text),
+        ):
+            with self.subTest(workflow=workflow, script=script[-80:]):
+                findings = self.checker.scan_install_commands(workflow, script, root=ROOT)
+                self.assertTrue(any("pip install must use" in finding for finding in findings))
+
+    def test_workflow_bootstrap_run_header_comment_and_chomping(self) -> None:
+        """Positive: a YAML comment on `run: |` stays authorized; split blocks and `|-` fail."""
+        path = Path(".github/workflows/python-lock-refresh.yml")
+        text = (ROOT / path).read_text(encoding="utf-8")
+        header = (
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            '          bootstrap="$RUNNER_TEMP/uv-bootstrap.txt"'
+        )
+        self.assertIn(header, text)
+        commented = text.replace(
+            header,
+            header.replace("run: |", "run: | # install the reviewed uv", 1),
+            1,
+        )
+        self.assertEqual(self.checker.scan_install_commands(path, commented, root=ROOT), [])
+        install_guard = (
+            '          if [ -s "$bootstrap" ]; then\n'
+            '            python -m pip install --no-build-isolation --require-hashes -r "$bootstrap"\n'
+            "          fi"
+        )
+        self.assertIn(install_guard, commented)
+        split_block = commented.replace(
+            install_guard,
+            "      - name: Separate bootstrap install\n"
+            "        shell: bash\n"
+            "        run: |\n" + install_guard,
+            1,
+        )
+        for label, candidate in (
+            ("split-run-block", split_block),
+            ("strip-chomping", text.replace(header, header.replace("run: |", "run: |-", 1), 1)),
+            ("keep-chomping", text.replace(header, header.replace("run: |", "run: |+", 1), 1)),
+            ("indent-indicator", text.replace(header, header.replace("run: |", "run: |2", 1), 1)),
+            ("unspaced-hash", text.replace(header, header.replace("run: |", "run: |#", 1), 1)),
+        ):
+            with self.subTest(case=label):
+                findings = self.checker.scan_install_commands(path, candidate, root=ROOT)
+                self.assertTrue(any("pip install must use" in finding for finding in findings))
+
+    def test_previous_compiled_pin_fails(self) -> None:
+        """Negative: the previous uv pin cannot bootstrap the reviewed release."""
+        self.compiled = f"uv=={self.old} {self.digest}\n"
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.bootstrap()
+        self.assertIn(f"found uv=={self.old}, expected uv=={self.version}", str(raised.exception))
+        self.assertFalse(self.output.exists())
+
+    def test_bootstrap_comment_ends_hashed_continuation(self) -> None:
+        self.output.write_text(
+            f"uv=={self.version} \\\n  {self.digest} \\\n# comment \\\nother==1 \\\n  {self.digest}\n",
+            encoding="utf-8",
+        )
+        self.checker._check_bootstrap_pin(self.output, self.version)
+
+    def test_hashed_other_requirement_is_accepted(self) -> None:
+        self.compiled += f"other==1 {self.digest}\n"
+        self.assertEqual(self.bootstrap(), 0)
+
+    def test_marked_other_requirement_is_accepted(self) -> None:
+        self.compiled += f'other==1 ; python_version >= "3.10" {self.digest}\n'
+        self.assertEqual(self.bootstrap(), 0)
+
+    def test_committed_tooling_lock_is_accepted(self) -> None:
+        version = self.checker.load_manifest(ROOT)["uv_version"]
+        self.checker._check_bootstrap_pin(ROOT / "requirements/locks/tooling-tests.txt", version)
+
+    def test_marked_uv_pin_fails(self) -> None:
+        self.compiled = f'uv=={self.version} ; sys_platform == "linux" {self.digest}\n'
+        with self.assertRaises(self.checker.ContractError):
+            self.bootstrap()
+
+    def test_uppercase_uv_pin_is_accepted(self) -> None:
+        self.compiled = f"UV=={self.version} {self.digest}\n"
+        self.assertEqual(self.bootstrap(), 0)
+
+    def test_unhashed_other_requirement_fails(self) -> None:
+        self.compiled += "other==1\n"
+        with self.assertRaisesRegex(self.checker.ContractError, "sha256 artifact hash"):
+            self.bootstrap()
+
+    def test_invalid_token_after_artifact_hash_fails(self) -> None:
+        self.compiled += f"other==1 {self.digest} --no-deps\n"
+        with self.assertRaisesRegex(self.checker.ContractError, "sha256 artifact hash"):
+            self.bootstrap()
+
+    def test_malformed_hash_alongside_valid_hash_fails(self) -> None:
+        self.compiled += f"other==1 {self.digest} --hash=sha256:abc\n"
+        with self.assertRaisesRegex(self.checker.ContractError, "sha256 artifact hash"):
+            self.bootstrap()
+
+    def test_missing_uv_pin_fails(self) -> None:
+        self.compiled = f"other==1 {self.digest}\n"
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.bootstrap()
+        self.assertIn(f"found no uv pin, expected uv=={self.version}", str(raised.exception))
+
+    def test_alternative_uv_requirement_fails(self) -> None:
+        for requirement in (f"uv>={self.version}", f"uv[extra]=={self.version}"):
+            with self.subTest(requirement=requirement):
+                self.compiled = f"{requirement} {self.digest}\nuv=={self.version} {self.digest}\n"
+                with self.assertRaises(self.checker.ContractError):
+                    self.bootstrap()
+
+    def test_duplicate_reviewed_uv_pin_fails(self) -> None:
+        self.compiled *= 2
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.bootstrap()
+        pin = f"uv=={self.version}"
+        self.assertIn(f"found {pin}, {pin}, expected {pin}", str(raised.exception))
+
+    def test_missing_uv_hash_fails(self) -> None:
+        """Negative: another package's hash or an inline comment cannot authorize uv."""
+        self.compiled = f"uv=={self.version} # {self.digest}\nother==1 {self.digest}\n"
+        with self.assertRaisesRegex(self.checker.ContractError, "sha256 artifact hash"):
+            self.bootstrap()
+
+    def test_conflicting_compiled_uv_pins_fail(self) -> None:
+        """Negative: a hash for the reviewed version cannot authorize a conflicting uv pin."""
+        self.compiled += f"uv=={self.old} {self.digest}\n"
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.bootstrap()
+        self.assertIn(
+            f"found uv=={self.version}, uv=={self.old}, expected uv=={self.version}",
+            str(raised.exception),
+        )
+
+    def test_conflicting_uv_pin_after_continued_comment(self) -> None:
+        self.compiled += f"# comment \\\nuv=={self.old} {self.digest}\n"
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.bootstrap()
+        self.assertIn(
+            f"found uv=={self.version}, uv=={self.old}, expected uv=={self.version}",
+            str(raised.exception),
+        )
+
+    def test_wrong_version_with_invalid_hash_reports_both_pins(self) -> None:
+        for hashes in ("", "--hash=sha256:bad", f"{self.digest} --hash=sha256:bad"):
+            with self.subTest(hashes=hashes):
+                self.compiled = f"uv=={self.old} {hashes}\n"
+                with self.assertRaises(self.checker.ContractError) as raised:
+                    self.bootstrap()
+                self.assertIn(
+                    f"found uv=={self.old}, expected uv=={self.version}", str(raised.exception)
+                )
+                self.assertIn("sha256 artifact hash", str(raised.exception))
+
+    def test_bootstrap_byte_limit(self) -> None:
+        size = len(self.compiled.encode("utf-8"))
+        with mock.patch.object(self.checker, "MAX_LOCK_BYTES", size):
+            self.assertEqual(self.bootstrap(), 0)
+            self.compiled += "\n"
+            with self.assertRaisesRegex(self.checker.ContractError, "exceeds .* bytes"):
+                self.bootstrap()
+
+    def test_physical_line_limit_counts_continuations(self) -> None:
+        self.compiled = f"uv=={self.version} \\\n  {self.digest}\n"
+        with mock.patch.object(self.checker, "MAX_REQUIREMENTS_LINES", 2):
+            self.assertEqual(self.bootstrap(), 0)
+            self.compiled += "# comment\n"
+            with self.assertRaisesRegex(self.checker.ContractError, "exceeds 2 physical lines"):
+                self.bootstrap()
+
+    def test_check_and_bootstrap_hash_limit(self) -> None:
+        limit = self.checker.MAX_HASHES_PER_REQUIREMENT
+        self.compiled = f"uv=={self.version}" + f" {self.digest}" * limit + "\n"
+        self.installed.return_value = self.version
+        self.assertEqual(self.checker.write(self.root, sys.executable), 0)
+        lock = self.root / "tooling-lock.txt"
+        self.checker._check_bootstrap_pin(lock, self.version)
+        text = lock.read_text(encoding="utf-8").rstrip() + f" {self.digest}\n"
+        lock.write_text(text, encoding="utf-8")
+        location = f"{len(text.splitlines())}: exceeds {limit} hash options"
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(self.checker.check(self.root), 1)
+        self.assertEqual(stderr.getvalue().strip(), f"ERROR: {lock.name}:{location}")
+        with self.assertRaises(self.checker.ContractError) as raised:
+            self.checker._check_bootstrap_pin(lock, self.version)
+        self.assertEqual(str(raised.exception), f"{lock}:{location}")
+
+    def test_write_preserves_lock_on_size_refusal(self) -> None:
+        self.installed.return_value = self.version
+        self.assertEqual(self.checker.write(self.root, sys.executable), 0)
+        lock = self.root / "tooling-lock.txt"
+        original = lock.read_bytes()
+        limit = self.checker.MAX_LOCK_BYTES
+        # The removable generator comment exceeds the input limit. The valid
+        # requirement fits on input, but its stamp takes the output over the limit.
+        for generated in ("#" + "x" * limit, self.compiled.rstrip().ljust(limit)):
+            with self.subTest(generated_size=len(generated)):
+                self.compiled = generated
+                with self.assertRaisesRegex(self.checker.ContractError, f"exceeds {limit} bytes"):
+                    self.checker.write(self.root, sys.executable)
+                self.assertEqual(lock.read_bytes(), original)
+
+    def test_write_preserves_lock_on_hash_limit_refusal(self) -> None:
+        self.installed.return_value = self.version
+        limit = self.checker.MAX_HASHES_PER_REQUIREMENT
+        self.compiled = f"uv=={self.version}" + f" {self.digest}" * limit + "\n"
+        self.assertEqual(self.checker.write(self.root, sys.executable), 0)
+        lock = self.root / "tooling-lock.txt"
+        temporary = lock.with_suffix(lock.suffix + ".tmp")
+        original = lock.read_bytes()
+        self.assertIn(f" {self.digest}" * limit, lock.read_text(encoding="utf-8"))
+        self.compiled = f"uv=={self.version}" + f" {self.digest}" * (limit + 1) + "\n"
+        with self.assertRaisesRegex(
+            self.checker.ContractError, rf"^tooling-lock\.txt:\d+: exceeds {limit} hash options$"
+        ):
+            self.checker.write(self.root, sys.executable)
+        self.assertEqual(lock.read_bytes(), original)
+        self.assertFalse(temporary.exists())
+
+    def test_write_preserves_lock_on_requirement_validation_refusal(self) -> None:
+        self.installed.return_value = self.version
+        lock = self.root / "tooling-lock.txt"
+        temporary = lock.with_suffix(lock.suffix + ".tmp")
+        with mock.patch.object(self.checker, "MAX_REQUIREMENTS_LINES", 5):
+            self.assertEqual(self.checker.write(self.root, sys.executable), 0)
+            original = lock.read_bytes()
+            self.compiled = f"uv=={self.version} \\\n  {self.digest}\n"
+            with self.assertRaisesRegex(
+                self.checker.ContractError, r"^tooling-lock\.txt: exceeds 5 physical lines$"
+            ):
+                self.checker.write(self.root, sys.executable)
+            self.assertEqual(lock.read_bytes(), original)
+            self.assertFalse(temporary.exists())
+        self.compiled = f"uv=={self.version}\n"
+        with self.assertRaisesRegex(
+            self.checker.ContractError,
+            r"^tooling-lock\.txt:5: dependency has no sha256 artifact hash$",
+        ):
+            self.checker.write(self.root, sys.executable)
+        self.assertEqual(lock.read_bytes(), original)
+        self.assertFalse(temporary.exists())
+
+    def test_write_preserves_lock_on_non_utf8_generated_lock(self) -> None:
+        self.installed.return_value = self.version
+        self.assertEqual(self.checker.write(self.root, sys.executable), 0)
+        lock = self.root / "tooling-lock.txt"
+        temporary = lock.with_suffix(lock.suffix + ".tmp")
+        original = lock.read_bytes()
+
+        def write_non_utf8(
+            binary: str, args: list[str], *, cwd: Path
+        ) -> subprocess.CompletedProcess[str]:
+            Path(args[args.index("-o") + 1]).write_bytes(b"uv==0.12.18\xff\n")
+            return subprocess.CompletedProcess([binary, *args], 0, "", "")
+
+        self.run_uv.side_effect = write_non_utf8
+        with self.assertRaisesRegex(
+            self.checker.ContractError, r"^tooling-lock\.txt: generated lock is not UTF-8: "
+        ):
+            self.checker.write(self.root, sys.executable)
+        self.assertEqual(lock.read_bytes(), original)
+        self.assertFalse(temporary.exists())
+
+    def test_multiline_uv_hash_is_accepted(self) -> None:
+        """Boundary: recognize uv's backslash-continued artifact hashes."""
+        self.compiled = f"uv=={self.version} \\\n    {self.digest}\n"
+        self.assertEqual(self.bootstrap(), 0)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), self.compiled)
+
+    def test_mismatched_input_refused_before_uv_runs(self) -> None:
+        """Negative: verify the input before invoking even uv --version."""
+        (self.root / "tools.in").write_text(f"uv=={self.old}\n", encoding="utf-8")
+        with self.assertRaisesRegex(self.checker.ContractError, "differs from uv_version"):
+            self.bootstrap()
+        self.installed.assert_not_called()
+        self.run_uv.assert_not_called()
+
+    def test_matching_version_removes_stale_output(self) -> None:
+        """Boundary: a matching generator skips compilation and clears stale output."""
+        self.installed.return_value = self.version
+        self.output.write_text("stale", encoding="utf-8")
+        self.assertEqual(self.bootstrap(), 0)
+        self.assertFalse(self.output.exists())
+        self.run_uv.assert_not_called()
+
+    def test_failed_bootstrap_compile_leaves_no_output(self) -> None:
+        """Negative: a mismatch unlinks existing output before compile and leaves none on error."""
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                self.output.write_text("stale", encoding="utf-8")
+                existed_at_compile: list[bool] = []
+
+                def fail_compile(
+                    binary: str,
+                    args: list[str],
+                    *,
+                    cwd: Path,
+                    write_partial: bool = partial,
+                    seen: list[bool] = existed_at_compile,
+                ) -> subprocess.CompletedProcess[str]:
+                    target = Path(args[args.index("-o") + 1])
+                    seen.append(target.exists())
+                    if write_partial:
+                        target.write_text("partial", encoding="utf-8")
+                    return subprocess.CompletedProcess([binary, *args], 1, "", "compile failed")
+
+                self.run_uv.side_effect = fail_compile
+                with self.assertRaisesRegex(
+                    self.checker.ContractError, r"^uv failed for tooling-lock\.txt: compile failed$"
+                ):
+                    self.bootstrap()
+                self.assertEqual(existed_at_compile, [False])
+                self.assertFalse(self.output.exists())
+
+    def test_ambiguous_generator_entries_fail(self) -> None:
+        """Boundary: report both lock entries that carry an exact generator pin."""
+        manifest = self.checker.load_manifest(self.root)
+        manifest["locks"].append(dict(manifest["locks"][0], output="extra-lock.txt"))
+        (self.root / self.checker.MANIFEST_PATH).write_text(json.dumps(manifest), encoding="utf-8")
+        for version in (self.version, self.old):
+            with self.subTest(installed=version):
+                self.installed.return_value = version
+                with self.assertRaisesRegex(
+                    self.checker.ContractError, "tooling-lock.txt.*extra-lock.txt"
+                ):
+                    self.bootstrap()
+        self.run_uv.assert_not_called()
+
+    def test_no_generator_entry_fails(self) -> None:
+        """Boundary: report an empty candidate list when no entry pins uv."""
+        (self.root / "tools.in").write_text("uv>=0.1\n", encoding="utf-8")
+        for version in (self.version, self.old):
+            with self.subTest(installed=version):
+                self.installed.return_value = version
+                with self.assertRaisesRegex(self.checker.ContractError, r"found \[\]"):
+                    self.bootstrap()
+        self.run_uv.assert_not_called()
+
+    def test_manifest_output_cannot_be_bootstrap_destination(self) -> None:
+        """Negative: neither compilation nor stale-file cleanup can touch a manifest lock."""
+        self.output = self.root / "tooling-lock.txt"
+        self.output.write_text("committed", encoding="utf-8")
+        for version in (self.version, self.old):
+            with self.subTest(version=version):
+                self.installed.return_value = version
+                with self.assertRaisesRegex(self.checker.ContractError, "bootstrap output"):
+                    self.bootstrap()
+                self.assertEqual(self.output.read_text(encoding="utf-8"), "committed")
+        self.run_uv.assert_not_called()
+
+    def linked_worktree(self) -> tuple[Path, Path]:
+        common = self.root.parent / "main" / ".git"
+        git_dir = common / "worktrees" / "wt"
+        git_dir.mkdir(parents=True)
+        (self.root / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+        (git_dir / "HEAD").write_text("ref: refs/heads/topic\n", encoding="utf-8")
+        (common / "config").write_text("[core]\n\tbare = false\n", encoding="utf-8")
+        return git_dir, common
+
+    def assert_git_metadata_survives(self, path: Path) -> None:
+        contents = path.read_bytes()
+        self.output = path
+        with mock.patch.object(self.checker, "tracked_paths", return_value=[]):
+            for version in (self.version, self.old):
+                with self.subTest(installed=version):
+                    self.installed.return_value = version
+                    with self.assertRaisesRegex(
+                        self.checker.ContractError,
+                        "bootstrap output must not be inside the Git metadata",
+                    ):
+                        self.bootstrap()
+                    self.assertEqual(path.read_bytes(), contents)
+        self.run_uv.assert_not_called()
+
+    def test_main_checkout_git_metadata_survives(self) -> None:
+        """Negative: bootstrap cannot remove or overwrite the main checkout's config."""
+        metadata = self.root / ".git"
+        metadata.mkdir()
+        (metadata / "config").write_text("[core]\n\tbare = false\n", encoding="utf-8")
+        with mock.patch.object(
+            self.checker, "_git_metadata_dirs", return_value=(metadata, metadata)
+        ):
+            self.assert_git_metadata_survives(metadata / "config")
+
+    def test_linked_worktree_git_metadata_survives(self) -> None:
+        """Boundary: the worktree's .git pointer file is itself protected."""
+        dirs = self.linked_worktree()
+        with mock.patch.object(self.checker, "_git_metadata_dirs", return_value=dirs):
+            self.assert_git_metadata_survives(self.root / ".git")
+
+    def test_linked_worktree_head_survives(self) -> None:
+        """Negative: both bootstrap paths preserve HEAD in the separate Git directory."""
+        dirs = self.linked_worktree()
+        with mock.patch.object(self.checker, "_git_metadata_dirs", return_value=dirs):
+            self.assert_git_metadata_survives(dirs[0] / "HEAD")
+
+    def test_common_git_config_survives(self) -> None:
+        """Negative: traversing out of the checkout cannot replace shared Git config."""
+        dirs = self.linked_worktree()
+        with mock.patch.object(self.checker, "_git_metadata_dirs", return_value=dirs):
+            self.assert_git_metadata_survives(self.root / "../main/.git/config")
+
+    def test_unrelated_bootstrap_output_allowed(self) -> None:
+        """Positive: a temporary lock outside the checkout and Git directories is writable."""
+        dirs = self.linked_worktree()
+        self.output = self.root.parent / "runner-temp" / "uv-bootstrap.txt"
+        self.output.parent.mkdir()
+        with mock.patch.object(self.checker, "_git_metadata_dirs", return_value=dirs):
+            self.assertEqual(self.bootstrap(), 0)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), self.compiled)
+
+    def test_git_metadata_lookup_failure_preserves_output(self) -> None:
+        """Negative: failed, timed-out or output-limited Git discovery preserves the output."""
+        git_dir, common = self.linked_worktree()
+        self.output = self.root.parent / "bootstrap.txt"
+        argv = ("git",)
+        stdout = bytes(git_dir) + b"\n" + bytes(common) + b"\n"
+        for outcome in (
+            BinaryCommandResult(argv, 1, stdout, b""),
+            CommandTimedOut(argv, self.checker.GIT_TIMEOUT_S, b"", b""),
+            CommandOutputLimitExceeded(argv, len(stdout), stdout, b""),
+        ):
+            with (
+                self.subTest(outcome=outcome),
+                mock.patch.object(self.checker, "run_command", side_effect=[outcome]),
+            ):
+                self.output.write_text("stale", encoding="utf-8")
+                self.run_uv.reset_mock()
+                with self.assertRaisesRegex(
+                    self.checker.ContractError, "cannot determine Git metadata directories"
+                ):
+                    self.bootstrap()
+                self.assertEqual(self.output.read_text(encoding="utf-8"), "stale")
+                self.run_uv.assert_not_called()
+
+    def test_invalid_git_metadata_response_refused(self) -> None:
+        """Negative: Git must report exactly two absolute paths."""
+        directory = bytes(self.root) + b"\n"
+        for stdout in (directory, directory * 3, directory + b"relative\n"):
+            with (
+                self.subTest(stdout=stdout),
+                mock.patch.object(
+                    self.checker,
+                    "run_command",
+                    return_value=BinaryCommandResult(("git",), 0, stdout, b""),
+                ),
+                self.assertRaisesRegex(
+                    self.checker.ContractError, "cannot determine Git metadata directories"
+                ),
+            ):
+                self.checker._git_metadata_dirs(self.root)
+
+    def test_real_git_metadata_directories(self) -> None:
+        """Boundary: Git locates HEAD and config in the current repository layout."""
+        git_dir, common = self.checker._git_metadata_dirs(ROOT)
+        self.assertTrue((git_dir / "HEAD").is_file())
+        self.assertTrue((common / "config").is_file())
+
+    def test_other_tracked_lock_is_protected(self) -> None:
+        """Negative: a tracked lock outside the Python manifest is also protected."""
+        (self.root / ".git").mkdir()
+        self.output = self.root / "Cargo.lock"
+        self.output.write_text("tracked", encoding="utf-8")
+        metadata = self.root / ".git"
+        with (
+            mock.patch.object(
+                self.checker, "_git_metadata_dirs", return_value=(metadata, metadata)
+            ),
+            mock.patch.object(self.checker, "tracked_paths", return_value=[Path("Cargo.lock")]),
+        ):
+            with self.assertRaisesRegex(self.checker.ContractError, "tracked file"):
+                self.bootstrap()
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "tracked")
+        self.run_uv.assert_not_called()
+
+    def test_bootstrap_cli_requires_output(self) -> None:
+        """Negative: missing --output is a usage error without a traceback."""
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [str(CHECKER), "bootstrap-uv"]),
+            redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.checker.main()
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertIn("--output", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_write_preserves_compile_failure_detail(self) -> None:
+        """Negative: write still names the failed lock and reports uv's stderr."""
+        self.installed.return_value = self.version
+        self.run_uv.side_effect = None
+        self.run_uv.return_value = subprocess.CompletedProcess([], 1, "stdout", "resolver failed")
+        with self.assertRaisesRegex(
+            self.checker.ContractError, r"^uv failed for tooling-lock\.txt: resolver failed$"
+        ):
+            self.checker.write(self.root, sys.executable)
 
 
 class UvExecutionAndCompileArgsTests(unittest.TestCase):

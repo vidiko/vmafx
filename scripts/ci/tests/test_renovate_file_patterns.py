@@ -258,31 +258,252 @@ class RenovateFilePatterns(unittest.TestCase):
         self.assertTrue(any("missing from postUpdateOptions" in e for e in errors))
 
 
-def matching_group_rules(config: dict[str, Any], dependency: dict[str, str]) -> list[int]:
-    """Find group rules for these concrete fixtures in their configured order."""
-    result = []
-    for index, rule in enumerate(config["packageRules"]):
-        if "groupName" not in rule:
+MAX_PATTERN_LENGTH = 512
+MAX_PATTERN_LIST_LENGTH = 1024
+_GLOB_LITERAL_CHARS: frozenset[str] = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-@:/+="
+)
+_GLOB_ALLOWED_CHARS: frozenset[str] = _GLOB_LITERAL_CHARS | {"*", "?"}
+
+
+def _translate_single_star_glob(segment: str) -> str:
+    parts: list[str] = []
+    for char in segment[:MAX_PATTERN_LENGTH]:
+        if char == "*":
+            parts.append("[^/]*")
+        elif char == "?":
+            parts.append("[^/]")
+        else:
+            parts.append(re.escape(char))
+    return "".join(parts)
+
+
+def _compile_renovate_glob(body: str) -> re.Pattern[str] | None:
+    """Translate the modeled subset of Renovate's minimatch(..., {dot: true,
+    nocase: true}) globs (Renovate main 208cd854196d, lib/util/string-match.ts).
+    Measured against minimatch 10.2.6 and 11.0.8:
+    - {uv,numpy} matches uv and numpy, and [u]v and +(u)v match uv (brace
+      expansion, character class, extglob -> not modeled, None);
+    - requirements/*.in does not match requirements/locks/tooling-tests.in and
+      u?v does not match u/v (* and ? never cross /);
+    - requirements/** matches requirements/locks/tooling-tests.in; a/** matches
+      a/ and a/.b (dot: true) but not a; uv/** does not match uv;
+    - a** matches ab and not a/b (non-segment ** -> not modeled, None);
+    - UV matches uv (nocase: true)."""
+    if not body or len(body) > MAX_PATTERN_LENGTH:
+        return None
+    for char in body[:MAX_PATTERN_LENGTH]:
+        if char not in _GLOB_ALLOWED_CHARS:
+            return None
+    if body == "**":
+        translated = ".*"
+    elif body.endswith("/**") and "**" not in body[:-3]:
+        translated = f"{_translate_single_star_glob(body[:-3])}/.*"
+    elif "**" not in body:
+        translated = _translate_single_star_glob(body)
+    else:
+        return None
+    return re.compile(translated, re.IGNORECASE | re.DOTALL)
+
+
+def _matches_single_pattern(value: str, body: str) -> bool | None:
+    regex = re.fullmatch(r"/(.+)/(i?)", body, re.DOTALL)
+    if regex is not None:
+        flags = re.IGNORECASE if regex[2] == "i" else 0
+        return re.search(to_python(regex[1]), value, flags) is not None
+    compiled = _compile_renovate_glob(body)
+    if compiled is None:
+        return None
+    return compiled.fullmatch(value) is not None
+
+
+def _matches_regex_or_glob_list(value: str, patterns: list[str]) -> bool | None:
+    """Mirror matchRegexOrGlobList (Renovate main 208cd854196d,
+    lib/util/string-match.ts:13-21, 29-57, 72-77, 94-104): an empty list is
+    false; positive/negative split requires at least one positive match when
+    positives exist and every !-negated pattern to hold; /re/ and /re/i (plus
+    !/re/ and !/re/i) are regexes; modeled globs follow minimatch(..., {dot:
+    true, nocase: true}) via _compile_renovate_glob ({uv,numpy} vs uv/numpy,
+    [u]v and +(u)v vs uv, and non-segment a** vs ab or a/b return None;
+    requirements/*.in misses requirements/locks/tooling-tests.in and u?v misses
+    u/v; requirements/** matches requirements/locks/tooling-tests.in, a/**
+    matches a/ and a/.b but not a, and uv/** misses uv; UV matches uv); any
+    unmodeled pattern returns None for the whole list."""
+    if not patterns:
+        return False
+    if len(patterns) > MAX_PATTERN_LIST_LENGTH:
+        return None
+    has_positive = False
+    positive_matched = False
+    negated_matched = False
+    for raw in patterns[:MAX_PATTERN_LIST_LENGTH]:
+        if len(raw) > MAX_PATTERN_LENGTH:
+            return None
+        negated = raw.startswith("!")
+        body = raw[1:] if negated else raw
+        hit = _matches_single_pattern(value, body)
+        if hit is None:
+            return None
+        if negated:
+            negated_matched = negated_matched or hit
+        else:
+            has_positive = True
+            positive_matched = positive_matched or hit
+    if negated_matched:
+        return False
+    return not has_positive or positive_matched
+
+
+_DIRECT_GLOB_CASES: tuple[tuple[str, list[str], bool | None], ...] = (
+    ("uv", ["{uv,numpy}"], None),
+    ("numpy", ["{uv,numpy}"], None),
+    ("uv", ["{u..z}v"], None),
+    ("requirements/locks/tooling-tests.in", ["requirements/*.in"], False),
+    ("u/v", ["u?v"], False),
+    ("requirements/locks/tooling-tests.in", ["requirements/**"], True),
+    ("a/", ["a/**"], True),
+    ("a/.b", ["a/**"], True),
+    ("a", ["a/**"], False),
+    ("uv", ["uv/**"], False),
+    ("ab", ["a**"], None),
+    ("a/b", ["a**"], None),
+    ("uv", ["[u]v"], None),
+    ("uv", ["+(u)v"], None),
+    ("uv", ["UV"], True),
+    ("github.com/example-org/tool", ["github.com/example-org/tool/**"], False),
+    ("github.com/example-org/tool/x/y", ["github.com/example-org/tool/**"], True),
+    ("uv", [], False),
+    ("a/b", ["**"], True),
+    ("uv", ["!uv", "{uv,numpy}"], None),
+    ("uv", ["u" * (MAX_PATTERN_LENGTH + 1)], None),
+)
+
+
+class RenovateRegexOrGlobList(unittest.TestCase):
+    """Direct positive, negative, and boundary cases for _matches_regex_or_glob_list."""
+
+    def test_matches_regex_or_glob_list(self) -> None:
+        for value, patterns, expected in _DIRECT_GLOB_CASES:
+            with self.subTest(value=value, patterns=patterns):
+                self.assertIs(_matches_regex_or_glob_list(value, patterns), expected)
+
+
+# Renovate main 208cd854196d, lib/util/package-rules/matchers.ts:29-48 defines
+# 19 packageRule matchers; only these 8 delegate to matchRegexOrGlobList.
+_REGEX_OR_GLOB_LIST_MATCHERS: frozenset[str] = frozenset(
+    {
+        "matchManagers",
+        "matchFileNames",
+        "matchDatasources",
+        "matchPackageNames",
+        "matchDepNames",
+        "matchDepTypes",
+        "matchCurrentValue",
+        "matchUpdateTypes",
+    }
+)
+_RENOVATE_REGEX = re.compile(r"!?/(.+)/(i?)", re.DOTALL)
+_PLAIN_RELEASE = re.compile(r"^[0-9]+(\.[0-9]+)*$")
+MAX_RELEASE_PARTS = 16
+
+
+class UnsupportedPackageRuleError(ValueError):
+    """Raised when a matching packageRule carries an unmodeled matcher or value
+    (Renovate main 208cd854196d, lib/util/package-rules/matchers.ts:29-48,
+    lib/util/package-rules/current-version.ts:24-79)."""
+
+    def __init__(self, rule_index: int, key: str, value: Any) -> None:
+        self.rule_index = rule_index
+        self.key = key
+        self.value = value
+        super().__init__(f"packageRules[{rule_index}]: matcher {key}={value!r} is not modeled")
+
+
+def _plain_release_numbers(text: str) -> tuple[int, ...] | None:
+    """Parse an exact PEP 440 release (`^[0-9]+(\\.[0-9]+)*$`) and drop trailing
+    zeros for exact-version equality in CurrentVersionMatcher (Renovate main
+    208cd854196d, lib/util/package-rules/current-version.ts:24-79)."""
+    if _PLAIN_RELEASE.fullmatch(text) is None:
+        return None
+    raw_parts = text.split(".")
+    if len(raw_parts) > MAX_RELEASE_PARTS:
+        return None
+    parts = [int(part) for part in raw_parts[:MAX_RELEASE_PARTS]]
+    end = 1
+    for index, number in enumerate(parts[:MAX_RELEASE_PARTS]):
+        if number != 0:
+            end = index + 1
+    return tuple(parts[:end])
+
+
+def _matches_current_version(version: str | None, pattern: Any) -> bool | None:
+    """Mirror Renovate CurrentVersionMatcher (Renovate main 208cd854196d,
+    lib/util/package-rules/current-version.ts:24-79): /re/, /re/i, !/re/, and
+    !/re/i reuse regex matching from lib/util/string-match.ts:29-57, 94-104;
+    plain PEP 440 releases (`^[0-9]+(\\.[0-9]+)*$`) compare release numbers
+    after dropping trailing zeros; ranges, globs, and non-strings return None."""
+    if version is None or not isinstance(pattern, str):
+        return None
+    if _RENOVATE_REGEX.fullmatch(pattern) is not None:
+        return _matches_regex_or_glob_list(version, [pattern])
+    current = _plain_release_numbers(version)
+    wanted = _plain_release_numbers(pattern)
+    if current is not None and wanted is not None:
+        return current == wanted
+    return None
+
+
+def _eval_modeled_matcher(key: str, raw: Any, dependency: dict[str, str]) -> bool | None:
+    """Evaluate one match* key: dispatch the 8 allow-listed keys to
+    matchRegexOrGlobList (Renovate main 208cd854196d,
+    lib/util/package-rules/matchers.ts:29-48), matchCurrentVersion to
+    CurrentVersionMatcher (current-version.ts:24-79), and return None for any
+    other matcher or non-string pattern list."""
+    if key == "matchCurrentVersion":
+        return _matches_current_version(dependency.get(key), raw)
+    if key not in _REGEX_OR_GLOB_LIST_MATCHERS:
+        return None
+    choices = raw if isinstance(raw, list) else [raw]
+    if not all(isinstance(item, str) for item in choices):
+        return None
+    return _matches_regex_or_glob_list(dependency.get(key, ""), choices)
+
+
+def _rule_matches(index: int, rule: dict[str, Any], dependency: dict[str, str]) -> bool:
+    """Evaluate a packageRule's matchers (Renovate main 208cd854196d,
+    lib/util/package-rules/index.ts:64-137, matchers.ts:29-48): check every
+    modeled predicate first so a rule excluded by one is skipped, then raise
+    UnsupportedPackageRuleError if an unmodeled key or value remains."""
+    unmodeled: tuple[str, Any] | None = None
+    for key, raw in rule.items():
+        if not key.startswith("match"):
             continue
-        matches = True
-        for key, patterns in rule.items():
-            if not key.startswith("match"):
-                continue
-            value = dependency.get(key, "")
-            choices = patterns if isinstance(patterns, list) else [patterns]
-            if not any(
-                (
-                    re.search(p[1:-1], value)
-                    if p.startswith("/") and p.endswith("/")
-                    else fnmatch.fnmatchcase(value, p)
-                )
-                for p in choices
-            ):
-                matches = False
-                break
-        if matches:
-            result.append(index)
-    return result
+        matched = _eval_modeled_matcher(key, raw, dependency)
+        if matched is False:
+            return False
+        if matched is None and unmodeled is None:
+            unmodeled = (key, raw)
+    if unmodeled is not None:
+        raise UnsupportedPackageRuleError(index, unmodeled[0], unmodeled[1])
+    return True
+
+
+def matching_package_rules(config: dict[str, Any], dependency: dict[str, str]) -> list[int]:
+    """Find matching rules for these concrete fixtures in their configured order
+    (Renovate main 208cd854196d, lib/util/package-rules/index.ts:64-137)."""
+    return [
+        index
+        for index, rule in enumerate(config["packageRules"])
+        if _rule_matches(index, rule, dependency)
+    ]
+
+
+def matching_group_rules(config: dict[str, Any], dependency: dict[str, str]) -> list[int]:
+    return [
+        i
+        for i in matching_package_rules(config, dependency)
+        if "groupName" in config["packageRules"][i]
+    ]
 
 
 class CoupledPinGroups(unittest.TestCase):
@@ -539,6 +760,682 @@ class PythonCiVersionGroup(unittest.TestCase):
         self.assertEqual(
             self.findings(remove), ["no single custom manager for python / actions/python-versions"]
         )
+
+
+TOOLING_INPUT = "requirements/locks/tooling-tests.in"
+LOCK_MANIFEST = "requirements/locks/manifest.json"
+UV_GROUP = "uv (lock generator, all managers)"
+UV_SELECTOR_FINDING = "uv manager selector must be the exact anchored manifest path"
+MAX_IGNORE_PATHS = 1024
+
+
+def uv_lock_generator_manager(config: dict[str, Any]) -> dict[str, Any] | None:
+    """The custom manager that owns manifest.json's uv_version, or None."""
+    managers = [
+        manager
+        for manager in config.get("customManagers", [])
+        if manager.get("depNameTemplate") == "uv"
+    ]
+    return managers[0] if len(managers) == 1 else None
+
+
+def _uv_manifest_finding(manager: dict[str, Any], manifest_text: str, version: str) -> str | None:
+    if manager.get("datasourceTemplate") != "pypi":
+        return "uv manager datasourceTemplate must be pypi"
+    selectors = manager.get("managerFilePatterns", [])
+    if len(selectors) != 1:
+        return "uv manager needs exactly one managerFilePatterns entry"
+    if selectors[0] != r"/^requirements/locks/manifest\.json$/":
+        return UV_SELECTOR_FINDING
+    patterns = [re.compile(to_python(m)) for m in manager.get("matchStrings", [])]
+    want = [version]
+    got = [
+        m.groupdict().get("currentValue", "") for p in patterns for m in p.finditer(manifest_text)
+    ]
+    if got != want:
+        return f"{LOCK_MANIFEST}: manager reads {got}, manifest uv_version is {want}"
+    return None
+
+
+def _manager_enabled_by_list(config: dict[str, Any], manager: str) -> bool:
+    """Mirror Renovate getEnabledManagersList (Renovate main 208cd854196d,
+    lib/modules/manager/index.ts:146-156): an absent or empty enabledManagers
+    enables all managers; a non-empty list enables only the listed ones."""
+    enabled_managers = config.get("enabledManagers")
+    return not enabled_managers or manager in enabled_managers
+
+
+def _is_ignored_by_renovate(path: str, ignore_paths: list[str]) -> bool:
+    """Mirror Renovate ignorePaths matching (Renovate main 208cd854196d,
+    lib/workers/repository/extract/file-match.ts:32-35): substring or glob."""
+    if len(ignore_paths) > MAX_IGNORE_PATHS:
+        return True
+    # fnmatchcase stands in for minimatch(..., {dot: true}); its * also matches /,
+    # which errs toward reporting a file ignored (fail closed).
+    return any(
+        pattern in path or fnmatch.fnmatchcase(path, pattern)
+        for pattern in ignore_paths[:MAX_IGNORE_PATHS]
+    )
+
+
+def _fold_uv_pin_rules(
+    config: dict[str, Any],
+    manager: str,
+    path: str,
+    current_value: str,
+    version: str,
+    update_type: str,
+) -> tuple[list[int], bool, Any, Any]:
+    """Fold matching packageRules in order for one uv pin (Renovate main
+    208cd854196d, lib/util/package-rules/index.ts:64-137, mergeChildConfig)."""
+    rules = config["packageRules"]
+    indices = matching_package_rules(
+        config,
+        {
+            "matchManagers": manager,
+            "matchFileNames": path,
+            "matchDatasources": "pypi",
+            "matchPackageNames": "uv",
+            "matchDepNames": "uv",
+            "matchUpdateTypes": update_type,
+            "matchCurrentValue": current_value,
+            "matchCurrentVersion": version,
+        },
+    )
+    enabled = bool(config.get(manager, {}).get("enabled", True))
+    group_name = config.get("groupName")
+    group_slug = config.get("groupSlug")
+    for index in indices:
+        rule = rules[index]
+        enabled = bool(rule.get("enabled", enabled))
+        group_name = rule.get("groupName", group_name)
+        group_slug = rule.get("groupSlug", group_slug)
+    return indices, enabled and _manager_enabled_by_list(config, manager), group_name, group_slug
+
+
+def _uv_group_finding(
+    config: dict[str, Any], update_type: str, manifest_version: str, pip_version: str
+) -> list[str]:
+    """Check manager enablement (Renovate main 208cd854196d,
+    lib/modules/manager/index.ts:146-156), effective groupName folding
+    (lib/util/package-rules/index.ts:64-137, mergeChildConfig), and effective
+    groupSlug agreement (lib/workers/repository/updates/branch-name.ts:70-95).
+    Stricter than Renovate, which compares slugify(groupSlug or groupName): this
+    compares the configured groupSlug values, so it never misses a split branch
+    but also reports a slug that only one pin sets, even when it equals the
+    slug Renovate derives from groupName."""
+    rules = config["packageRules"]
+    shared = {index for index, rule in enumerate(rules) if rule.get("groupName") == UV_GROUP}
+    groups: dict[str, Any] = {}
+    slugs: dict[str, Any] = {}
+    disabled: list[str] = []
+    for manager, path, current_value, version in (
+        ("pip_requirements", TOOLING_INPUT, f"=={pip_version}", pip_version),
+        ("custom.regex", LOCK_MANIFEST, manifest_version, manifest_version),
+    ):
+        indices, is_enabled, group_name, group_slug = _fold_uv_pin_rules(
+            config, manager, path, current_value, version, update_type
+        )
+        if not is_enabled:
+            disabled.append(f"{path}: {manager} uv ({update_type}) disabled")
+        shared.intersection_update(indices)
+        groups[manager] = group_name
+        slugs[manager] = group_slug
+    if disabled:
+        return disabled
+    if not shared:
+        return [f"uv ({update_type}): missing shared {UV_GROUP!r} rule"]
+    for manager, group_name in groups.items():
+        if group_name != UV_GROUP:
+            return [
+                f"uv ({update_type}): later {manager} rule overrides the uv group with {group_name!r}"
+            ]
+    if slugs["pip_requirements"] != slugs["custom.regex"]:
+        return [
+            f"uv ({update_type}): uv pins have mismatched groupSlug "
+            f"({slugs['pip_requirements']!r} vs {slugs['custom.regex']!r})"
+        ]
+    return []
+
+
+def _collect_uv_group_findings(
+    config: dict[str, Any], manifest_version: str, pip_version: str
+) -> list[str]:
+    """Run _uv_group_finding across patch, minor, and major; turn an
+    UnsupportedPackageRuleError (Renovate main 208cd854196d,
+    lib/util/package-rules/matchers.ts:29-48, current-version.ts:24-79) into
+    one fail-closed finding and stop the group check for that update type."""
+    findings: list[str] = []
+    for update_type in ("patch", "minor", "major"):
+        try:
+            group_findings = _uv_group_finding(config, update_type, manifest_version, pip_version)
+        except UnsupportedPackageRuleError as exc:
+            group_findings = [
+                f"packageRules[{exc.rule_index}]: "
+                f"the uv check does not model {exc.key}={exc.value!r}"
+            ]
+        for finding in group_findings:
+            if finding not in findings:
+                findings.append(finding)
+    return findings
+
+
+def uv_lock_generator_findings(config: dict[str, Any], read: Callable[[str], str]) -> list[str]:
+    """Every way the config fails to move both uv pins in one pull request."""
+    manager = uv_lock_generator_manager(config)
+    if manager is None:
+        return ["no single custom manager for uv"]
+    errors: list[str] = []
+    manifest_text = read(LOCK_MANIFEST)
+    version = str(json.loads(manifest_text)["uv_version"])
+    manifest_finding = _uv_manifest_finding(manager, manifest_text, version)
+    if manifest_finding is not None:
+        errors.append(manifest_finding)
+    pins = re.findall(r"^uv==([^\s#]+)\s*$", read(TOOLING_INPUT), re.MULTILINE)
+    if len(pins) != 1:
+        return [f"{TOOLING_INPUT}: expected one exact uv pin"]
+    patterns = config["pip_requirements"]["managerFilePatterns"]
+    if not any(re.search(pattern[1:-1], TOOLING_INPUT) for pattern in patterns):
+        errors.append(f"{TOOLING_INPUT}: outside pip_requirements file patterns")
+    for path in (TOOLING_INPUT, LOCK_MANIFEST):
+        if _is_ignored_by_renovate(path, config["ignorePaths"]):
+            errors.append(f"{path}: ignored by Renovate")
+    errors.extend(_collect_uv_group_findings(config, version, pins[0]))
+    return errors
+
+
+class UvLockGeneratorGroup(unittest.TestCase):
+    """Positive: the checked-in config has no findings and manifest.json carries
+    uv_version. Negative: a removed manager, a manager pattern that misses the
+    manifest, matchStrings that read nothing, a removed uv group rule and a uv
+    group rule placed before Python (patch) each fail. Boundary: a sibling
+    uv_version_note key in manifest.json is ignored."""
+
+    config: ClassVar[dict[str, Any]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        RenovateFilePatterns.setUpClass()
+        cls.config = RenovateFilePatterns.config
+
+    def findings(
+        self,
+        change: Callable[[dict[str, Any]], None] | None = None,
+        files: dict[str, str] | None = None,
+    ) -> list[str]:
+        config = json.loads(json.dumps(self.config))
+        if change is not None:
+            change(config)
+
+        def read(path: str) -> str:
+            if files and path in files:
+                return files[path]
+            return (ROOT / path).read_text(encoding="utf-8")
+
+        return uv_lock_generator_findings(config, read)
+
+    def test_checked_in_config_owns_uv_pins(self) -> None:
+        self.assertEqual(self.findings(), [])
+        manifest = json.loads((ROOT / LOCK_MANIFEST).read_text(encoding="utf-8"))
+        self.assertIn("uv_version", manifest)
+        self.assertRegex(manifest["uv_version"], r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
+    def test_uv_group_requires_both_updates(self) -> None:
+        (rule,) = [r for r in self.config["packageRules"] if r.get("groupName") == UV_GROUP]
+        self.assertEqual(rule.get("matchPackageNames"), ["uv"])
+        self.assertEqual(rule.get("minimumGroupSize"), 2)
+        self.assertEqual(rule.get("matchDatasources"), ["pypi"])
+        self.assertCountEqual(
+            rule.get("matchFileNames", []), ["requirements/locks/tooling-tests.in", LOCK_MANIFEST]
+        )
+
+    def test_disabled_pip_uv_without_group_name_fails(self) -> None:
+        def disable(config: dict[str, Any]) -> None:
+            config["packageRules"].append(
+                {
+                    "matchManagers": ["pip_requirements"],
+                    "matchFileNames": [TOOLING_INPUT],
+                    "matchPackageNames": ["uv"],
+                    "enabled": False,
+                }
+            )
+
+        self.assertIn(
+            f"{TOOLING_INPUT}: pip_requirements uv (patch) disabled", self.findings(disable)
+        )
+
+    def test_negative_and_regex_package_patterns_match_like_renovate(self) -> None:
+        """Negative and boundary: !glob, !/re/ and /re/i follow Renovate string-match.ts."""
+        pip_disabled = f"{TOOLING_INPUT}: pip_requirements uv (patch) disabled"
+
+        def append_pip_disable(patterns: list[str]) -> Callable[[dict[str, Any]], None]:
+            def change(config: dict[str, Any]) -> None:
+                config["packageRules"].append(
+                    {
+                        "matchManagers": ["pip_requirements"],
+                        "matchFileNames": [TOOLING_INPUT],
+                        "matchPackageNames": patterns,
+                        "enabled": False,
+                    }
+                )
+
+            return change
+
+        self.assertIn(pip_disabled, self.findings(append_pip_disable(["!numpy"])))
+        self.assertEqual(self.findings(append_pip_disable(["!uv"])), [])
+        self.assertIn(pip_disabled, self.findings(append_pip_disable(["UV"])))
+        self.assertIn(pip_disabled, self.findings(append_pip_disable(["/^UV$/i"])))
+        self.assertIn(pip_disabled, self.findings(append_pip_disable(["!/^numpy$/i"])))
+        self.assertEqual(self.findings(append_pip_disable(["!/^UV$/i"])), [])
+        self.assertEqual(self.findings(append_pip_disable(["u*", "!uv"])), [])
+        self.assertEqual(self.findings(append_pip_disable([])), [])
+
+    def _append_pip_disable_rule(
+        self,
+        package: str = "uv",
+        packages: list[str] | None = None,
+        **extra: Any,
+    ) -> Callable[[dict[str, Any]], None]:
+        package_patterns = [package] if packages is None else packages
+
+        def change(config: dict[str, Any]) -> None:
+            config["packageRules"].append(
+                {
+                    "matchManagers": ["pip_requirements"],
+                    "matchFileNames": [TOOLING_INPUT],
+                    **extra,
+                    "matchPackageNames": package_patterns,
+                    "enabled": False,
+                }
+            )
+
+        return change
+
+    def test_unmodeled_glob_package_patterns_fail_closed(self) -> None:
+        """Negative: brace, bracket, and extglob package patterns fail closed."""
+        rule_index = len(self.config["packageRules"])
+        for pattern in ("{uv,numpy}", "{u..z}v", "[u]v", "+(u)v"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    self.findings(self._append_pip_disable_rule(packages=[pattern])),
+                    [
+                        f"packageRules[{rule_index}]: "
+                        f"the uv check does not model matchPackageNames={[pattern]!r}"
+                    ],
+                )
+
+    def test_glob_package_patterns_match_like_renovate(self) -> None:
+        """Positive and boundary: modeled package globs follow minimatch."""
+        pip_disabled = [
+            f"{TOOLING_INPUT}: pip_requirements uv ({kind}) disabled"
+            for kind in ("patch", "minor", "major")
+        ]
+        for matching in (["u?"], ["u*"], ["UV"]):
+            with self.subTest(matchPackageNames=matching):
+                self.assertEqual(
+                    self.findings(self._append_pip_disable_rule(packages=matching)),
+                    pip_disabled,
+                )
+        for non_matching in (["u?v"], ["uv/**"]):
+            with self.subTest(matchPackageNames=non_matching):
+                self.assertEqual(
+                    self.findings(self._append_pip_disable_rule(packages=non_matching)),
+                    [],
+                )
+
+    def test_glob_file_patterns_match_like_renovate(self) -> None:
+        """Positive and negative: * stops at / while trailing /** crosses directories."""
+        pip_disabled = [
+            f"{TOOLING_INPUT}: pip_requirements uv ({kind}) disabled"
+            for kind in ("patch", "minor", "major")
+        ]
+        self.assertEqual(
+            self.findings(self._append_pip_disable_rule(matchFileNames=["requirements/*.in"])),
+            [],
+        )
+        self.assertEqual(
+            self.findings(self._append_pip_disable_rule(matchFileNames=["requirements/**"])),
+            pip_disabled,
+        )
+
+    def test_unmodeled_current_version_range_fails_closed(self) -> None:
+        """Negative: a matchCurrentVersion range on uv is reported as not modeled."""
+        rule_index = len(self.config["packageRules"])
+        self.assertEqual(
+            self.findings(self._append_pip_disable_rule(matchCurrentVersion=">=0")),
+            [
+                f"packageRules[{rule_index}]: "
+                "the uv check does not model matchCurrentVersion='>=0'"
+            ],
+        )
+
+    def test_current_version_regex_and_pep440_release_match_like_renovate(self) -> None:
+        """Positive and negative: regexes and exact PEP 440 releases match CurrentVersionMatcher."""
+        version = str(json.loads((ROOT / LOCK_MANIFEST).read_text(encoding="utf-8"))["uv_version"])
+        release_parts = version.split(".")
+        major = int(release_parts[0])
+        bumped_version = ".".join([*release_parts[:-1], str(int(release_parts[-1]) + 1)])
+        version_files = {
+            LOCK_MANIFEST: json.dumps({"uv_version": version}),
+            TOOLING_INPUT: f"uv=={version}\n",
+        }
+        pip_disabled = [
+            f"{TOOLING_INPUT}: pip_requirements uv ({kind}) disabled"
+            for kind in ("patch", "minor", "major")
+        ]
+        for matching in (rf"/^{major}\./", version, f"{version}.0"):
+            with self.subTest(matchCurrentVersion=matching):
+                self.assertEqual(
+                    self.findings(
+                        self._append_pip_disable_rule(matchCurrentVersion=matching),
+                        files=version_files,
+                    ),
+                    pip_disabled,
+                )
+        for non_matching in (rf"/^{major + 1}\./", rf"!/^{major}\./", bumped_version):
+            with self.subTest(matchCurrentVersion=non_matching):
+                self.assertEqual(
+                    self.findings(
+                        self._append_pip_disable_rule(matchCurrentVersion=non_matching),
+                        files=version_files,
+                    ),
+                    [],
+                )
+
+    def test_unmodeled_package_rule_matcher_fails_closed(self) -> None:
+        """Negative: an unmodeled match* key on a rule that matches uv fails closed."""
+        rule_index = len(self.config["packageRules"])
+        self.assertEqual(
+            self.findings(self._append_pip_disable_rule(matchConfidence=["high"])),
+            [
+                f"packageRules[{rule_index}]: "
+                "the uv check does not model matchConfidence=['high']"
+            ],
+        )
+
+    def test_unmodeled_matcher_on_non_uv_rule_is_ignored(self) -> None:
+        """Boundary: a rule excluded by a modeled matcher is skipped despite unmodeled keys."""
+        self.assertEqual(
+            self.findings(
+                self._append_pip_disable_rule(package="numpy", matchCurrentVersion=">=0")
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.findings(self._append_pip_disable_rule(package="numpy", matchConfidence=["high"])),
+            [],
+        )
+
+    def test_uv_managers_must_be_enabled(self) -> None:
+        pip_disabled = f"{TOOLING_INPUT}: pip_requirements uv (patch) disabled"
+        manifest_disabled = f"{LOCK_MANIFEST}: custom.regex uv (patch) disabled"
+        self.assertEqual(self.findings(lambda cfg: cfg.update(enabledManagers=[])), [])
+        npm_findings = self.findings(lambda cfg: cfg.update(enabledManagers=["npm"]))
+        self.assertIn(pip_disabled, npm_findings)
+        self.assertIn(manifest_disabled, npm_findings)
+        self.assertIn(
+            pip_disabled, self.findings(lambda cfg: cfg.update(enabledManagers=["custom.regex"]))
+        )
+        self.assertIn(
+            manifest_disabled,
+            self.findings(lambda cfg: cfg.update(enabledManagers=["pip_requirements"])),
+        )
+        self.assertIn(
+            manifest_disabled,
+            self.findings(lambda cfg: cfg.update({"custom.regex": {"enabled": False}})),
+        )
+
+    def test_missing_tooling_input_pin_fails(self) -> None:
+        self.assertIn(
+            f"{TOOLING_INPUT}: expected one exact uv pin",
+            self.findings(files={TOOLING_INPUT: "pytest-timeout==1.0"}),
+        )
+
+    def test_tooling_input_must_be_visible_to_pip_manager(self) -> None:
+        def ignore(config: dict[str, Any]) -> None:
+            config["ignorePaths"].append(TOOLING_INPUT)
+
+        def exclude(config: dict[str, Any]) -> None:
+            config["pip_requirements"]["managerFilePatterns"] = [r"/^requirements\.txt$/"]
+
+        self.assertIn(f"{TOOLING_INPUT}: ignored by Renovate", self.findings(ignore))
+        self.assertIn(
+            f"{TOOLING_INPUT}: outside pip_requirements file patterns", self.findings(exclude)
+        )
+
+    def test_ignored_uv_manifest_fails(self) -> None:
+        def ignore_exact(config: dict[str, Any]) -> None:
+            config["ignorePaths"].append(LOCK_MANIFEST)
+
+        def ignore_substring(config: dict[str, Any]) -> None:
+            config["ignorePaths"] = ["requirements/locks"]
+
+        self.assertIn(f"{LOCK_MANIFEST}: ignored by Renovate", self.findings(ignore_exact))
+        substring_findings = self.findings(ignore_substring)
+        self.assertIn(f"{LOCK_MANIFEST}: ignored by Renovate", substring_findings)
+        self.assertIn(f"{TOOLING_INPUT}: ignored by Renovate", substring_findings)
+
+    def test_manifest_allows_space_before_colon(self) -> None:
+        self.assertEqual(self.findings(files={LOCK_MANIFEST: '{"uv_version" : "0.13.6"}'}), [])
+
+    def test_missing_manager_fails(self) -> None:
+        def remove(config: dict[str, Any]) -> None:
+            config["customManagers"] = [
+                m for m in config["customManagers"] if m.get("depNameTemplate") != "uv"
+            ]
+
+        self.assertEqual(self.findings(remove), ["no single custom manager for uv"])
+
+    def test_manager_pattern_missing_manifest_fails(self) -> None:
+        def mispoint(config: dict[str, Any]) -> None:
+            manager = uv_lock_generator_manager(config)
+            assert manager is not None
+            manager["managerFilePatterns"] = ["/^requirements/locks/other\\.json$/"]
+
+        self.assertIn(UV_SELECTOR_FINDING, self.findings(mispoint))
+
+    def manager_findings(self, **changes: Any) -> list[str]:
+        def change(config: dict[str, Any]) -> None:
+            manager = uv_lock_generator_manager(config)
+            assert manager is not None
+            manager.update(changes)
+
+        return self.findings(change)
+
+    def test_manager_requires_one_selector(self) -> None:
+        selectors = [r"/^requirements/locks/manifest\.json$/", r"/^another\.json$/"]
+        for patterns in ([], selectors):
+            with self.subTest(patterns=patterns):
+                self.assertIn(
+                    "uv manager needs exactly one managerFilePatterns entry",
+                    self.manager_findings(managerFilePatterns=patterns),
+                )
+
+    def test_selector_cannot_match_sibling(self) -> None:
+        self.assertIn(
+            UV_SELECTOR_FINDING,
+            self.manager_findings(managerFilePatterns=[r"/^requirements/locks/[^/]+\.json$/"]),
+        )
+
+    def test_selector_cannot_match_nested_manifest(self) -> None:
+        self.assertIn(
+            UV_SELECTOR_FINDING,
+            self.manager_findings(
+                managerFilePatterns=[r"/^requirements/locks/(?:.*/)?manifest\.json$/"]
+            ),
+        )
+
+    def test_selector_cannot_match_archived_manifest(self) -> None:
+        """Negative: even an optional literal archive directory widens the selector."""
+        self.assertIn(
+            UV_SELECTOR_FINDING,
+            self.manager_findings(
+                managerFilePatterns=[r"/^requirements/locks/(?:archive/)?manifest\.json$/"]
+            ),
+        )
+
+    def test_manager_requires_pypi(self) -> None:
+        self.assertIn(
+            "uv manager datasourceTemplate must be pypi",
+            self.manager_findings(datasourceTemplate="npm"),
+        )
+
+    def test_current_value_rule_cannot_split_uv_pins(self) -> None:
+        """Negative: a later pip rule for this version overrides all three update types."""
+        version = json.loads((ROOT / LOCK_MANIFEST).read_text(encoding="utf-8"))["uv_version"]
+
+        def override(config: dict[str, Any]) -> None:
+            config["packageRules"].append(
+                {
+                    "matchManagers": ["pip_requirements"],
+                    "matchPackageNames": ["uv"],
+                    "matchCurrentValue": f"=={version}",
+                    "groupName": "split",
+                }
+            )
+
+        self.assertEqual(
+            self.findings(override),
+            [
+                f"uv ({kind}): later pip_requirements rule overrides the uv group with 'split'"
+                for kind in ("patch", "minor", "major")
+            ],
+        )
+
+    def test_later_pypi_group_cannot_override_uv(self) -> None:
+        for manager, path in (
+            ("custom.regex", LOCK_MANIFEST),
+            ("pip_requirements", "requirements/locks/tooling-tests.in"),
+        ):
+
+            def override(config: dict[str, Any], manager: str = manager, path: str = path) -> None:
+                config["packageRules"].append(
+                    {
+                        "matchManagers": [manager],
+                        "matchDatasources": ["pypi"],
+                        "matchPackageNames": ["uv"],
+                        "matchFileNames": [path],
+                        "matchUpdateTypes": ["major"],
+                        "groupName": "another group",
+                    }
+                )
+
+            with self.subTest(manager=manager):
+                self.assertIn(
+                    f"uv (major): later {manager} rule overrides the uv group with 'another group'",
+                    self.findings(override),
+                )
+
+    def test_later_shared_rule_can_restore_uv_group_after_pip_override(self) -> None:
+        """Positive and negative: folding matching rules lets a later shared rule restore UV_GROUP."""
+        pip_split = {
+            "matchManagers": ["pip_requirements"],
+            "matchFileNames": [TOOLING_INPUT],
+            "matchPackageNames": ["uv"],
+            "groupName": "split",
+        }
+        shared_restore = {
+            "matchDatasources": ["pypi"],
+            "matchFileNames": [TOOLING_INPUT, LOCK_MANIFEST],
+            "matchPackageNames": ["uv"],
+            "groupName": UV_GROUP,
+        }
+        self.assertIn(
+            "uv (patch): later pip_requirements rule overrides the uv group with 'split'",
+            self.findings(lambda cfg: cfg["packageRules"].append(pip_split)),
+        )
+        self.assertEqual(
+            self.findings(lambda cfg: cfg["packageRules"].extend([pip_split, shared_restore])),
+            [],
+        )
+
+    def test_uv_group_slug_must_agree_across_both_pins(self) -> None:
+        """Negative and positive: diverging groupSlug splits branches; a shared slug agrees."""
+        pip_slug = {
+            "matchManagers": ["pip_requirements"],
+            "matchFileNames": [TOOLING_INPUT],
+            "matchPackageNames": ["uv"],
+            "groupSlug": "uv-pip-only",
+        }
+        shared_slug = {
+            "matchDatasources": ["pypi"],
+            "matchFileNames": [TOOLING_INPUT, LOCK_MANIFEST],
+            "matchPackageNames": ["uv"],
+            "groupSlug": "uv-lock-generator",
+        }
+
+        def top_and_pip_slug(cfg: dict[str, Any]) -> None:
+            cfg["groupSlug"] = "top-slug"
+            cfg["packageRules"].append(pip_slug)
+
+        self.assertIn(
+            "uv (patch): uv pins have mismatched groupSlug ('uv-pip-only' vs None)",
+            self.findings(lambda cfg: cfg["packageRules"].append(pip_slug)),
+        )
+        self.assertEqual(
+            self.findings(lambda cfg: cfg["packageRules"].append(shared_slug)),
+            [],
+        )
+        self.assertEqual(
+            self.findings(lambda cfg: cfg["packageRules"].extend([pip_slug, shared_slug])),
+            [],
+        )
+        self.assertEqual(
+            self.findings(lambda cfg: cfg.update(groupSlug="top-slug")),
+            [],
+        )
+        self.assertIn(
+            "uv (patch): uv pins have mismatched groupSlug ('uv-pip-only' vs 'top-slug')",
+            self.findings(top_and_pip_slug),
+        )
+
+    def test_match_strings_reading_nothing_fails(self) -> None:
+        def miss(config: dict[str, Any]) -> None:
+            manager = uv_lock_generator_manager(config)
+            assert manager is not None
+            manager["matchStrings"] = [
+                '"other_version":\\s*"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"'
+            ]
+
+        self.assertTrue(
+            any(e.startswith(f"{LOCK_MANIFEST}: manager reads []") for e in self.findings(miss))
+        )
+
+    def test_removed_uv_group_rule_splits_copies(self) -> None:
+        def ungroup(config: dict[str, Any]) -> None:
+            config["packageRules"] = [
+                r for r in config["packageRules"] if r.get("groupName") != UV_GROUP
+            ]
+
+        errors = self.findings(ungroup)
+        self.assertTrue(any(e.startswith("uv (patch):") for e in errors))
+        self.assertTrue(any(e.startswith("uv (minor):") for e in errors))
+
+    def test_uv_rule_before_python_patch_splits_copies(self) -> None:
+        def move_early(config: dict[str, Any]) -> None:
+            uv_rules = [r for r in config["packageRules"] if r.get("groupName") == UV_GROUP]
+            rest = [r for r in config["packageRules"] if r.get("groupName") != UV_GROUP]
+            patch_idx = next(
+                i for i, r in enumerate(rest) if r.get("groupName") == "Python (patch)"
+            )
+            config["packageRules"] = [*rest[:patch_idx], *uv_rules, *rest[patch_idx:]]
+
+        errors = self.findings(move_early)
+        self.assertTrue(any(e.startswith("uv (patch):") for e in errors))
+        self.assertTrue(any(e.startswith("uv (minor):") for e in errors))
+
+    def test_manifest_lookalike_key_is_ignored(self) -> None:
+        real = json.loads((ROOT / LOCK_MANIFEST).read_text(encoding="utf-8"))
+        planted = json.dumps(
+            {
+                "uv_version_note": "1.2.3",
+                "uv_version": real["uv_version"],
+                "locks": real["locks"],
+            },
+            indent=2,
+        )
+        self.assertIn('"uv_version_note": "1.2.3"', planted)
+        self.assertEqual(self.findings(files={LOCK_MANIFEST: planted}), [])
 
 
 RUST_PINS = {

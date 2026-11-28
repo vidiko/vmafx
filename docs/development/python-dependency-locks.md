@@ -18,9 +18,22 @@ The central authority is `requirements/locks/manifest.json`, which pairs every
 lock file with its source files and compilation arguments using a reviewed,
 pinned
 version of `uv` (`uv_version` in `requirements/locks/manifest.json`).
-Both `check` and `write` reject a manifest input whose `uv` pin differs from
-`uv_version`, so a Renovate PR that bumps the pin must update `uv_version` in
-the same change to pass.
+`check`, `bootstrap-uv`, and `write` reject a manifest input whose `uv` pin differs from
+`uv_version` (`test_check_rejects_manifest_only_bump` and
+`test_check_rejects_tooling_input_only_bump` for `check`,
+`test_mismatched_input_refused_before_uv_runs` for `bootstrap-uv`, and
+`test_write_rejects_mismatch_before_running_uv` for `write` in
+`scripts/ci/tests/test_python_dependency_locks.py`). Renovate keeps both files visible
+and groups the `requirements/locks/tooling-tests.in` pin with `uv_version` through the
+`uv (lock generator, all managers)` group in `renovate.json`, guarded by
+`test_checked_in_config_owns_uv_pins` in `scripts/ci/tests/test_renovate_file_patterns.py`.
+The guard mirrors Renovate's package-rule matching for the keys it models and
+reports a rule that may apply to a `uv` pin through a matcher, glob pattern, or
+`matchCurrentVersion` value it does not model
+(`test_unmodeled_package_rule_matcher_fails_closed`).
+Renovate’s `minimumGroupSize` threshold (`test_uv_group_requires_both_updates`) only
+postpones creation of a new branch, so the `check` hook still rejects a pull request that
+changes just one pin.
 
 The checker recognizes `uv` by its case-insensitive, PEP 503-normalized package
 name. It checks `==` and `===` pins with optional extras, whitespace, and
@@ -81,6 +94,7 @@ CI Workflows & Dockerfiles                Local Workstation (make lint-tools, cy
 | --- | --- |
 | `make python-locks-check` | Validates that all lock files match their inputs and that every executed `pip install` in the repo uses `--require-hashes` or local `--no-deps`. Offline, fast. |
 | `make python-locks-write` | Networked refresh: runs the pinned `uv` compiler to update all lock files and re-stamp metadata headers. |
+| `python3 scripts/ci/check_python_dependency_locks.py bootstrap-uv --output FILE` | Compiles a temporary hash-pinned generator lock when the installed uv differs from the reviewed version. Pass a new or throwaway path (`.github/workflows/python-lock-refresh.yml` uses `$RUNNER_TEMP/uv-bootstrap.txt`): `bootstrap-uv` removes `FILE` when the versions match (`test_matching_version_removes_stale_output`), and when they differ it removes any existing `FILE` before compiling and leaves no file if compilation fails without restoring the old one (`test_failed_bootstrap_compile_leaves_no_output`). |
 | `make lint-tools` | Installs project linting tools (`ruff`, `black`, `mypy`) into `.venv` from `requirements/locks/dev-linters.txt` using `--require-hashes`. |
 | `make cythonize-deps` | Installs C-extension build dependencies (`Cython`, `numpy`, `setuptools`, `packaging`) from `requirements/locks/cythonize.txt` using `--require-hashes`. |
 | `python3 -m pip install --require-hashes -r requirements/locks/nox.txt` | Installs the reviewed Nox release and its transitive dependencies before running local package sessions. |
@@ -95,6 +109,29 @@ only live entries among the 30 exact paths in
 new operator grant. If the branch moves or is deleted, publication fails without
 overwriting it. The next input change runs refresh again; otherwise rerun it
 against the current tip.
+
+A uv bump changes `tooling-tests.in` and the manifest's `uv_version` while
+`tooling-tests.txt` still pins the old uv. The job installs that old uv, then
+`check_python_dependency_locks.py bootstrap-uv` uses it to compile the
+generator lock into a temporary hash-pinned file. The job installs the reviewed
+uv from that file and runs `write` to regenerate every lock with it.
+`test_stale_tooling_lock_regenerates_after_bootstrap` exercises this recovery.
+`test_checked_in_workflow_has_the_required_shape` in
+`scripts/ci/tests/test_python_lock_refresh_workflow.py` checks the step order.
+The bootstrap install covers the whole generator entry (every package in the
+temporary hash-pinned lock that `bootstrap-uv` compiles, not only uv). Because
+that lock is compiled at run time and never committed, its packages enter the
+job environment before review, matching what `write` then commits for review.
+The job installs the old uv from the committed `tooling-tests.txt` hashes, so if
+those release files are deleted from PyPI, the hashes stop installing and the
+bump needs manual lock regeneration. A yanked release still installs from the
+exact `==` pin under pip (PEP 592, Installers, suggested approach 1), though
+PEP 592 lets an installer refuse it.
+
+In `renovate.json`, the `custom.regex` manager for `uv_version` matches only
+three-part `X.Y.Z` releases (`[0-9]+\.[0-9]+\.[0-9]+`), so a four-part or
+pre-release uv version is not extracted and splits the update group, while
+`check` still refuses a one-sided bump.
 
 ## How to add or update a dependency
 
