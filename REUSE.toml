@@ -18,7 +18,6 @@ path = ["scripts/ci/tests/test-toolchain-probe-mingw.sh"]
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 luoye-cpu"
 SPDX-License-Identifier = "EUPL-1.2"
-
 # These six files descend from Netflix/vmaf root files.  ADR-1250 requires
 # inherited work, and every fork contribution to it, to remain on the terms it
 # already carried rather than being swept into the fork-local EUPL default.
@@ -275,6 +274,16 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = "2016-2020 Netflix, Inc."
 SPDX-License-Identifier = "BSD-2-Clause-Patent"
+
+# The CLI golden transcripts (ADR-3543) are diff targets: no inline SPDX
+# header may precede the pinned bytes, so their terms are annotated here
+# (ADR-3401: outside contributors name themselves as holders). This table
+# must stay after the core/** table: REUSE applies the last matching one.
+[[annotations]]
+path = ["core/tools/test/golden/*.txt"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 luoye-cpu"
+SPDX-License-Identifier = "EUPL-1.2"
 
 [[annotations]]
 path = ["core/src/mcp/3rdparty/cJSON/**"]
