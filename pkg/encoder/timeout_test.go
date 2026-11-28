@@ -16,30 +16,6 @@ import (
 	"time"
 )
 
-func TestEncodeTimeout_DefaultWhenUnset(t *testing.T) {
-	t.Setenv("VMAFX_TUNE_ENCODE_TIMEOUT", "")
-	got := encodeTimeout()
-	if got != defaultEncodeTimeout {
-		t.Errorf("encodeTimeout() = %v, want %v (the default)", got, defaultEncodeTimeout)
-	}
-}
-
-func TestEncodeTimeout_HonoursEnvOverride(t *testing.T) {
-	t.Setenv("VMAFX_TUNE_ENCODE_TIMEOUT", "7s")
-	got := encodeTimeout()
-	if got != 7*time.Second {
-		t.Errorf("encodeTimeout() = %v, want 7s", got)
-	}
-}
-
-func TestEncodeTimeout_InvalidEnvFallsBackToDefault(t *testing.T) {
-	t.Setenv("VMAFX_TUNE_ENCODE_TIMEOUT", "not-a-duration")
-	got := encodeTimeout()
-	if got != defaultEncodeTimeout {
-		t.Errorf("encodeTimeout() with invalid env = %v, want default %v", got, defaultEncodeTimeout)
-	}
-}
-
 func TestProbeTimeout_DefaultWhenUnset(t *testing.T) {
 	t.Setenv("VMAFX_TUNE_PROBE_TIMEOUT", "")
 	got := probeTimeout()

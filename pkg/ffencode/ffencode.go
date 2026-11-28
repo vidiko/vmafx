@@ -36,13 +36,19 @@ import (
 
 // DefaultEncodeTimeout bounds a single ffmpeg encode subprocess. Override via
 // VMAFX_TUNE_ENCODE_TIMEOUT (a Go duration); 0 or negative disables it.
-// Mirrors pkg/encoder's posture so both drivers behave alike under a wedged
-// encoder or a blocked GPU driver.
+// The Python encoder has no timeout; this Go-side bound is a deliberate
+// improvement, not a parity gap. pkg/encoder and pkg/encodeprofile call
+// EncodeTimeout() directly, so all three encode drivers share this bound under
+// a wedged encoder or a blocked GPU driver.
 const DefaultEncodeTimeout = 60 * time.Minute
 
-// encodeTimeout returns the per-call ffmpeg timeout honouring the operator
-// override.
-func encodeTimeout() time.Duration {
+// EncodeTimeout returns the per-call ffmpeg timeout honouring the operator
+// override. The value is parsed with time.ParseDuration; an empty or
+// unparseable VMAFX_TUNE_ENCODE_TIMEOUT falls back to DefaultEncodeTimeout.
+// A zero or negative duration is returned as is and means no timeout, so
+// callers must check the result for a positive value before passing it to
+// context.WithTimeout.
+func EncodeTimeout() time.Duration {
 	if raw := os.Getenv("VMAFX_TUNE_ENCODE_TIMEOUT"); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil {
 			return d
@@ -483,7 +489,7 @@ type Runner func(ctx context.Context, argv []string) (stderr string, exitStatus 
 func defaultRunner(ctx context.Context, argv []string) (string, int, error) {
 	cancel := func() {}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		if to := encodeTimeout(); to > 0 {
+		if to := EncodeTimeout(); to > 0 {
 			ctx, cancel = context.WithTimeout(ctx, to)
 		}
 	}
@@ -491,7 +497,7 @@ func defaultRunner(ctx context.Context, argv []string) (string, int, error) {
 
 	// #nosec G204 -- argv[0] is the operator-configured ffmpeg binary and
 	// argv[1:] is assembled by BuildFFmpegCommand from validated CLI flags.
-	// ctx enforces encodeTimeout().
+	// ctx enforces EncodeTimeout().
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.WaitDelay = 2 * time.Second
 	out, runErr := cmd.CombinedOutput()
