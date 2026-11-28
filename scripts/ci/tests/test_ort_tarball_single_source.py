@@ -179,7 +179,7 @@ class TestOrtGuard(unittest.TestCase):
         call = '    python ort_nuget_install.py --version "$ORT_VERSION"\n'
         for assignment, expected in (
             ("", False),
-            ("    ORT_VERSION=1.0\n", False),
+            ("    ORT_VERSION=1.0\n", True),
             ("    ORT_VERSION=9.0\n", True),
             ('    ORT_VERSION="$NEXT_VERSION"\n', True),
             ('    ORT_VERSION="$(cat version)"\n', True),
@@ -200,36 +200,39 @@ class TestOrtGuard(unittest.TestCase):
         cases = (
             (
                 f'- run: |\n    ORT_VERSION=1.0 && ORT_VERSION="$NEXT_VERSION" && {tail}',
-                ":2: unpinned ORT_VERSION '\"$NEXT_VERSION\"' for package 'cpu'",
+                ":2: ambiguous ORT_VERSION in step",
             ),
             (
                 '- name: install\n  env:\n    ORT_VERSION: "1.0"\n  run: |\n'
                 f'    true && ORT_VERSION="$NEXT_VERSION" && {tail}',
-                ":5: unpinned ORT_VERSION '\"$NEXT_VERSION\"' for package 'cpu'",
+                ":5: ambiguous ORT_VERSION in step",
             ),
             (
                 f'- run: |\n    ORT_VERSION="1.0$NEXT_VERSION" {tail}',
-                ":2: unpinned ORT_VERSION '\"1.0$NEXT_VERSION\"' for package 'cpu'",
+                ":2: ambiguous ORT_VERSION in step",
             ),
             (
                 f"- run: |\n    ORT_VERSION=1.0#$NEXT_VERSION {tail}",
-                ":2: unpinned ORT_VERSION '1.0#$NEXT_VERSION' for package 'cpu'",
+                ":2: ambiguous ORT_VERSION in step",
             ),
             (
                 f"- run: |\n    ORT_VERSION=1.0$(echo ORT_VERSION=1.0 ) {tail}",
-                ":2: unpinned ORT_VERSION '1.0$(echo ORT_VERSION=1.0 )' for package 'cpu'",
+                ":2: ambiguous ORT_VERSION in step",
             ),
             (
                 f'- run: |\n    ORT_VERSION="--version 1.0" && {tail}',
-                ":2: unpinned ORT_VERSION '\"--version 1.0\"' for package 'cpu'",
+                ":2: ambiguous ORT_VERSION in step",
             ),
-            (f'- run: |\n    ORT_VERSION="1.0" {tail}', None),
+            (
+                f'- run: |\n    ORT_VERSION="1.0" {tail}',
+                ":2: ambiguous ORT_VERSION in step",
+            ),
         )
         for text, expected in cases[: guard.MAX_COMMAND_LINES]:
             with self.subTest(text=text):
                 workflow.write_text(text, encoding="utf-8")
                 findings = guard.scan_file(workflow, packages)[0]
-                self.assertEqual(findings, [f"{workflow}{expected}"] if expected else [])
+                self.assertEqual(findings, [f"{workflow}{expected}"])
 
     def test_nuget_package_identity(self) -> None:
         workflow = Path(self.temp.name) / "downloads.yml"
@@ -884,3 +887,308 @@ class TestOrtGuard(unittest.TestCase):
             guard.check_tarball_pins(root=root),
             (1, [f"{workflow}:1: old ONNX Runtime release source forbidden"]),
         )
+
+    def test_workflow_rebind_after_and_refused(self) -> None:
+        workflow = Path(self.temp.name) / "rebind_and.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        call = '    python3 ort_nuget_install.py --version "$ORT_VERSION"\n'
+        for header, line_no in (
+            ('- name: install\n  env:\n    ORT_VERSION: "1.0"\n  run: |\n', 6),
+            ("- name: install\n  run: |\n", 4),
+        ):
+            workflow.write_text(header + '    true && ORT_VERSION="$(cat v)"\n' + call)
+            self.assertEqual(
+                guard.scan_file(workflow, packages)[0],
+                [f"{workflow}:{line_no}: ambiguous ORT_VERSION in step"],
+            )
+
+    def test_workflow_export_after_and_refused(self) -> None:
+        workflow = Path(self.temp.name) / "export_and.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        call = '    python3 ort_nuget_install.py --version "$ORT_VERSION"\n'
+        for header, line_no in (
+            ('- name: install\n  env:\n    ORT_VERSION: "1.0"\n  run: |\n', 6),
+            ("- name: install\n  run: |\n", 4),
+        ):
+            workflow.write_text(header + "    true && export ORT_VERSION=1.0\n" + call)
+            self.assertEqual(
+                guard.scan_file(workflow, packages)[0],
+                [f"{workflow}:{line_no}: ambiguous ORT_VERSION in step"],
+            )
+
+    def test_workflow_read_ort_version_refused(self) -> None:
+        workflow = Path(self.temp.name) / "read_var.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        call = '    python3 ort_nuget_install.py --version "$ORT_VERSION"\n'
+        for rebind in (
+            "    read ORT_VERSION\n",
+            "    declare ORT_VERSION=1.0\n",
+            "    printf -v ORT_VERSION 1.0\n",
+        ):
+            for header, line_no in (
+                ('- name: install\n  env:\n    ORT_VERSION: "1.0"\n  run: |\n', 6),
+                ("- name: install\n  run: |\n", 4),
+            ):
+                workflow.write_text(header + rebind + call)
+                self.assertEqual(
+                    guard.scan_file(workflow, packages)[0],
+                    [f"{workflow}:{line_no}: ambiguous ORT_VERSION in step"],
+                )
+
+    def test_workflow_echo_prefix_binding_refused(self) -> None:
+        workflow = Path(self.temp.name) / "echo_prefix.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        workflow.write_text(
+            '- run: ORT_VERSION=1.0 echo ok && python3 ort_nuget_install.py --version "$ORT_VERSION"\n'
+        )
+        self.assertEqual(
+            guard.scan_file(workflow, packages)[0],
+            [f"{workflow}:1: ambiguous ORT_VERSION in step"],
+        )
+
+    def test_workflow_inline_prefix_binding_refused(self) -> None:
+        workflow = Path(self.temp.name) / "inline_prefix.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        workflow.write_text(
+            '- run: ORT_VERSION=1.0 python3 ort_nuget_install.py --version "$ORT_VERSION"\n'
+        )
+        self.assertEqual(
+            guard.scan_file(workflow, packages)[0],
+            [f"{workflow}:1: ambiguous ORT_VERSION in step"],
+        )
+
+    def test_workflow_quoted_hash_before_unpinned_call_refused(self) -> None:
+        workflow = Path(self.temp.name) / "quoted_hash.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        workflow.write_text('- run: echo "step #1" && python3 ort_nuget_install.py --version 9.9\n')
+        self.assertEqual(
+            guard.scan_file(workflow, packages)[0],
+            [f"{workflow}:1: unpinned ORT_VERSION '9.9' for package 'cpu'"],
+        )
+
+    def test_workflow_command_substitution_boundary_refused(self) -> None:
+        workflow = Path(self.temp.name) / "cmd_sub.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        for line, expected in (
+            (
+                "- run: echo $(printf '%s' #1) && python3 ort_nuget_install.py --version 9.9\n",
+                "unpinned ORT_VERSION '9.9' for package 'cpu'",
+            ),
+            (
+                "- run: echo ${STEP_NAME:- #1} && python3 ort_nuget_install.py --version 9.9\n",
+                "unpinned ORT_VERSION '9.9' for package 'cpu'",
+            ),
+            (
+                "- run: python3 ort_nuget_install.py --version 1.0 --prefix $(echo /a; echo /b)\n",
+                "invalid ort_nuget_install.py arguments in step",
+            ),
+        ):
+            workflow.write_text(line)
+            self.assertEqual(guard.scan_file(workflow, packages)[0], [f"{workflow}:1: {expected}"])
+
+    def test_workflow_backtick_boundary_refused(self) -> None:
+        workflow = Path(self.temp.name) / "backticks.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        for line, expected in (
+            (
+                "- run: echo `printf '%s' #1` && python3 ort_nuget_install.py --version 9.9\n",
+                "unpinned ORT_VERSION '9.9' for package 'cpu'",
+            ),
+            (
+                "- run: python3 ort_nuget_install.py --version 1.0 --prefix `echo /a && echo /b`\n",
+                "invalid ort_nuget_install.py arguments in step",
+            ),
+        ):
+            workflow.write_text(line)
+            self.assertEqual(guard.scan_file(workflow, packages)[0], [f"{workflow}:1: {expected}"])
+
+    def test_workflow_prefix_package_flag_refused(self) -> None:
+        workflow = Path(self.temp.name) / "prefix_pkg.yml"
+        packages: dict[str, dict[str, Any]] = {
+            "cpu": {"versions": {"1.0": {}}},
+            "gpu": {"versions": {"2.0": {}}},
+        }
+        workflow.write_text(
+            '- run: FOO="--package cpu" python3 ort_nuget_install.py --package gpu --version 1.0\n'
+        )
+        self.assertEqual(
+            guard.scan_file(workflow, packages)[0],
+            [f"{workflow}:1: unpinned ORT_VERSION '1.0' for package 'gpu'"],
+        )
+
+    def test_workflow_duplicate_version_flag_refused(self) -> None:
+        workflow = Path(self.temp.name) / "dup_ver.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        workflow.write_text("- run: python3 ort_nuget_install.py --version 1.0 --version 9.9\n")
+        self.assertEqual(
+            guard.scan_file(workflow, packages)[0],
+            [f"{workflow}:1: invalid ort_nuget_install.py arguments in step"],
+        )
+
+    def test_workflow_default_expansion_version_refused(self) -> None:
+        workflow = Path(self.temp.name) / "default_ver.yml"
+        packages: dict[str, dict[str, Any]] = {"cpu": {"versions": {"1.0": {}}}}
+        for arg in ("${ORT_VERSION:-1.0}", '"${ORT_VERSION:-1.0}"'):
+            workflow.write_text(
+                '- name: install\n  env:\n    ORT_VERSION: "1.0"\n'
+                f"  run: python3 scripts/ci/ort_nuget_install.py --version {arg}\n"
+            )
+            self.assertEqual(
+                guard.scan_file(workflow, packages)[0],
+                [f"{workflow}:4: invalid ort_nuget_install.py arguments in step"],
+            )
+
+    def test_workflow_env_and_whole_line_two_sites_refused(self) -> None:
+        workflow = Path(self.temp.name) / "two_sites.yml"
+        for assign in ("    ORT_VERSION=1.22.0\n", '    export ORT_VERSION="1.22.0"\n'):
+            workflow.write_text(
+                '- name: Install ORT\n  env:\n    ORT_VERSION: "1.22.0"\n  run: |\n'
+                + assign
+                + '    python3 scripts/ci/ort_nuget_install.py --version "${ORT_VERSION}"'
+                " --prefix /opt/onnxruntime\n"
+            )
+            self.assertEqual(
+                guard.check_tarball_pins(files=[workflow]),
+                (1, [f"{workflow}:6: ambiguous ORT_VERSION in step"]),
+            )
+
+    def test_nuget_download_multiple_or_noncanonical_sites_refused(self) -> None:
+        workflow = Path(self.temp.name) / "nuget_sites.yml"
+        url = "https://api.nuget.org/v3-flatcontainer/${OTHER}/file"
+        for body, line_no in (
+            (
+                "- name: dl\n  env:\n    OTHER: unrelated\n  run: |\n"
+                f"    OTHER=unrelated\n    curl {url}\n",
+                6,
+            ),
+            (f"- name: dl\n  run: |\n    true && OTHER=unrelated\n    curl {url}\n", 4),
+            (f"- name: dl\n  run: |\n    read OTHER\n    curl {url}\n", 4),
+        ):
+            workflow.write_text(body)
+            self.assertEqual(
+                guard.scan_file(workflow, {})[0],
+                [f"{workflow}:{line_no}: NuGet download with unresolved package"],
+            )
+
+    def test_workflow_helper_continuation_limits(self) -> None:
+        workflow = Path(self.temp.name) / "continuation_limit.yml"
+        head = "- run: |\n    python3 scripts/ci/ort_nuget_install.py --version 1.30.0 \\\n"
+        tail = "      --prefix /opt/onnxruntime\n"
+        workflow.write_text(head + "      \\\n" * (guard.MAX_COMMAND_LINES - 2) + tail)
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+        workflow.write_text(head + "      \\\n" * (guard.MAX_COMMAND_LINES - 1) + tail)
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:2: helper command continuation exceeds limit"]),
+        )
+        call = (
+            "python3 scripts/ci/ort_nuget_install.py --version 1.30.0 --prefix /opt/onnxruntime\n"
+        )
+        workflow.write_text("- run: " + "true; " * (guard.MAX_STEP_LINES - 1) + call)
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+        workflow.write_text("- run: " + "true; " * guard.MAX_STEP_LINES + call)
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:1: helper command continuation exceeds limit"]),
+        )
+
+    def test_workflow_step_binding_limits(self) -> None:
+        workflow = Path(self.temp.name) / "step_limit.yml"
+        helper_head = '- name: install\n  env:\n    ORT_VERSION: "1.30.0"\n  run: |\n'
+        helper_call = (
+            '    python3 scripts/ci/ort_nuget_install.py --version "${ORT_VERSION}"'
+            " --prefix /opt/onnxruntime\n"
+        )
+        workflow.write_text(
+            helper_head + "    echo ok\n" * (guard.MAX_STEP_LINES - 5) + helper_call
+        )
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+        workflow.write_text(
+            helper_head + "    echo ok\n" * (guard.MAX_STEP_LINES - 4) + helper_call
+        )
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:{guard.MAX_STEP_LINES + 1}: step binding limit exceeded"]),
+        )
+        nuget_head = "- name: dl\n  env:\n    OTHER: unrelated\n  run: |\n"
+        nuget_call = "    curl https://api.nuget.org/v3-flatcontainer/${OTHER}/file\n"
+        workflow.write_text(nuget_head + "    echo ok\n" * (guard.MAX_STEP_LINES - 5) + nuget_call)
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+        workflow.write_text(nuget_head + "    echo ok\n" * (guard.MAX_STEP_LINES - 4) + nuget_call)
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:{guard.MAX_STEP_LINES + 1}: step binding limit exceeded"]),
+        )
+
+    def test_workflow_nuget_address_limit_and_v2_package(self) -> None:
+        workflow = Path(self.temp.name) / "nuget_limit.yml"
+        unit = " https://api.nuget.org/v3-flatcontainer/other.pkg/file"
+        workflow.write_text("run: curl" + unit * guard.MAX_COMMAND_LINES + "\n")
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+        workflow.write_text("run: curl" + unit * (guard.MAX_COMMAND_LINES + 1) + "\n")
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:1: NuGet address limit exceeded"]),
+        )
+        workflow.write_text(
+            "run: curl https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/1.99.0\n"
+        )
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:1: ONNX Runtime download must use helper"]),
+        )
+        workflow.write_text(
+            "run: curl https://www.nuget.org/api/v2/package/${UNPINNED_PKG}/1.99.0\n"
+        )
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:1: NuGet download with unresolved package"]),
+        )
+        workflow.write_text(
+            "run: curl https://www.nuget.org/api/v2/package/Newtonsoft.Json/13.0.3\n"
+        )
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+
+    def test_workflow_five_canonical_call_site_shapes_accepted(self) -> None:
+        workflow = Path(self.temp.name) / "canonical.yml"
+        sites = (
+            ("1.30.0", "", ""),
+            ("1.29.0", "", ""),
+            ("1.22.0", "", ""),
+            ("1.22.0", "", ""),
+            ("1.22.0", "--package gpu ", ' --cache-dir "${RUNNER_TEMP}/ort-cache"'),
+        )
+        steps = [
+            f"      - name: Install ORT {idx}\n"
+            "        env:\n"
+            f'          ORT_VERSION: "{ver}"\n'
+            "        run: |\n"
+            f'          python3 scripts/ci/ort_nuget_install.py {pkg}--version "${{ORT_VERSION}}" \\\n'
+            f"            --prefix /opt/onnxruntime{cache}\n"
+            for idx, (ver, pkg, cache) in enumerate(sites)
+        ]
+        workflow.write_text("jobs:\n  build:\n    steps:\n" + "".join(steps))
+        self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+
+    def test_workflow_whole_line_binding_quoted_hash_and_real_tree(self) -> None:
+        workflow = Path(self.temp.name) / "whole_line.yml"
+        for assign in ("    ORT_VERSION=1.22.0\n", "    export ORT_VERSION=1.22.0\n"):
+            workflow.write_text(
+                "- name: Install ORT\n  run: |\n"
+                + assign
+                + '    echo "step #1"\n'
+                + '    python3 scripts/ci/ort_nuget_install.py --version "${ORT_VERSION}" \\\n'
+                + "      --prefix /opt/onnxruntime\n"
+            )
+            self.assertEqual(guard.check_tarball_pins(files=[workflow]), (0, []))
+        workflow.write_text(
+            "- name: Install ORT\n  run: |\n    ORT_VERSION=1.99.0\n"
+            '    echo "step #1"\n'
+            '    python3 scripts/ci/ort_nuget_install.py --version "${ORT_VERSION}" \\\n'
+            "      --prefix /opt/onnxruntime\n"
+        )
+        self.assertEqual(
+            guard.check_tarball_pins(files=[workflow]),
+            (1, [f"{workflow}:5: unpinned ORT_VERSION '1.99.0' for package 'cpu'"]),
+        )
+        self.assertEqual(guard.check_tarball_pins(root=ROOT), (0, []))

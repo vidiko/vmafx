@@ -28,21 +28,20 @@ GENERIC_STEP_RE = re.compile(r"^(\s*)-\s+")
 TAR_EXTRACT_RE = re.compile(r"\btar\b.*?(?:-[a-zA-Z0-9]*x|--extract)")
 SHA_CHECK_RE = re.compile(r"\bsha256sum\b.*?(?:--check|-c\b)")
 GPU_MARKER_RE = re.compile(r"onnxruntime-[^\s\"'/]*-gpu")
-PACKAGE_FLAG_RE = re.compile(r"--package(?:=|\s+)[\"']?([A-Za-z0-9_-]+)")
-VERSION_FLAG_RE = re.compile(r"--version(?:=|\s+)[\"']?([^\"'\s#\\]+)")
 MAX_COMMAND_LINES = 256
 MAX_STEP_LINES = 10000
-# Skip quoted and escaped characters when finding shell command boundaries.
+# Skip quoted strings and expansions when finding shell command boundaries or comments.
 WORKFLOW_BOUNDARY_RE = re.compile(
-    r"""\\.|'[^']*'|"(?:\\.|[^"\\]++)*"|(?P<stop>[;|]|&&|(?<![<>])&(?!>)|(?<!\S)\#.*|\Z)"""
+    r"""\\.|'[^']*'|"(?:\\.|`(?:\\.|[^`\\]++)*`|\$\([^()]*\)|\$\{[^}]*\}|\$|[^"\\$`]++)*"|"""
+    r"""`(?:\\.|[^`\\]++)*`|\$\([^()]*\)|\$\{[^}]*\}|"""
+    r"""(?P<stop>\|\||[;|]|&&|(?<![<>])&(?!>)|(?<!\S)\#.*|\Z)"""
 )
-BINDING_RE = re.compile(r"^\s*(?:(?:export|ARG|ENV)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*)$")
+STEP_RUN_KEY_RE = re.compile(r"^\s*(?:-\s+)?run:(?:\s|$)")
+STEP_ENV_HEADER_RE = re.compile(r"^\s*env:\s*$")
+YAML_BINDING_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*):\s+(.+?)\s*$")
+SHELL_BINDING_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.+?)\s*$")
+CONTAINER_BINDING_RE = re.compile(r"^\s*(?:ARG|ENV)\s+([A-Za-z_][A-Za-z0-9_]*)=(.+?)\s*$")
 LITERAL_BINDING_RE = re.compile(r"""(["']?)([A-Za-z0-9_.+-]+)\1(?:\s+#.*)?""")
-INLINE_BINDING_RE = re.compile(
-    r"""(?:^|[\s;&|])([A-Za-z_][A-Za-z0-9_]*)="""
-    r"""((?:\\.|'[^']*'|"(?:\\.|[^"\\]++)*"|`(?:\\.|[^`\\]++)*`"""
-    r"""|\$\([^()]*\)|\$\{[^}]*\}|\$|[^\s"'`\\;&|$]++)*+)"""
-)
 HELPER_FLAGS: frozenset[str] = frozenset(
     {
         "--package",
@@ -65,11 +64,21 @@ CONTAINER_HELPER_CMD_RE = re.compile(
     r"python3\s+(?:/build/vmaf/)?scripts/ci/ort_nuget_install\.py"
     r"((?:\s+--[a-z-]+(?:=|\s+)(?!-)\S+)+)$"
 )
-CONTAINER_FLAG_PAIR_RE = re.compile(r"(--[a-z-]+)(?:=|\s+)((?!-)\S+)")
+CONTAINER_HELPER_VERSION_REF_RE = re.compile(
+    r'(--version(?:=|\s+))(?:\$ORT_VERSION|\$\{ORT_VERSION\}|"\$ORT_VERSION"|"\$\{ORT_VERSION\}")'
+)
+CONTAINER_FLAG_PAIR_RE = re.compile(
+    r"""(?:\s+|^)(--[a-z-]+)(?:=|\s+)(?!-)((?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s"'])+)"""
+)
 CONTAINER_VERSION_ARG_RE = re.compile(
     r'^(?:[0-9]+(?:\.[0-9]+)+|\$ORT_VERSION|\$\{ORT_VERSION\}|"\$ORT_VERSION"|"\$\{ORT_VERSION\}")$'
 )
-CONTAINER_FLAG_VALUE_RE = re.compile(r"^[A-Za-z0-9_./][A-Za-z0-9_./-]*$")
+PACKAGE_VALUE_RE = re.compile(r"""^(["']?)([A-Za-z0-9_-]+)\1$""")
+CONTAINER_FLAG_VALUE_RE = re.compile(
+    r"""^(?:[A-Za-z0-9_./][A-Za-z0-9_./-]*"""
+    r"""|'(?![-\s])[A-Za-z0-9_./:;-]+'"""
+    r"""|"(?![-\s])(?:[A-Za-z0-9_./:;-]|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)+")$"""
+)
 NUGET_ADDRESS_RE = re.compile(
     r"(?:api\.nuget\.org/v3-flatcontainer/|nuget\.org/api/v2/package/)([^/\s]+)",
     re.I,
@@ -338,34 +347,121 @@ def _validate_pin_table(pin_file: Path) -> tuple[dict[str, dict[str, Any]], list
     return valid, findings
 
 
-def _step_bindings(lines: list[str]) -> dict[str, set[str]] | None:
-    """Collect bindings, retaining nonliteral values so they cannot look unassigned."""
-    if len(lines) > MAX_STEP_LINES:
+def _strip_workflow_comment(line: str) -> str:
+    """Return line up to the first unquoted shell or YAML comment."""
+    for index, match in enumerate(WORKFLOW_BOUNDARY_RE.finditer(line)):
+        if index > MAX_STEP_LINES:
+            break
+        stop = match["stop"]
+        if stop and stop.startswith("#"):
+            return line[: match.start()]
+    return line
+
+
+def _extract_allowed_binding(
+    clean_line: str,
+    name: str,
+    in_run: bool,
+    before_site: bool,
+    prev_continues: bool,
+    is_workflow: bool,
+) -> str | None:
+    """Return literal binding value when clean_line is an allowed single binding site."""
+    if prev_continues:
         return None
-    bindings: dict[str, set[str]] = {}
-    for line in lines:
-        match = BINDING_RE.match(line)
-        if match:
-            literal = LITERAL_BINDING_RE.fullmatch(match[2].rstrip())
-            bindings.setdefault(match[1], set()).add(literal[2] if literal else match[2])
-    return bindings
+    if not is_workflow:
+        match = CONTAINER_BINDING_RE.fullmatch(clean_line)
+    elif in_run:
+        match = SHELL_BINDING_RE.fullmatch(clean_line) if before_site else None
+    else:
+        match = YAML_BINDING_RE.fullmatch(clean_line)
+    if match is None or match.group(1) != name:
+        return None
+    literal = LITERAL_BINDING_RE.fullmatch(match.group(2))
+    return literal.group(2) if literal else None
+
+
+def _next_run_state(clean_line: str, in_run: bool, is_workflow: bool) -> bool:
+    """Track whether subsequent workflow step lines belong to a run: block."""
+    if not is_workflow:
+        return False
+    if STEP_RUN_KEY_RE.match(clean_line):
+        return True
+    if STEP_ENV_HEADER_RE.match(clean_line):
+        return False
+    return in_run
+
+
+def _resolve_single_binding(
+    block_lines: list[str], name: str, site_offset: int, is_workflow: bool
+) -> tuple[str | None, str]:
+    """Count binding sites for name in block_lines and require one literal binding."""
+    if len(block_lines) > MAX_STEP_LINES:
+        return None, "step binding limit exceeded"
+    site_re = re.compile(rf"(?<![\w$])(?<!\$\{{){re.escape(name)}(?!\w)")
+    count = 0
+    resolved: str | None = None
+    in_run = False
+    prev_continues = False
+    for offset, raw_line in enumerate(block_lines[:MAX_STEP_LINES]):
+        if raw_line.lstrip().startswith("#"):
+            prev_continues = False
+            continue
+        clean = _strip_workflow_comment(raw_line)
+        hits = len(site_re.findall(clean))
+        count += hits
+        if count == 1 and hits == 1:
+            resolved = _extract_allowed_binding(
+                clean, name, in_run, offset < site_offset, prev_continues, is_workflow
+            )
+        in_run = _next_run_state(clean, in_run, is_workflow)
+        prev_continues = clean.rstrip().endswith("\\")
+    if count == 0:
+        return None, "missing"
+    if count != 1 or resolved is None:
+        return None, "ambiguous"
+    return resolved, ""
+
+
+def _parse_helper_flag_pairs(flags_tail: str) -> list[tuple[str, str]] | None:
+    """Parse flags_tail end-to-end into (flag, value) pairs, rejecting leftovers."""
+    stripped = flags_tail.strip()
+    if not stripped or "`" in stripped or "$(" in stripped:
+        return None
+    pairs: list[tuple[str, str]] = []
+    pos = 0
+    for _ in range(MAX_HELPER_FLAGS + 1):
+        if pos == len(stripped):
+            return pairs
+        match = CONTAINER_FLAG_PAIR_RE.match(stripped, pos)
+        if match is None:
+            return None
+        pairs.append((match.group(1), match.group(2)))
+        pos = match.end()
+    return None
+
+
+def _valid_helper_flag_value(flag: str, value: str) -> bool:
+    """Return True when value matches the allow-listed syntax for flag."""
+    if flag == "--version":
+        return CONTAINER_VERSION_ARG_RE.fullmatch(value) is not None
+    if "ORT_VERSION" in value:
+        return False
+    if flag == "--package":
+        return PACKAGE_VALUE_RE.fullmatch(value) is not None
+    return CONTAINER_FLAG_VALUE_RE.fullmatch(value) is not None
 
 
 def _valid_container_helper_flags(flags_tail: str) -> bool:
     """Return True when every helper flag is known, unique, and has an allowed value."""
-    pairs = CONTAINER_FLAG_PAIR_RE.findall(flags_tail)
+    pairs = _parse_helper_flag_pairs(flags_tail)
     if not pairs or len(pairs) > MAX_HELPER_FLAGS:
         return False
     seen: set[str] = set()
     for flag, value in pairs[:MAX_HELPER_FLAGS]:
-        if flag not in HELPER_FLAGS or flag in seen:
+        if flag not in HELPER_FLAGS or flag in seen or not _valid_helper_flag_value(flag, value):
             return False
         seen.add(flag)
-        if flag == "--version":
-            if CONTAINER_VERSION_ARG_RE.fullmatch(value) is None:
-                return False
-        elif CONTAINER_FLAG_VALUE_RE.fullmatch(value) is None or "ORT_VERSION" in value:
-            return False
     return True
 
 
@@ -378,7 +474,11 @@ def _parse_container_segment(raw_seg: str, persistent: list[str], calls: list[st
         cmd_match = CONTAINER_HELPER_CMD_RE.fullmatch(seg)
         if cmd_match is None or not _valid_container_helper_flags(cmd_match.group(2)):
             return False
-        calls.append(" ".join([*persistent, seg]))
+        override = cmd_match.group(1) or (persistent[-1].split("=", 1)[1] if persistent else None)
+        tail = cmd_match.group(2)
+        if override is not None:
+            tail = CONTAINER_HELPER_VERSION_REF_RE.sub(rf"\g<1>{override}", tail)
+        calls.append(f"ort_nuget_install.py{tail}")
         return True
     if "ORT_VERSION" in seg:
         if CONTAINER_ORT_ASSIGN_RE.fullmatch(seg) is None:
@@ -450,23 +550,16 @@ def _container_helper_calls(lines: list[str], site_idx: int) -> list[str] | None
 
 def _workflow_helper_calls(command: str, first_line_end: int) -> list[str] | None:
     """Select calls starting on this physical line, including their continued arguments."""
-    calls = []
+    calls: list[str] = []
     start = 0
-    assignment = ""
     for index, match in enumerate(WORKFLOW_BOUNDARY_RE.finditer(command)):
         if index == MAX_STEP_LINES:
             return None
         if match["stop"] is None:
             continue
-        clause = command[start : match.start()]
         # Each following physical line is visited separately by scan_file.
         if "ort_nuget_install.py" in command[start : min(first_line_end, match.start())]:
-            calls.append(f"{assignment} {clause}")
-        else:
-            shell = re.sub(r"^(?:-\s+)?run:\s*", "", clause.strip())
-            binding = BINDING_RE.fullmatch(shell)
-            if binding and binding[1] == "ORT_VERSION":
-                assignment = shell
+            calls.append(command[start : match.start()])
         if match["stop"].startswith("#") or match.end() >= first_line_end:
             break
         start = match.end()
@@ -489,44 +582,40 @@ def _helper_command(
 
 
 def _resolve_helper_version(
-    lines: list[str],
-    start_idx: int,
-    site_idx: int,
-    call_text: str,
+    block_lines: list[str],
+    site_offset: int,
+    raw_version: str | None,
+    is_workflow: bool,
 ) -> tuple[str | None, str]:
-    """Resolve the literal or bound ORT_VERSION for a helper call."""
-    prefix, _, tail = call_text.partition("ort_nuget_install.py")
-    ver_match = VERSION_FLAG_RE.search(tail)
-    version = ver_match.group(1) if ver_match else None
-    if version not in ("$ORT_VERSION", "${ORT_VERSION}"):
-        return version, ""
-    inline = dict(INLINE_BINDING_RE.findall(prefix))
-    if "ORT_VERSION" in inline:
-        raw = inline["ORT_VERSION"]
-        literal = LITERAL_BINDING_RE.fullmatch(raw)
-        return (literal[2] if literal else raw), ""
-    bindings = _step_bindings(lines[start_idx : site_idx + 1])
-    if bindings is None:
-        return None, "step binding limit exceeded"
-    values = bindings.get("ORT_VERSION", set())
-    if len(values) > 1:
+    """Resolve the literal or single-site bound ORT_VERSION for a helper call."""
+    if raw_version is None:
+        return None, ""
+    if raw_version.strip('"') not in ("$ORT_VERSION", "${ORT_VERSION}"):
+        return raw_version, ""
+    version, err = _resolve_single_binding(block_lines, "ORT_VERSION", site_offset, is_workflow)
+    if err == "step binding limit exceeded":
+        return None, err
+    if err == "ambiguous":
         return None, "ambiguous ORT_VERSION in step"
-    return next(iter(values), None), ""
+    return version, ""
 
 
 def _check_helper_call(
-    lines: list[str],
-    start_idx: int,
-    bound_end: int,
+    block_lines: list[str],
+    site_offset: int,
     call_text: str,
     packages: dict[str, dict[str, Any]],
+    is_workflow: bool,
 ) -> str:
     """Verify the package and version of a single helper invocation."""
-    pkg_match = PACKAGE_FLAG_RE.search(call_text)
-    if "--package" in call_text and pkg_match is None:
-        return "invalid ONNX Runtime package argument"
-    pkg_name = pkg_match.group(1) if pkg_match else "cpu"
-    version, message = _resolve_helper_version(lines, start_idx, bound_end, call_text)
+    _, sep, tail = call_text.partition("ort_nuget_install.py")
+    if not sep or not _valid_container_helper_flags(tail):
+        return "invalid ort_nuget_install.py arguments in step"
+    pairs = dict(_parse_helper_flag_pairs(tail) or ())
+    pkg_name = pairs.get("--package", "cpu").strip("\"'")
+    version, message = _resolve_helper_version(
+        block_lines, site_offset, pairs.get("--version"), is_workflow
+    )
     if message:
         return message
     if pkg_name not in packages:
@@ -554,17 +643,27 @@ def _check_helper_step(
             "helper command continuation exceeds limit" if is_workflow else CONTAINER_SHAPE_FINDING
         )
         return [f"{path}:{line_no}: {msg}"]
-    bound_end = site_idx if is_workflow else _container_instruction(lines, site_idx)[0] - 1
+    if is_workflow:
+        block_lines = lines[start_idx : end_idx + 1]
+        site_offset = site_idx - start_idx
+    else:
+        run_idx = _container_instruction(lines, site_idx)[0]
+        block_lines = lines[start_idx:run_idx]
+        site_offset = len(block_lines)
     findings: list[str] = []
-    for call_text in calls:
-        message = _check_helper_call(lines, start_idx, bound_end, call_text, packages)
+    for call_text in calls[:MAX_STEP_LINES]:
+        message = _check_helper_call(block_lines, site_offset, call_text, packages, is_workflow)
         if message:
             findings.append(f"{path}:{line_no}: {message}")
     return findings
 
 
-def _nuget_binding_problem(segments: list[str], bindings: dict[str, set[str]]) -> str:
-    """Require each dynamic NuGet package segment to resolve to unrelated literal IDs."""
+def _nuget_binding_problem(
+    segments: list[str], block_lines: list[str], site_offset: int, is_workflow: bool
+) -> str:
+    """Require each dynamic NuGet package segment to resolve to one unrelated literal ID."""
+    if len(block_lines) > MAX_STEP_LINES:
+        return "step binding limit exceeded"
     var_re = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
     invalid = False
     names: list[str] = []
@@ -573,10 +672,10 @@ def _nuget_binding_problem(segments: list[str], bindings: dict[str, set[str]]) -
         names.extend(g1 or g2 for g1, g2 in refs[:MAX_COMMAND_LINES])
         invalid = invalid or len(refs) != 1 or bool(var_re.sub("", seg))
     for name in names[:MAX_COMMAND_LINES]:
-        values = bindings.get(name, set())
-        if any(ORT_PACKAGE_RE.fullmatch(val.replace('"', "").replace("'", "")) for val in values):
+        value, err = _resolve_single_binding(block_lines, name, site_offset, is_workflow)
+        if value is not None and ORT_PACKAGE_RE.fullmatch(value):
             return "ONNX Runtime download must use helper"
-        if not values or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", value) for value in values):
+        if err or value is None or not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
             return "NuGet download with unresolved package"
     return "NuGet download with unresolved package" if invalid else ""
 
@@ -600,10 +699,8 @@ def _check_nuget_download(
     if not dynamic:
         return []
     start_idx, end_idx = find_block_for_site(lines, idx, is_workflow)
-    bindings = _step_bindings(lines[start_idx : end_idx + 1])
-    if bindings is None:
-        return [f"{path}:{idx + 1}: step binding limit exceeded"]
-    problem = _nuget_binding_problem(dynamic, bindings)
+    block_lines = lines[start_idx : end_idx + 1]
+    problem = _nuget_binding_problem(dynamic, block_lines, idx - start_idx, is_workflow)
     return [f"{path}:{idx + 1}: {problem}"] if problem else []
 
 
@@ -620,7 +717,7 @@ def _scan_workflow_line(
     if line.lstrip().startswith("#"):
         return []
     if is_workflow:
-        line = re.split(r"\s+#", line, maxsplit=1)[0]
+        line = _strip_workflow_comment(line)
     lower = line.lower()
     findings: list[str] = []
     if "onnxruntime/releases/download" in lower:

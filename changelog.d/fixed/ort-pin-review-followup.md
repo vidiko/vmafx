@@ -1,3 +1,6 @@
 - The CI pin check now validates each ONNX Runtime install on a shared shell
   line, flags ambiguous version assignments, and accepts unrelated NuGet
-  downloads in steps that also define an ONNX Runtime package variable.
+  downloads in steps that also define an ONNX Runtime package variable. Dynamic
+  workflow version and NuGet package variables must now come from a single
+  step `env:` key or whole-line literal assignment, and helper flags are
+  checked against the installer's allow-list.
