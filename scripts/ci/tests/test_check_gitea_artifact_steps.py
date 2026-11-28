@@ -4,17 +4,77 @@
 
 from __future__ import annotations
 
+import difflib
+import importlib.util
+import io
+import os
+import re
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml  # type: ignore[import-untyped]  # PyYAML ships no stubs in the hook env
+from ruamel.yaml import YAML as RuamelYAML
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+from scripts.lib.safe_subprocess import run as run_command  # noqa: E402
+
 SCRIPT = ROOT / "scripts/ci/check_gitea_artifact_steps.py"
+WRITE_PREFLIGHT_READS = 3
+
+
+def load_checker_module():
+    """Load the checker script for direct helper tests."""
+    spec = importlib.util.spec_from_file_location("check_gitea_artifact_steps_test", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def find_twin_start_lines(module, document) -> list[int]:
+    """Line numbers of every accepted twin, including skip twins."""
+    starts: list[int] = []
+    for steps in module._step_lists(document):
+        for index in range(1, len(steps)):
+            source, twin = steps[index - 1], steps[index]
+            if not isinstance(source, dict) or not isinstance(twin, dict):
+                continue
+            kind = module._classify(source.get("uses"))
+            if not kind or kind[1]:
+                continue
+            base = module._base_condition(source.get("if"), on_gitea=False)
+            if base is None:
+                continue
+            if not module._check_twin("", kind[0], source, twin, base):
+                starts.append(twin.lc.line)
+    return starts
+
+
+def cut_twin(lines: list[str], start: int) -> str:
+    """Delete one whole step beginning at ``start`` from ``lines``."""
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if not line.strip():
+            break
+        leading = len(line) - len(line.lstrip())
+        if leading < indent:
+            break
+        if leading == indent and (line.lstrip().startswith("#") or line.lstrip().startswith("- ")):
+            break
+        end += 1
+    return "".join(lines[:start] + lines[end:])
+
+
 V7 = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2"
 V3 = "actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf  # v3.2.2"
 DL8 = "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2"
@@ -71,6 +131,347 @@ jobs:
         with:
           pattern: digest-*
           merge-multiple: true
+"""
+
+ROUND_TRIP = f"""\
+# top-level comment
+name: "Round trip"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      # keep this comment
+      - name: "Upload log"
+        if: ${{{{ (always()) && env.GITEA_ACTIONS != 'true' }}}}
+        uses: {V7}
+        with:
+          name: "log"
+          path: build/log.txt
+      - name: Upload log (Gitea)
+        if: ${{{{ (always()) && env.GITEA_ACTIONS == 'true' }}}}
+        uses: {V3}
+        with:
+          name: "log"
+          path: build/log.txt
+      - name: Folded
+        run: >
+          echo one
+          echo two
+      - &defaults
+        name: "Anchored"
+        run: echo hi
+      - <<: *defaults
+        name: "Merged"
+"""
+
+
+ROUND_TRIP_WRITE = f"""\
+---
+# top-level comment
+name: "Round trip"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      # keep this comment
+      - name: "Upload log"
+        uses: {V7}
+        with:
+          name: "log"
+          path: build/log.txt
+
+      - name: Folded
+        run: >
+          echo one
+          echo two
+      - &defaults
+        name: "Anchored"
+        run: echo hi
+      - <<: *defaults
+        name: "Merged"
+"""
+
+TRAILING_COMMENTS = f"""\
+---
+name: Comments
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Upload log
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt
+      # keep this comment with the upload
+      # second line
+      - name: Next
+        run: echo next
+"""
+
+TRAILING_COMMENTS_WRITE = f"""\
+---
+name: Comments
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Upload log
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt
+      - name: Upload log (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        uses: {V3}
+        with:
+          name: log
+          path: build/log.txt
+      # keep this comment with the upload
+      # second line
+      - name: Next
+        run: echo next
+"""
+
+SAME_LINE_COMMENTS = f"""\
+---
+name: Same line
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all
+        uses: {V7}
+      - name: Upload
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt  # eol comment on path
+      - name: Next
+        run: echo next
+"""
+
+SAME_LINE_COMMENTS_WRITE = f"""\
+---
+name: Same line
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {V7}
+      - name: Download all (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        uses: {V3}
+      - name: Upload
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt  # eol comment on path
+      - name: Upload (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        uses: {V3}
+        with:
+          name: log
+          path: build/log.txt
+      - name: Next
+        run: echo next
+"""
+
+SKIP_TRAILING_BLOCK = f"""\
+---
+name: Skip
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+
+      # keep this comment
+      - name: Next
+        run: echo next
+"""
+
+SKIP_TRAILING_BLOCK_WRITE = f"""\
+---
+name: Skip
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      - name: Download digests (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        shell: bash
+        run: |
+          echo '::warning::artifact download skipped on Gitea: v4+ is GitHub-only, v3 lacks merge-multiple, pattern'
+
+      # keep this comment
+      - name: Next
+        run: echo next
+"""
+
+FLOW_MAPPING = f"""\
+---
+name: Flow
+on: push
+jobs:
+  build:
+    steps:
+      - name: Upload
+        uses: {V7}
+        with: {{ name: log, path: out.log }}
+"""
+
+LAST_STEP_COMMENT = f"""\
+---
+name: Last step
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      # MARKER after the last step
+  b:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo b
+"""
+
+LAST_STEP_COMMENT_WRITE = f"""\
+---
+name: Last step
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      - name: Download digests (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        shell: bash
+        run: |
+          echo '::warning::artifact download skipped on Gitea: v4+ is GitHub-only, v3 lacks merge-multiple, pattern'
+      # MARKER after the last step
+  b:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo b
+"""
+
+LAST_STEP_COMMENT_EOF = f"""\
+---
+name: Last step
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      # MARKER at the end of the file
+"""
+
+LAST_STEP_COMMENT_EOF_WRITE = f"""\
+---
+name: Last step
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      - name: Download digests (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        shell: bash
+        run: |
+          echo '::warning::artifact download skipped on Gitea: v4+ is GitHub-only, v3 lacks merge-multiple, pattern'
+      # MARKER at the end of the file
+"""
+
+
+LAST_STEP_COMMENT_NEXT_JOB = f"""\
+---
+name: Next job comment
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+# MARKER before the next job
+  b:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo b
+"""
+
+LAST_STEP_COMMENT_NEXT_JOB_WRITE = f"""\
+---
+name: Next job comment
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        if: ${{{{ env.GITEA_ACTIONS != 'true' }}}}
+        uses: {DL8}
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      - name: Download digests (Gitea)
+        if: ${{{{ env.GITEA_ACTIONS == 'true' }}}}
+        shell: bash
+        run: |
+          echo '::warning::artifact download skipped on Gitea: v4+ is GitHub-only, v3 lacks merge-multiple, pattern'
+# MARKER before the next job
+  b:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo b
 """
 
 
@@ -178,19 +579,321 @@ class GiteaArtifactCheckTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.path.read_text(encoding="utf-8"), first)
 
+    def test_write_keeps_round_trip_file_byte_stable(self) -> None:
+        result = self.run_check(ROUND_TRIP, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), textwrap.dedent(ROUND_TRIP))
+
+    def test_write_round_trip_adds_only_twin_lines(self) -> None:
+        before = textwrap.dedent(ROUND_TRIP_WRITE)
+        result = self.run_check(ROUND_TRIP_WRITE, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        after = self.path.read_text(encoding="utf-8")
+        guard = "        if: ${{ env.GITEA_ACTIONS != 'true' }}"
+        twin = (
+            "      - name: Upload log (Gitea)\n"
+            "        if: ${{ env.GITEA_ACTIONS == 'true' }}\n"
+            f"        uses: {V3}\n"
+            "        with:\n"
+            '          name: "log"\n'
+            "          path: build/log.txt"
+        )
+        expected = before.replace(
+            f'      - name: "Upload log"\n        uses: {V7}',
+            f'      - name: "Upload log"\n{guard}\n        uses: {V7}',
+        ).replace(
+            "          path: build/log.txt\n\n      - name: Folded",
+            f"          path: build/log.txt\n{twin}\n\n      - name: Folded",
+        )
+        self.assertEqual(after, expected)
+        diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm=""))
+        removed = [line[1:] for line in diff if line.startswith("-") and not line.startswith("---")]
+        self.assertEqual(removed, [])
+        self.assertTrue(after.startswith("---\n# top-level comment"))
+        self.assertIn("path: build/log.txt\n\n      - name: Folded", after)
+
+    def test_write_moves_trailing_comments_after_the_twin(self) -> None:
+        result = self.run_check(TRAILING_COMMENTS, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.path.read_text(encoding="utf-8"),
+            textwrap.dedent(TRAILING_COMMENTS_WRITE),
+        )
+
+    def test_write_keeps_same_line_comments_on_source(self) -> None:
+        result = self.run_check(SAME_LINE_COMMENTS, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.path.read_text(encoding="utf-8"),
+            textwrap.dedent(SAME_LINE_COMMENTS_WRITE),
+        )
+
+    def test_write_keeps_one_blank_line_after_skip_twin(self) -> None:
+        result = self.run_check(SKIP_TRAILING_BLOCK, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.path.read_text(encoding="utf-8"),
+            textwrap.dedent(SKIP_TRAILING_BLOCK_WRITE),
+        )
+
+    def test_write_keeps_last_step_comment_out_of_the_skip_twin(self) -> None:
+        for fixture, expected in (
+            (LAST_STEP_COMMENT, LAST_STEP_COMMENT_WRITE),
+            (LAST_STEP_COMMENT_EOF, LAST_STEP_COMMENT_EOF_WRITE),
+            (LAST_STEP_COMMENT_NEXT_JOB, LAST_STEP_COMMENT_NEXT_JOB_WRITE),
+        ):
+            with self.subTest(fixture=fixture.splitlines()[1]):
+                result = self.run_check(fixture, "--write")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.path.read_text(encoding="utf-8"), textwrap.dedent(expected))
+
+    def test_write_comment_cases_are_idempotent(self) -> None:
+        for fixture in (SAME_LINE_COMMENTS, SKIP_TRAILING_BLOCK):
+            with self.subTest(fixture=fixture.splitlines()[1]):
+                self.run_check(fixture, "--write")
+                first = self.path.read_text(encoding="utf-8")
+                result = run_command(
+                    [sys.executable, str(SCRIPT), "--write", str(self.path)],
+                    allowed_executables=(sys.executable,),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout_seconds=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.path.read_text(encoding="utf-8"), first)
+
+    def test_take_trailing_post_returns_none_for_none_token(self) -> None:
+        module = load_checker_module()
+        step = RuamelYAML(typ="rt").load("uses: x\n")
+        step.ca.items["uses"] = [None, None, None, None]
+        self.assertIsNone(module._take_trailing_post(step))
+
+    def test_write_refuses_to_reformat_flow_mappings(self) -> None:
+        result = self.run_check(FLOW_MAPPING, "--write")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refusing to rewrite", result.stderr)
+        self.assertIn("not guarded", result.stdout)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), textwrap.dedent(FLOW_MAPPING))
+
+    def test_skip_twin_quotes_unsupported_input_names(self) -> None:
+        text = f"""\
+name: Injection
+on: push
+jobs:
+  build:
+    steps:
+      - name: Upload
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt
+          x'; touch /tmp/pwned; echo: value
+"""
+        result = self.run_check(text, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        steps = yaml.safe_load(self.path.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        run = steps[1]["run"]
+        parts = shlex.split(run)
+        self.assertEqual(len(parts), 2)
+        self.assertIn("x'; touch /tmp/pwned; echo", parts[1])
+
+    def test_write_preserves_if_false(self) -> None:
+        text = f"""\
+name: Disabled
+on: push
+jobs:
+  build:
+    steps:
+      - name: Upload
+        if: false
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt
+"""
+        result = self.run_check(text, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        steps = yaml.safe_load(self.path.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        self.assertEqual(len(steps), 2)
+        self.assertIn("(false)", steps[0]["if"])
+        self.assertIn("(false)", steps[1]["if"])
+
+    def test_write_preserves_explicit_marker_after_comment(self) -> None:
+        text = f"""\
+# leading comment
+
+---
+name: Marker
+on: push
+jobs:
+  build:
+    steps:
+      - name: Upload
+        uses: {V7}
+        with:
+          name: log
+          path: build/log.txt
+"""
+        result = self.run_check(text, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(
+            self.path.read_text(encoding="utf-8").startswith("# leading comment\n\n---\n")
+        )
+
+    def test_write_repairs_a_malformed_v3_twin(self) -> None:
+        head, _sep, tail = GOOD.rpartition("path: build/log.txt")
+        text = head + "path: other" + tail
+        result = self.run_check(text, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        steps = yaml.safe_load(self.path.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["with"], steps[1]["with"])
+        self.assertEqual(steps[1]["uses"], V3.split(maxsplit=1)[0])
+
+    def test_check_steps_refuses_partial_scan_at_max_steps(self) -> None:
+        module = load_checker_module()
+        old = module.MAX_STEPS
+        module.MAX_STEPS = 1
+        try:
+            findings = module.check_steps("limit", [{"uses": V7}, {"uses": V7}])
+        finally:
+            module.MAX_STEPS = old
+        self.assertTrue(any("refusing partial check" in finding for finding in findings))
+
+    def test_atomic_write_leaves_original_on_replace_failure(self) -> None:
+        module = load_checker_module()
+        original = "old\n"
+        self.path.write_text(original, encoding="utf-8")
+        with mock.patch.object(module.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                module._atomic_write(self.path, "new\n")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+        self.assertEqual(list(self.path.parent.glob(f".{self.path.name}.*.tmp")), [])
+
+    def test_write_refuses_a_concurrent_edit(self) -> None:
+        module = load_checker_module()
+        original = textwrap.dedent(UNGUARDED)
+        self.path.write_text(original, encoding="utf-8")
+        real_read = Path.read_text
+        reads = 0
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            nonlocal reads
+            reads += 1
+            if reads >= WRITE_PREFLIGHT_READS:
+                return original + "# edited by another process\n"
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertFalse(module.write_file(self.path))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+
+    def test_write_refuses_max_steps_without_touching_the_file(self) -> None:
+        module = load_checker_module()
+        self.path.write_text(textwrap.dedent(UNGUARDED), encoding="utf-8")
+        old = module.MAX_STEPS
+        module.MAX_STEPS = 1
+        try:
+            self.assertFalse(module.write_file(self.path))
+        finally:
+            module.MAX_STEPS = old
+        self.assertEqual(self.path.read_text(encoding="utf-8"), textwrap.dedent(UNGUARDED))
+
+    @unittest.skipIf(os.name == "nt", "Windows does not preserve POSIX execute bits")
+    def test_write_keeps_the_file_mode(self) -> None:
+        module = load_checker_module()
+        self.path.write_text(textwrap.dedent(UNGUARDED), encoding="utf-8")
+        mode = self.path.stat().st_mode
+        self.path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        before = stat.S_IMODE(self.path.stat().st_mode)
+        self.assertTrue(module.write_file(self.path))
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), before)
+
+    def test_malformed_yaml_reports_location_and_continues(self) -> None:
+        module = load_checker_module()
+        bad = self.path
+        bad.write_text(
+            "name: Bad\njobs:\n  build:\n    runs-on: [ubuntu-latest\n",
+            encoding="utf-8",
+        )
+        good = self.path.parent / "good.yml"
+        good.write_text(textwrap.dedent(GOOD), encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", new=stdout):
+            self.assertEqual(module.main([str(bad), str(good)]), 1)
+        output = stdout.getvalue()
+        self.assertRegex(output, re.escape(str(bad)) + r":\d+:\d+: invalid YAML")
+
+    def test_twin_comparison_keeps_yaml_1_2_yes_as_a_string(self) -> None:
+        text = UNGUARDED.replace(
+            "          path: build/log.txt",
+            "          path: build/log.txt\n          if-no-files-found: yes",
+        )
+        result = self.run_check(text, "--write")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        steps = RuamelYAML(typ="safe").load(self.path.read_text(encoding="utf-8"))["jobs"]["build"][
+            "steps"
+        ]
+        self.assertEqual(steps[0]["with"]["if-no-files-found"], "yes")
+        self.assertEqual(steps[1]["with"]["if-no-files-found"], "yes")
+
     def test_file_without_artifact_steps_passes(self) -> None:
         result = self.run_check("name: Empty\non: push\njobs: {}\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_repository_workflows_pass(self) -> None:
-        result = subprocess.run(  # noqa: S603 -- fixed interpreter and script argv
+        result = run_command(
             [sys.executable, str(SCRIPT)],
+            allowed_executables=(sys.executable,),
             capture_output=True,
             text=True,
             check=False,
-            timeout=120,
+            timeout_seconds=120,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_write_replays_every_deleted_twin(self) -> None:
+        """Delete each twin from the tracked tree, then write it back byte-for-byte."""
+        module = load_checker_module()
+        parser = RuamelYAML(typ="rt")
+        parser.preserve_quotes = True
+        parser.width = 1000
+        parser.indent(mapping=2, sequence=4, offset=2)
+        replayed = 0
+        skipped = set()
+        for path in module.find_files(ROOT):
+            original = path.read_text(encoding="utf-8")
+            document = parser.load(original)
+            stream = io.StringIO()
+            parser.explicit_start = original.startswith("---")
+            parser.dump(document, stream)
+            if stream.getvalue() != original:
+                # The writer refuses these files; they need a manual edit.
+                skipped.add(path.name)
+                continue
+            starts = find_twin_start_lines(module, document)
+            if not starts:
+                continue
+            lines = original.splitlines(keepends=True)
+            for start in starts:
+                broken = cut_twin(lines, start)
+                with tempfile.TemporaryDirectory() as tmp:
+                    candidate = Path(tmp) / "workflow.yml"
+                    candidate.write_text(broken, encoding="utf-8")
+                    result = run_command(
+                        [sys.executable, str(SCRIPT), "--write", str(candidate)],
+                        allowed_executables=(sys.executable,),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout_seconds=120,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(candidate.read_text(encoding="utf-8"), original, path)
+                    replayed += 1
+        self.assertGreater(replayed, 0)
+        self.assertEqual(skipped, {"supply-chain.yml"})
 
 
 if __name__ == "__main__":
