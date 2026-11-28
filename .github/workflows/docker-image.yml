@@ -5,6 +5,8 @@ on:
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "0 5 * * 1"   # weekly, before the security scan
   merge_group:
     types: [checks_requested]
     branches: [master]
@@ -28,13 +30,14 @@ jobs:
 
   impact:
     needs: tier
-    if: needs.tier.outputs.full == 'true'
+    if: needs.tier.outputs.full == 'true' || needs.tier.outputs.light == 'true'
     name: Plan Docker image impact
     runs-on: ubuntu-26.04
     # 5-minute floor: hosted runner setup and checkout jitter; bound is max(5, 2 x p95).
     timeout-minutes: 5
     outputs:
-      selected: ${{ steps.impact.outputs.docker_image }}
+      selected: ${{ steps.pick.outputs.selected }}
+      reason: ${{ steps.pick.outputs.reason }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -49,6 +52,28 @@ jobs:
         run: |
           python3 scripts/ci/plan-ci-impact.py --event "$EVENT_NAME" \
             --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+      # ADR-2198 / #2749: the full tier owes the broad selector; a light-tier
+      # pull request owes the image's own inputs so an affected Dockerfile still
+      # runs the Trivy image scan before it lands.
+      - name: Pick the selector of this tier
+        id: pick
+        env:
+          FULL: ${{ needs.tier.outputs.full }}
+          BROAD: ${{ steps.impact.outputs.docker_image }}
+          NARROW: ${{ steps.impact.outputs.docker_image_inputs }}
+        run: |
+          if [ "$FULL" = true ]; then
+            selected="$BROAD" selector=docker_image
+          else
+            selected="$NARROW" selector=docker_image_inputs
+          fi
+          case "$selected" in
+            true) reason="selected by $selector" ;;
+            false) reason="not selected: $selector matched no changed path; the broad selector runs on the full tier and the master push" ;;
+            *) echo "::error::planner gave $selector='$selected'"; exit 1 ;;
+          esac
+          echo "$reason"
+          { echo "selected=$selected"; echo "reason=$reason"; } >> "$GITHUB_OUTPUT"
 
   docker-work:
     needs: impact
@@ -79,8 +104,67 @@ jobs:
       # registry-mirrors) now pulls them through mirror.gcr.io, same digests.
       - name: Pull Docker Hub images through mirror.gcr.io
         run: bash scripts/ci/docker-hub-mirror.sh
+      - name: Install the pinned trivy
+        shell: bash
+        run: |
+          version="$(sed -n 's/^TRIVY_VERSION="\([0-9.]*\)"$/\1/p' build-config.env)"
+          expected_sha="$(sed -n 's/^TRIVY_SHA256="\([0-9a-f]*\)"$/\1/p' build-config.env)"
+          if [[ -z "${version}" || -z "${expected_sha}" ]]; then
+            echo "::error::build-config.env must define TRIVY_VERSION and TRIVY_SHA256."
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/trivy-bin"
+          tarball="trivy_${version}_Linux-64bit.tar.gz"
+          url="https://github.com/aquasecurity/trivy/releases/download/v${version}/${tarball}"
+          curl -fsSL --retry 3 --retry-all-errors --max-time 300 -o "${RUNNER_TEMP}/${tarball}" "${url}"
+          echo "${expected_sha}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/trivy-bin" trivy
+          echo "${RUNNER_TEMP}/trivy-bin" >> "${GITHUB_PATH}"
+      - name: Prove the Trivy ignore policy drops only kernel header findings
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy="scripts/ci/trivy-linux-libc-dev.rego"
+          fixture="scripts/ci/fixtures/trivy-linux-libc-dev-policy-report.json"
+          filtered="${RUNNER_TEMP}/trivy-linux-libc-dev-policy-report.json"
+          trivy convert --format json --ignore-policy "${policy}" -o "${filtered}" "${fixture}"
+          python3 - "${filtered}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              report = json.load(handle)
+          packages = {
+              finding["PkgName"]
+              for result in report.get("Results", [])
+              for finding in result.get("Vulnerabilities", [])
+          }
+          if "linux-libc-dev" in packages:
+              raise SystemExit("policy did not drop the linux-libc-dev finding")
+          if "libssl3t64" not in packages:
+              raise SystemExit("policy dropped the libssl3t64 control finding")
+          PY
+      - name: Build planted vulnerable image
+        run: docker build -f scripts/ci/fixtures/trivy-negative.Dockerfile -t vmafx-trivy-negative .
+      - name: Prove trivy rejects the planted image
+        run: |
+          set +e
+          trivy image --exit-code 3 --ignorefile .trivyignore.yaml \
+            --ignore-policy scripts/ci/trivy-linux-libc-dev.rego \
+            --scanners vuln --severity HIGH,CRITICAL vmafx-trivy-negative
+          rc=$?
+          set -e
+          if [ "$rc" -ne 3 ]; then
+            echo "::error::trivy returned $rc for a known-vulnerable image; expected 3 (findings)"
+            exit 1
+          fi
       - name: Build Docker Image
         run: docker build -t vmaf .
+      - name: Trivy image scan
+        run: |
+          trivy image --exit-code 1 --ignorefile .trivyignore.yaml \
+            --ignore-policy scripts/ci/trivy-linux-libc-dev.rego \
+            --scanners vuln --severity HIGH,CRITICAL vmaf
       - name: Smoke-test image — CPU score assertion
         # Run vmaf inside the image against the 576×324 YUV fixture pair that
         # ships in testdata/. Expected pooled mean VMAF ≈ 94.32 (cpu integer
@@ -150,7 +234,7 @@ jobs:
 
   docker:
     needs: [tier, impact, docker-work]
-    if: always() && needs.tier.outputs.full == 'true'
+    if: always() && (needs.tier.outputs.full == 'true' || needs.tier.outputs.light == 'true')
     # required-aggregator
     name: Docker Image Build
     runs-on: ubuntu-26.04

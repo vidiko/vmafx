@@ -155,6 +155,9 @@ CONSUMER_SELECTORS = {"upstream_consumers"}
 GSTREAMER_SELECTORS = {"gstreamer_element"}
 # ADR-3338 / ADR-3545: dev-container and docker/dev Ubuntu image own-input lanes.
 DEV_CONTAINER_LANE_SELECTORS = {"dev_container_inputs", "ubuntu_dev_images"}
+# #2749: the root image build and Trivy scan follow the image's own inputs on a
+# light-tier pull request, so the input-only selector does not fire on a fallback.
+DOCKER_IMAGE_LANE_SELECTORS = {"docker_image_inputs"}
 OWN_PATHS_ONLY = (
     TESTER_SELECTORS
     | MSVC_LEG_SELECTORS
@@ -162,6 +165,7 @@ OWN_PATHS_ONLY = (
     | CONSUMER_SELECTORS
     | GSTREAMER_SELECTORS
     | DEV_CONTAINER_LANE_SELECTORS
+    | DOCKER_IMAGE_LANE_SELECTORS
 )
 
 
@@ -261,6 +265,56 @@ class ConfigContract(unittest.TestCase):
 
 
 class RoutingContract(unittest.TestCase):
+    def test_python_audit_selector_tracks_every_manifest_input_and_output(self) -> None:
+        manifest = json.loads(
+            (REPO_ROOT / "requirements/locks/manifest.json").read_text(encoding="utf-8")
+        )
+        expected = {"requirements/locks/manifest.json"}
+        for lock in manifest["locks"]:
+            expected.add(lock["output"])
+            expected.update(lock["inputs"])
+        config = planner.load_config(CONFIG)
+        self.assertEqual(set(config["selectors"]["python_audit"]["patterns"]), expected)
+        for path in sorted(expected):
+            with self.subTest(path=path):
+                self.assertTrue(_plan_for([path]).selectors["python_audit"])
+        self.assertFalse(_plan_for(["docs/development/ci.md"]).selectors["python_audit"])
+
+    def test_image_exception_change_runs_the_image_scan(self) -> None:
+        self.assertTrue(_plan_for([".trivyignore.yaml"]).selectors["docker_image"])
+
+    def test_image_own_inputs_include_locks_and_kernel_policy(self) -> None:
+        config = planner.load_config(CONFIG)
+        broad = set(config["selectors"]["docker_image"]["patterns"])
+        narrow = set(config["selectors"]["docker_image_inputs"]["patterns"])
+        for path in (
+            "python/requirements-lock.txt",
+            "requirements/locks/build.txt",
+            "requirements/locks/package-build.txt",
+            "scripts/ci/trivy-linux-libc-dev.rego",
+            "scripts/ci/fixtures/trivy-linux-libc-dev-policy-report.json",
+            "Dockerfile",
+            "scripts/ci/fixtures/trivy-negative.Dockerfile",
+            ".github/workflows/docker-image.yml",
+            "python/pyproject.toml",
+            "scripts/ci/docker-hub-mirror.sh",
+            "scripts/ci/ffmpeg-shared-series.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, broad)
+                self.assertIn(path, narrow)
+                plan = _plan_for([path])
+                self.assertTrue(plan.selectors["docker_image"])
+                self.assertTrue(plan.selectors["docker_image_inputs"])
+        for path in (
+            "ffmpeg-patches/series.txt",
+            "ffmpeg-patches/src/vf_vmafx_options.h",
+        ):
+            with self.subTest(path=path):
+                plan = _plan_for([path])
+                self.assertTrue(plan.selectors["docker_image"])
+                self.assertTrue(plan.selectors["docker_image_inputs"])
+
     def test_docs_only_change_is_impact_mode_with_no_c_lane(self) -> None:
         plan = _plan_for(["docs/usage/cli.md", "changelog.d/fixed/x.md"])
         self.assertEqual(plan.mode, "impact")
@@ -1193,7 +1247,11 @@ class WorkflowContract(unittest.TestCase):
                 # by the aggregator only for a tier that does not owe it).
                 self.assertIn(f"needs: [tier, impact, {work_job}]", block)
                 self.assertRegex(
-                    block, r"if: always\(\) && needs\.tier\.outputs\.(light|full) == 'true'"
+                    block,
+                    r"if: always\(\) && (?:"
+                    r"needs\.tier\.outputs\.(light|full) == 'true'"
+                    r"|\(needs\.tier\.outputs\.full == 'true' \|\| "
+                    r"needs\.tier\.outputs\.light == 'true'\))",
                 )
                 self.assertIn(f"name: {check_name}", block)
                 if "gate_leg_result.py" in block:
