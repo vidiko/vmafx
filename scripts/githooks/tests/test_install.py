@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
 
@@ -677,20 +678,34 @@ class LefthookBridgeTests(unittest.TestCase):
         self.stub(".venv/bin/pre-commit")
         return self.repo / ".git"
 
-    def run_message_job(self, item: str) -> TextCommandResult:
+    def run_message_job(self, item: str, env: Mapping[str, str] | None = None) -> TextCommandResult:
         self.argv_log.unlink(missing_ok=True)
         config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
         template = config["commit-msg"]["commands"]["framework-hooks"]["run"]
+        job_env = {**self.env, **env} if env else self.env
         return run_command(
             ("sh", "-c", replace_lefthook_item(template, item)),
             allowed_executables=("sh",),
             cwd=self.repo,
-            env=self.env,
+            env=job_env,
             input_data="",
             capture_output=True,
             text=True,
             timeout_seconds=60,
         )
+
+    def create_commit_oid(self) -> str:
+        tree = self.bridge_git("write-tree").stdout.strip()
+        return self.bridge_git(
+            "-c",
+            "user.name=Hook Test",
+            "-c",
+            "user.email=hook-test@example.invalid",
+            "commit-tree",
+            tree,
+            "-m",
+            "chore: head",
+        ).stdout.strip()
 
     def bridge_git(
         self, *args: str, cwd: Path | None = None, check: bool = True
@@ -725,13 +740,19 @@ class LefthookBridgeTests(unittest.TestCase):
 
     def test_commit_msg_run_preserves_message_path_with_spaces(self) -> None:
         git_dir = self.prepare_message_repo("repository with spaces").resolve()
-        for name in ("COMMIT_EDITMSG", "MERGE_MSG"):
+        merge_oid = self.create_commit_oid()
+        for name, env in (
+            ("COMMIT_EDITMSG", None),
+            ("MERGE_MSG", {"GIT_REFLOG_ACTION": "merge side"}),
+        ):
             with self.subTest(name=name):
-                for candidate in ("COMMIT_EDITMSG", "MERGE_MSG"):
+                for candidate in ("COMMIT_EDITMSG", "MERGE_MSG", "MERGE_HEAD"):
                     (git_dir / candidate).unlink(missing_ok=True)
+                if env is not None:
+                    (git_dir / "MERGE_HEAD").write_text(f"{merge_oid}\n", encoding="utf-8")
                 message = git_dir / name
                 message.touch()
-                result = self.run_message_job(message.as_posix())
+                result = self.run_message_job(message.as_posix(), env=env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 install, hook = self.argv_calls()
                 self.assertEqual(install, ["install-hooks"])
@@ -788,6 +809,59 @@ class LefthookBridgeTests(unittest.TestCase):
                     hook[hook.index("--") + 1 :], [(wt_git_dir / "COMMIT_EDITMSG").as_posix()]
                 )
 
+    def test_commit_msg_real_git_merge_and_conflict_commit(self) -> None:
+        script = Path("scripts/git-hooks/framework-hooks.sh")
+        (self.repo / script.parent).mkdir(parents=True)
+        shutil.copy2(ROOT / script, self.repo / script)
+        self.stub(".venv/bin/pre-commit")
+        self.install_lefthook_commit_msg_shim()
+        git_id = (
+            "-c",
+            "user.name=Hook Test",
+            "-c",
+            "user.email=hook-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        )
+        (self.repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt", str(script))
+        self.bridge_git(*git_id, "commit", "-m", "chore: base")
+        self.bridge_git("checkout", "-b", "side")
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        self.bridge_git("add", "side.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: side")
+        self.bridge_git("checkout", "-")
+        (self.repo / "main.txt").write_text("main\n", encoding="utf-8")
+        self.bridge_git("add", "main.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: main")
+
+        git_dir = Path(self.bridge_git("rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+        future = time.time_ns() + 3_600_000_000_000
+        os.utime(git_dir / "COMMIT_EDITMSG", ns=(future, future))
+        self.argv_log.unlink(missing_ok=True)
+        self.bridge_git(*git_id, "merge", "--no-edit", "side")
+        install, hook = self.argv_calls()
+        self.assertEqual(install, ["install-hooks"])
+        self.assertEqual(hook[hook.index("--") + 1 :], [(git_dir / "MERGE_MSG").as_posix()])
+
+        self.bridge_git("checkout", "side")
+        (self.repo / "shared.txt").write_text("from-side\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: shared side")
+        self.bridge_git("checkout", "-")
+        (self.repo / "shared.txt").write_text("from-main\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: shared main")
+        conflict = self.bridge_git(*git_id, "merge", "--no-edit", "side", check=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        (self.repo / "shared.txt").write_text("resolved\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt")
+        self.argv_log.unlink(missing_ok=True)
+        self.bridge_git(*git_id, "commit", "--no-edit")
+        install, hook = self.argv_calls()
+        self.assertEqual(install, ["install-hooks"])
+        self.assertEqual(hook[hook.index("--") + 1 :], [(git_dir / "COMMIT_EDITMSG").as_posix()])
+
     def test_commit_msg_resolves_active_message_file(self) -> None:
         git_dir = self.prepare_message_repo("repository with spaces").resolve()
         edit_msg = git_dir / "COMMIT_EDITMSG"
@@ -803,19 +877,41 @@ class LefthookBridgeTests(unittest.TestCase):
         self.assertEqual(self.argv_calls()[1][-1], edit_msg.as_posix())
 
         merge_msg.write_text("fix: merge\n", encoding="utf-8")
+        merge_oid = self.create_commit_oid()
         t0 = 1_700_000_000_000_000_000
         t1 = t0 + 1_000_000_000
-        os.utime(edit_msg, ns=(t0, t0))
-        os.utime(merge_msg, ns=(t1, t1))
-        newer_merge = self.run_message_job(merge_msg.as_posix())
-        self.assertEqual(newer_merge.returncode, 0, newer_merge.stderr)
-        self.assertEqual(self.argv_calls()[1][-1], merge_msg.as_posix())
-
-        os.utime(edit_msg, ns=(t1, t1))
-        os.utime(merge_msg, ns=(t1, t1))
-        equal_mtime = self.run_message_job(merge_msg.as_posix())
-        self.assertEqual(equal_mtime.returncode, 0, equal_mtime.stderr)
-        self.assertEqual(self.argv_calls()[1][-1], edit_msg.as_posix())
+        future = time.time_ns() + 3_600_000_000_000
+        merge_env: Mapping[str, str] = {"GIT_REFLOG_ACTION": "merge side"}
+        pull_env: Mapping[str, str] = {
+            "GIT_REFLOG_ACTION": "pull --no-rebase --no-edit origin main"
+        }
+        rebase_env: Mapping[str, str] = {"GIT_REFLOG_ACTION": "rebase (merge)"}
+        cases = (
+            ("newer-merge-unset-env", None, True, None, t0, t1, edit_msg),
+            ("equal-mtime-merge-env", merge_env, True, None, t1, t1, merge_msg),
+            ("equal-mtime-pull-env", pull_env, True, None, t1, t1, merge_msg),
+            ("future-edit-merge-env", merge_env, True, None, future, t1, merge_msg),
+            ("rebase-merge-action", rebase_env, True, None, t0, t1, edit_msg),
+            ("merge-env-no-merge-head", merge_env, False, None, t0, t1, edit_msg),
+            ("merge-env-rebase-merge-dir", merge_env, True, "rebase-merge", t0, t1, edit_msg),
+            ("merge-env-rebase-apply-dir", merge_env, True, "rebase-apply", t0, t1, edit_msg),
+        )
+        for label, env, has_head, rebase_dir, edit_ns, merge_ns, expected in cases:
+            with self.subTest(case=label):
+                merge_head = git_dir / "MERGE_HEAD"
+                if has_head:
+                    merge_head.write_text(f"{merge_oid}\n", encoding="utf-8")
+                else:
+                    merge_head.unlink(missing_ok=True)
+                for name in ("rebase-merge", "rebase-apply"):
+                    shutil.rmtree(git_dir / name, ignore_errors=True)
+                if rebase_dir is not None:
+                    (git_dir / rebase_dir).mkdir()
+                os.utime(edit_msg, ns=(edit_ns, edit_ns))
+                os.utime(merge_msg, ns=(merge_ns, merge_ns))
+                result = self.run_message_job(expected.as_posix(), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.argv_calls()[1][-1], expected.as_posix())
 
     def test_commit_msg_rejects_unexpected_message_files(self) -> None:
         other_git_dir = self.repo / ".git"

@@ -78,11 +78,31 @@ physical_dir() {
 }
 
 resolve_commit_msg_file() {
-  # Git writes the message file right before invoking commit-msg, so the newer
-  # regular file between COMMIT_EDITMSG and MERGE_MSG in this worktree's git
-  # dir is the active one (automerge and pull merge write MERGE_MSG; commit,
-  # amend, rebase reword, squash and conflicted-merge commit write
-  # COMMIT_EDITMSG). On equal mtimes, `-nt` is false and COMMIT_EDITMSG wins.
+  # lefthook v2.2.2 cannot pass {1} safely: run templates {0}/{1} join unescaped
+  # (internal/run/controller/command/replacer/replacer.go:75,:192, escaping file
+  # templates only), scripts: appends git args unescaped (command/build_script.go),
+  # exec_unix.go:81 runs `sh -c cmdstr`, exec_windows.go builds `"<sh>" -c "<cmdstr>"`
+  # by hand, env: values are not templated (job.go:128 copies job.Env; exec_unix.go:52
+  # applies only os.ExpandEnv), and test_run_values_survive_the_windows_command_line
+  # forbids block scalars and double quotes in `run:`.
+  # Git 2.56.1 commit-msg probe + git/git master source:
+  # - `merge --no-edit` / `merge -e`: arg .git/MERGE_MSG, GIT_REFLOG_ACTION="merge
+  #   <side>", MERGE_HEAD present, COMMIT_EDITMSG older/stale (builtin/merge.c:978,
+  #   :1590 setenv overwrite=0).
+  # - `pull --no-rebase --no-edit`: arg .git/MERGE_MSG, GIT_REFLOG_ACTION="pull ..."
+  #   kept from builtin/pull.c:160; MERGE_HEAD and MERGE_MSG share identical ns mtime.
+  # - `commit`, `--amend`, `commit` after `merge --no-commit` or conflicted merge,
+  #   `merge --continue`: arg .git/COMMIT_EDITMSG, no GIT_REFLOG_ACTION (last three
+  #   keep MERGE_HEAD and MERGE_MSG).
+  # - `rebase -i` reword: arg .git/COMMIT_EDITMSG, GIT_REFLOG_ACTION="rebase (reword)"
+  #   (sequencer.c:1170); `rebase --rebase-merges` writes MERGE_HEAD then runs commit;
+  #   `cherry-pick`, `cherry-pick -e`, `revert --no-edit`, `pull --rebase=merges`
+  #   merge/pick steps do not invoke commit-msg.
+  # Rule: pick MERGE_MSG iff GIT_REFLOG_ACTION starts with word `merge` or `pull`,
+  # MERGE_HEAD verifies, MERGE_MSG is a regular file in git-dir, and neither
+  # rebase-merge nor rebase-apply exists there; else COMMIT_EDITMSG if regular; else
+  # exit 2. Limit: pre-setting GIT_REFLOG_ACTION to another word before `merge`
+  # checks COMMIT_EDITMSG; the PR DCO range check still reads the stored message.
   local git_output git_dir edit_msg merge_msg
   if ! git_output=$(git rev-parse --absolute-git-dir 2>/dev/null && printf .); then
     echo "framework-hooks.sh: commit-msg needs the message file" >&2
@@ -91,9 +111,18 @@ resolve_commit_msg_file() {
   git_dir=${git_output%$'\n.'}
   edit_msg="$git_dir/COMMIT_EDITMSG"
   merge_msg="$git_dir/MERGE_MSG"
-  if [ -f "$merge_msg" ] && { [ ! -f "$edit_msg" ] || [ "$merge_msg" -nt "$edit_msg" ]; }; then
-    msg_file=$merge_msg
-  elif [ -f "$edit_msg" ]; then
+  case ${GIT_REFLOG_ACTION:-} in
+    merge | 'merge '* | $'merge\t'* | pull | 'pull '* | $'pull\t'*)
+      if [[ -f "$merge_msg" &&
+        ! -e "$git_dir/rebase-merge" && ! -L "$git_dir/rebase-merge" &&
+        ! -e "$git_dir/rebase-apply" && ! -L "$git_dir/rebase-apply" ]] &&
+        git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+        msg_file=$merge_msg
+        return 0
+      fi
+      ;;
+  esac
+  if [ -f "$edit_msg" ]; then
     msg_file=$edit_msg
   else
     echo "framework-hooks.sh: commit-msg needs the message file" >&2

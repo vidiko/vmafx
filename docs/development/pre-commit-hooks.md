@@ -155,12 +155,16 @@ At `commit-msg`, `lefthook.yml` passes no `{1}` placeholder to
 `framework-hooks.sh`: lefthook substitutes Git hook arguments raw into its
 `sh -c` command string without shell-escaping custom templates, so an
 apostrophe in a repository or linked-worktree path would break quoting or
-expand shell syntax. Called without a file argument, the bridge resolves the
-newer existing regular file between `COMMIT_EDITMSG` and `MERGE_MSG` in
-`git rev-parse --absolute-git-dir` (`COMMIT_EDITMSG` on equal timestamps) and
-passes it directly to `pre-commit hook-impl`. Direct callers that pass one file
-argument are still validated against those two filenames in the current
-worktree's Git directory.
+expand shell syntax. Called without a file argument, the bridge selects
+`MERGE_MSG` in `git rev-parse --absolute-git-dir` when `GIT_REFLOG_ACTION`
+starts with the word `merge` or `pull`, `MERGE_HEAD` resolves, `MERGE_MSG` is
+a regular file, and neither `rebase-merge` nor `rebase-apply` exists there;
+otherwise it selects `COMMIT_EDITMSG` if regular and passes the file directly
+to `pre-commit hook-impl`. A caller that pre-sets `GIT_REFLOG_ACTION` to
+another first word before `git merge` causes the bridge to check
+`COMMIT_EDITMSG` instead, while the pull-request DCO range check still reads
+the stored commit message. Direct callers that pass one file argument are still
+validated against those two filenames in the current worktree's Git directory.
 
 The Lefthook job allows 300 seconds for the framework, including its first-run
 environment installation. Lefthook fails the job when that time expires.
