@@ -165,3 +165,15 @@ Verification command:
 grep -c '^@docs/' AGENTS.md CLAUDE.md   # 1 each: the hard-rules page
 wc -c docs/development/rebase-sensitive-invariants.md
 ```
+
+### Status update 2026-11-25: lefthook owns commit-msg
+
+The decision above assigned `commit-msg` and `pre-rebase` to the ADR-1241
+dispatchers. With issue #3638 and PR #3653, `lefthook.yml` runs the
+`commit-msg` framework stage through `scripts/git-hooks/framework-hooks.sh`.
+The bridge accepts only `COMMIT_EDITMSG` or `MERGE_MSG` in the current
+worktree's Git directory. The Lefthook job has a 300-second timeout covering
+first-run framework installation. The ADR-1241 dispatchers still handle
+`pre-rebase`. They also handle
+`pre-commit`, `commit-msg` and `pre-push` wherever lefthook does not own the
+corresponding hook, as described in the [hook installation guide](../development/pre-commit-hooks.md#lefthook-and-the-governance-hooks).

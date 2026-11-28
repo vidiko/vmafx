@@ -46,20 +46,25 @@ from scripts.lib.safe_subprocess import TextCommandResult
 from scripts.lib.safe_subprocess import run as run_command
 
 ROOT = Path(__file__).resolve().parents[3]
+LEFTHOOK_CONFIG = ROOT / "lefthook.yml"
 UNSET = "env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY"
 TOOLS = ("git", "pre-commit", "npm", "node")
 EXPECTED = [".pre-commit-config.yaml", "f1", "f2", "f3", "f4", "new.txt"]
 
 
-def framework_block(stage: str) -> str:
+def framework_block(stage: str, *, lefthook_path: Path | None = None) -> str:
     """Return the shipped ``framework-hooks`` run script of a lefthook stage."""
-    config = yaml.safe_load((ROOT / "lefthook.yml").read_text())
+    source = LEFTHOOK_CONFIG if lefthook_path is None else lefthook_path
+    config = yaml.safe_load(source.read_text())
     run = str(config[stage]["commands"]["framework-hooks"]["run"]).strip()
-    match = re.match(r"^bash\s+([^\s]+)", run)
-    if match:
-        script = (ROOT / match.group(1)).read_text()
-        return f"stage={stage}\n" + script
-    return run
+    if re.match(r"^(?:(?:/usr)?/bin/)?sh(?:\s|$)", run):
+        raise ValueError(f"framework-hooks uses bash syntax; refusing POSIX sh in {run!r}")
+    match = re.match(r"^(bash)\s+([^\s]+)", run)
+    if match is None:
+        raise ValueError(f"framework-hooks run command lacks a recognised interpreter: {run!r}")
+    interpreter, script_rel = match.groups()
+    script = (ROOT / script_rel).read_text()
+    return f"#!/usr/bin/env {interpreter}\nstage={stage}\n{script}"
 
 
 class InstallHooksEnvTests(unittest.TestCase):
@@ -165,13 +170,16 @@ class InstallHooksEnvTests(unittest.TestCase):
     def tracked(self, cwd: Path) -> list[str]:
         return self.git("ls-files", cwd=cwd).stdout.split()
 
+    def hook_path(self, checkout: Path) -> Path:
+        hooks = Path(self.git("rev-parse", "--git-path", "hooks", cwd=checkout).stdout.strip())
+        return (hooks if hooks.is_absolute() else checkout / hooks) / "pre-commit"
+
     def commit_with_block(self, block: str, checkout: Path) -> tuple[int, list[str]]:
         """Commit one new file through ``block`` installed as the pre-commit hook."""
-        hooks = Path(self.git("rev-parse", "--git-path", "hooks", cwd=checkout).stdout.strip())
-        hooks = hooks if hooks.is_absolute() else checkout / hooks
-        hooks.mkdir(parents=True, exist_ok=True)
-        hook = hooks / "pre-commit"
-        hook.write_text("#!/bin/sh\n" + block + "\n")
+        hook = self.hook_path(checkout)
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        script = block if block.startswith("#!") else "#!/bin/sh\n" + block
+        hook.write_text(script.rstrip("\n") + "\n")
         hook.chmod(0o755)
         (checkout / "new.txt").write_text("new\n")
         self.git("add", "new.txt", cwd=checkout)
@@ -180,6 +188,11 @@ class InstallHooksEnvTests(unittest.TestCase):
             "commit", "-m", "test: change", cwd=checkout, check=False,
         )  # fmt: skip
         return result.returncode, self.tracked(checkout)
+
+    def planted_lefthook(self, filename: str, run: str) -> Path:
+        path = self.base / filename
+        path.write_text(f"pre-commit:\n  commands:\n    framework-hooks:\n      run: {run}\n")
+        return path
 
     def ran(self) -> bool:
         log = Path(self.env["HOOK_TEST_LOG"])
@@ -229,6 +242,36 @@ class InstallHooksEnvTests(unittest.TestCase):
             self.assertIn(install, block, stage)
             self.assertLess(block.index(install), block.index(runner), stage)
             self.assertIn("pre-commit is missing", block, stage)
+
+    def test_framework_hook_shebang_uses_lefthook_run_interpreter(self) -> None:
+        config = yaml.safe_load(LEFTHOOK_CONFIG.read_text())
+        shipped_run = str(config["pre-commit"]["commands"]["framework-hooks"]["run"]).strip()
+        interpreter = shipped_run.split()[0]
+        with self.subTest(case="positive"):
+            returncode, tracked = self.commit_with_block(
+                framework_block("pre-commit"), self.worktree
+            )
+            self.assertEqual(returncode, 0)
+            self.assertEqual(sorted(tracked), EXPECTED)
+            shebang = self.hook_path(self.worktree).read_text().splitlines()[0]
+            self.assertEqual(shebang, f"#!/usr/bin/env {interpreter}")
+            self.assertNotEqual(shebang, "#!/bin/sh")
+        with self.subTest(case="negative"):
+            sh_cfg = self.planted_lefthook(
+                "lefthook-sh.yml", "sh scripts/git-hooks/framework-hooks.sh pre-commit"
+            )
+            with self.assertRaisesRegex(ValueError, "POSIX sh"):
+                framework_block("pre-commit", lefthook_path=sh_cfg)
+        with self.subTest(case="boundary"):
+            for idx, bad_run in enumerate(
+                (
+                    "scripts/git-hooks/framework-hooks.sh pre-commit",
+                    "python3 scripts/git-hooks/framework-hooks.sh pre-commit",
+                )
+            ):
+                bad_cfg = self.planted_lefthook(f"lefthook-bad-{idx}.yml", bad_run)
+                with self.assertRaisesRegex(ValueError, "recognised interpreter"):
+                    framework_block("pre-commit", lefthook_path=bad_cfg)
 
 
 if __name__ == "__main__":

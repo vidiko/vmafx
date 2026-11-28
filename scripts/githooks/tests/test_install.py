@@ -13,8 +13,11 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
+
+import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -324,6 +327,86 @@ class HookInstallTests(unittest.TestCase):
         self.assertTrue(any(event[0] == "pre-push" for event in events))
         self.assertIn(["mkdocs"], events)
 
+    def test_framework_hooks_commit_msg_runs_configured_stage(self) -> None:
+        message = self.repo / ".git/COMMIT_EDITMSG"
+        message.write_text("bad: update stuff\n", encoding="utf-8")
+        rejected = self.run_command(
+            "bash",
+            "scripts/git-hooks/framework-hooks.sh",
+            "commit-msg",
+            str(message),
+            check=False,
+        )
+        self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+        message.write_text("fix: good\n", encoding="utf-8")
+        accepted = self.run_command(
+            "bash",
+            "scripts/git-hooks/framework-hooks.sh",
+            "commit-msg",
+            str(message),
+            check=False,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        self.assertTrue(any(event[0] == "commit-msg" for event in self.events()))
+
+    def test_shipped_commit_msg_policy_rejects_nonconventional_messages(self) -> None:
+        raw = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+        self.assertIsInstance(raw, dict)
+        repos = raw.get("repos")
+        self.assertIsInstance(repos, list)
+        entries = [
+            repo
+            for repo in repos[:200]
+            if isinstance(repo, dict)
+            and isinstance(repo.get("hooks"), list)
+            and any(
+                isinstance(hook, dict) and hook.get("id") == "conventional-pre-commit"
+                for hook in repo["hooks"][:200]
+            )
+        ]
+        self.assertEqual(len(entries), 1, "expected one conventional-pre-commit repo entry")
+        config = self.repo / ".pre-commit-config.yaml"
+        config.write_text(yaml.safe_dump({"repos": entries}, sort_keys=False), encoding="utf-8")
+        self.run_git("add", ".pre-commit-config.yaml")
+        message = self.repo / ".git/COMMIT_EDITMSG"
+        # Reuse the caller's store so a cached v4.5.0 hook environment needs no network clone.
+        store = os.environ.get("PRE_COMMIT_HOME") or str(Path("~/.cache/pre-commit").expanduser())
+        cases = (
+            ("negative", "update stuff\n", 1),
+            ("positive", "fix: good\n", 0),
+            ("boundary_fork_type", "simd: vectorise the sum\n", 0),
+            ("boundary_absent_type", "bogus: x\n", 1),
+        )
+        for label, text, expected_rc in cases:
+            with self.subTest(case=label):
+                message.write_text(text, encoding="utf-8")
+                result = run_command(
+                    [
+                        "pre-commit",
+                        "run",
+                        "--config",
+                        str(config),
+                        "--hook-stage",
+                        "commit-msg",
+                        "--commit-msg-filename",
+                        str(message),
+                        "conventional-pre-commit",
+                    ],
+                    allowed_executables=("pre-commit",),
+                    cwd=self.repo,
+                    env={**self.env, "PRE_COMMIT_HOME": store},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout_seconds=300,
+                )
+                output = (result.stdout + result.stderr).replace("\r\n", "\n")
+                self.assertEqual(result.returncode, expected_rc, output)
+                expected_line = (
+                    "Passed" if expected_rc == 0 else "Failed\n- hook id: conventional-pre-commit"
+                )
+                self.assertRegex(output, rf"(?m)^Conventional Commit\.+{expected_line}$")
+
     def test_missing_mkdocs_blocks_selected_docs_but_not_direct_non_docs(self) -> None:
         self.install()
         (self.bin / "mkdocs").unlink()
@@ -530,12 +613,29 @@ STATE_SYNC_PRAETORCTL = (
 
 BRIDGE_STUB = """#!/bin/sh
 printf '%s|%s|%s\\n' "$0" "$*" "$(command -v reuse || echo none)" >> "$BRIDGE_LOG"
+if [ -n "${BRIDGE_ARGV_LOG:-}" ]; then
+    printf '%s\\0' "$#" "$@" >> "$BRIDGE_ARGV_LOG"
+fi
 if [ "$1" = hook-impl ]; then cat >> "$BRIDGE_LOG"; fi
 """
 
 
+def replace_lefthook_item(template: str, item: str) -> str:
+    # Lefthook v2.2.2 internal/run/controller/command/replacer/replacer.go:267-294
+    # (replaceQuoted): only quoted placeholders strip one enclosing apostrophe pair.
+    unquoted = re.sub(r"^'(.*)'$", r"\1", item)
+
+    def substitute(match: re.Match[str]) -> str:
+        quote = match[1]
+        return f"{quote}{unquoted}{quote}" if quote else item
+
+    return re.sub(r"""(['"])\{1\}\1|\{1\}""", substitute, template)
+
+
 class LefthookBridgeTests(unittest.TestCase):
     """lefthook.yml hands its framework stages to framework-hooks.sh (ADR-1249, ADR-2012)."""
+
+    repo: Path
 
     def test_run_values_survive_the_windows_command_line(self) -> None:
         # lefthook on Windows starts `sh -c "<run>"` without escaping it, so a
@@ -547,10 +647,312 @@ class LefthookBridgeTests(unittest.TestCase):
             with self.subTest(run=value):
                 self.assertFalse(value.startswith(("|", ">")), "a block scalar hides its quotes")
                 self.assertNotIn('"', value)
-        for stage in ("pre-commit\n", "pre-push {1} {2}\n"):
+        for stage in ("pre-commit\n", "commit-msg\n", "pre-push {1} {2}\n"):
             self.assertEqual(
                 lefthook.count(f"run: bash scripts/git-hooks/framework-hooks.sh {stage}"), 1
             )
+
+    def test_lefthook_declares_commit_msg_framework_hook(self) -> None:
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        self.assertIsInstance(config, dict)
+        self.assertIn("commit-msg", config)
+        commands = config["commit-msg"]["commands"]
+        run_cmd = commands["framework-hooks"]["run"]
+        self.assertEqual(commands["framework-hooks"].get("timeout"), "300s")
+        self.assertNotIn("{1}", run_cmd)
+        self.assertEqual(
+            run_cmd,
+            "bash scripts/git-hooks/framework-hooks.sh commit-msg",
+        )
+
+    def prepare_message_repo(self, name: str) -> Path:
+        self.repo = self.repo / name
+        try:
+            self.repo.mkdir()
+        except OSError as error:
+            self.skipTest(f"cannot create repository path {self.repo}: {error}")
+        self.init_repo()
+        script = Path("scripts/git-hooks/framework-hooks.sh")
+        (self.repo / script.parent).mkdir(parents=True)
+        shutil.copy2(ROOT / script, self.repo / script)
+        self.stub(".venv/bin/pre-commit")
+        return self.repo / ".git"
+
+    def run_message_job(self, item: str, env: Mapping[str, str] | None = None) -> TextCommandResult:
+        self.argv_log.unlink(missing_ok=True)
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        template = config["commit-msg"]["commands"]["framework-hooks"]["run"]
+        job_env = {**self.env, **env} if env else self.env
+        return run_command(
+            ("sh", "-c", replace_lefthook_item(template, item)),
+            allowed_executables=("sh",),
+            cwd=self.repo,
+            env=job_env,
+            input_data="",
+            capture_output=True,
+            text=True,
+            timeout_seconds=60,
+        )
+
+    def create_commit_oid(self) -> str:
+        tree = self.bridge_git("write-tree").stdout.strip()
+        return self.bridge_git(
+            "-c",
+            "user.name=Hook Test",
+            "-c",
+            "user.email=hook-test@example.invalid",
+            "commit-tree",
+            tree,
+            "-m",
+            "chore: head",
+        ).stdout.strip()
+
+    def bridge_git(
+        self, *args: str, cwd: Path | None = None, check: bool = True
+    ) -> TextCommandResult:
+        return run_command(
+            (self.git, "-C", str(cwd or self.repo), *args),
+            allowed_executables=(self.git,),
+            cwd=cwd or self.repo,
+            env=self.env,
+            input_data="",
+            capture_output=True,
+            text=True,
+            check=check,
+            timeout_seconds=60,
+        )
+
+    def install_lefthook_commit_msg_shim(self) -> None:
+        hook = self.repo / ".git/hooks/commit-msg"
+        hook.write_text(
+            f"#!{Path(sys.executable).as_posix()}\n"
+            "import os, pathlib, re, sys, yaml\n"
+            f"cfg = yaml.safe_load(pathlib.Path({str(ROOT / 'lefthook.yml')!r}).read_text())\n"
+            "tpl = cfg['commit-msg']['commands']['framework-hooks']['run']\n"
+            "unq = re.sub(r\"^'(.*)'$\", r'\\1', sys.argv[1])\n"
+            "cmd = re.sub(r'''(['\"])\\{1\\}\\1|\\{1\\}''', "
+            "lambda m: f'{m[1]}{unq}{m[1]}' if m[1] else sys.argv[1], tpl)\n"
+            "os.execvp('sh', ['sh', '-c', cmd])\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        hook.chmod(0o755)
+
+    def test_commit_msg_run_preserves_message_path_with_spaces(self) -> None:
+        git_dir = self.prepare_message_repo("repository with spaces").resolve()
+        merge_oid = self.create_commit_oid()
+        for name, env in (
+            ("COMMIT_EDITMSG", None),
+            ("MERGE_MSG", {"GIT_REFLOG_ACTION": "merge side"}),
+        ):
+            with self.subTest(name=name):
+                for candidate in ("COMMIT_EDITMSG", "MERGE_MSG", "MERGE_HEAD"):
+                    (git_dir / candidate).unlink(missing_ok=True)
+                if env is not None:
+                    (git_dir / "MERGE_HEAD").write_text(f"{merge_oid}\n", encoding="utf-8")
+                message = git_dir / name
+                message.touch()
+                result = self.run_message_job(message.as_posix(), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                install, hook = self.argv_calls()
+                self.assertEqual(install, ["install-hooks"])
+                self.assertEqual(hook[0], "hook-impl")
+                self.assertEqual(hook[hook.index("--") + 1 :], [message.as_posix()])
+
+    def test_commit_msg_linked_worktree_with_shell_metacharacters(self) -> None:
+        script = Path("scripts/git-hooks/framework-hooks.sh")
+        (self.repo / script.parent).mkdir(parents=True)
+        shutil.copy2(ROOT / script, self.repo / script)
+        self.bridge_git("add", str(script))
+        self.bridge_git(
+            "-c",
+            "user.name=Hook Test",
+            "-c",
+            "user.email=hook-test@example.invalid",
+            "commit",
+            "-m",
+            "chore: init",
+        )
+        self.install_lefthook_commit_msg_shim()
+        marker = "vmafx_marker"
+        cases = (
+            ("paired", f"wt '$(touch${{IFS}}{marker};{marker})`touch${{IFS}}{marker}`'"),
+            ("unmatched", f"wt it's $(touch${{IFS}}{marker}) `touch${{IFS}}{marker}`"),
+        )
+        for label, wt_name in cases:
+            with self.subTest(case=label):
+                worktree = self.repo / "worktrees" / wt_name
+                self.bridge_git("worktree", "add", "-b", f"topic-{label}", str(worktree))
+                self.stub(f"worktrees/{wt_name}/.venv/bin/pre-commit")
+                self.argv_log.unlink(missing_ok=True)
+                result = self.bridge_git(
+                    "-c",
+                    "user.name=Hook Test",
+                    "-c",
+                    "user.email=hook-test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fix: linked worktree",
+                    cwd=worktree,
+                    check=False,
+                )
+                self.assertFalse((worktree / marker).exists(), "shell expanded worktree path")
+                self.assertNotIn(marker, result.stderr)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                wt_git_dir = Path(
+                    self.bridge_git("rev-parse", "--absolute-git-dir", cwd=worktree).stdout.strip()
+                ).resolve()
+                install, hook = self.argv_calls()
+                self.assertEqual(install, ["install-hooks"])
+                self.assertEqual(
+                    hook[hook.index("--") + 1 :], [(wt_git_dir / "COMMIT_EDITMSG").as_posix()]
+                )
+
+    def test_commit_msg_real_git_merge_and_conflict_commit(self) -> None:
+        script = Path("scripts/git-hooks/framework-hooks.sh")
+        (self.repo / script.parent).mkdir(parents=True)
+        shutil.copy2(ROOT / script, self.repo / script)
+        self.stub(".venv/bin/pre-commit")
+        self.install_lefthook_commit_msg_shim()
+        git_id = (
+            "-c",
+            "user.name=Hook Test",
+            "-c",
+            "user.email=hook-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        )
+        (self.repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt", str(script))
+        self.bridge_git(*git_id, "commit", "-m", "chore: base")
+        self.bridge_git("checkout", "-b", "side")
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        self.bridge_git("add", "side.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: side")
+        self.bridge_git("checkout", "-")
+        (self.repo / "main.txt").write_text("main\n", encoding="utf-8")
+        self.bridge_git("add", "main.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: main")
+
+        git_dir = Path(self.bridge_git("rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+        future = time.time_ns() + 3_600_000_000_000
+        os.utime(git_dir / "COMMIT_EDITMSG", ns=(future, future))
+        self.argv_log.unlink(missing_ok=True)
+        self.bridge_git(*git_id, "merge", "--no-edit", "side")
+        install, hook = self.argv_calls()
+        self.assertEqual(install, ["install-hooks"])
+        self.assertEqual(hook[hook.index("--") + 1 :], [(git_dir / "MERGE_MSG").as_posix()])
+
+        self.bridge_git("checkout", "side")
+        (self.repo / "shared.txt").write_text("from-side\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: shared side")
+        self.bridge_git("checkout", "-")
+        (self.repo / "shared.txt").write_text("from-main\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt")
+        self.bridge_git(*git_id, "commit", "-m", "feat: shared main")
+        conflict = self.bridge_git(*git_id, "merge", "--no-edit", "side", check=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        (self.repo / "shared.txt").write_text("resolved\n", encoding="utf-8")
+        self.bridge_git("add", "shared.txt")
+        self.argv_log.unlink(missing_ok=True)
+        self.bridge_git(*git_id, "commit", "--no-edit")
+        install, hook = self.argv_calls()
+        self.assertEqual(install, ["install-hooks"])
+        self.assertEqual(hook[hook.index("--") + 1 :], [(git_dir / "COMMIT_EDITMSG").as_posix()])
+
+    def test_commit_msg_resolves_active_message_file(self) -> None:
+        git_dir = self.prepare_message_repo("repository with spaces").resolve()
+        edit_msg = git_dir / "COMMIT_EDITMSG"
+        merge_msg = git_dir / "MERGE_MSG"
+        missing = self.run_message_job(edit_msg.as_posix())
+        self.assertEqual(missing.returncode, 2, missing.stderr)
+        self.assertIn("framework-hooks.sh: commit-msg needs the message file", missing.stderr)
+        self.assertFalse(self.argv_log.exists())
+
+        edit_msg.write_text("fix: edit\n", encoding="utf-8")
+        only_edit = self.run_message_job(edit_msg.as_posix())
+        self.assertEqual(only_edit.returncode, 0, only_edit.stderr)
+        self.assertEqual(self.argv_calls()[1][-1], edit_msg.as_posix())
+
+        merge_msg.write_text("fix: merge\n", encoding="utf-8")
+        merge_oid = self.create_commit_oid()
+        t0 = 1_700_000_000_000_000_000
+        t1 = t0 + 1_000_000_000
+        future = time.time_ns() + 3_600_000_000_000
+        merge_env: Mapping[str, str] = {"GIT_REFLOG_ACTION": "merge side"}
+        pull_env: Mapping[str, str] = {
+            "GIT_REFLOG_ACTION": "pull --no-rebase --no-edit origin main"
+        }
+        rebase_env: Mapping[str, str] = {"GIT_REFLOG_ACTION": "rebase (merge)"}
+        cases = (
+            ("newer-merge-unset-env", None, True, None, t0, t1, edit_msg),
+            ("equal-mtime-merge-env", merge_env, True, None, t1, t1, merge_msg),
+            ("equal-mtime-pull-env", pull_env, True, None, t1, t1, merge_msg),
+            ("future-edit-merge-env", merge_env, True, None, future, t1, merge_msg),
+            ("rebase-merge-action", rebase_env, True, None, t0, t1, edit_msg),
+            ("merge-env-no-merge-head", merge_env, False, None, t0, t1, edit_msg),
+            ("merge-env-rebase-merge-dir", merge_env, True, "rebase-merge", t0, t1, edit_msg),
+            ("merge-env-rebase-apply-dir", merge_env, True, "rebase-apply", t0, t1, edit_msg),
+        )
+        for label, env, has_head, rebase_dir, edit_ns, merge_ns, expected in cases:
+            with self.subTest(case=label):
+                merge_head = git_dir / "MERGE_HEAD"
+                if has_head:
+                    merge_head.write_text(f"{merge_oid}\n", encoding="utf-8")
+                else:
+                    merge_head.unlink(missing_ok=True)
+                for name in ("rebase-merge", "rebase-apply"):
+                    shutil.rmtree(git_dir / name, ignore_errors=True)
+                if rebase_dir is not None:
+                    (git_dir / rebase_dir).mkdir()
+                os.utime(edit_msg, ns=(edit_ns, edit_ns))
+                os.utime(merge_msg, ns=(merge_ns, merge_ns))
+                result = self.run_message_job(expected.as_posix(), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.argv_calls()[1][-1], expected.as_posix())
+
+    def test_commit_msg_rejects_unexpected_message_files(self) -> None:
+        other_git_dir = self.repo / ".git"
+        git_dir = self.prepare_message_repo("repository with spaces")
+        for path in (
+            git_dir / "unexpected-name",
+            self.repo / "COMMIT_EDITMSG",
+            other_git_dir / "COMMIT_EDITMSG",
+        ):
+            with self.subTest(path=path):
+                path.touch()
+                self.argv_log.unlink(missing_ok=True)
+                result = self.bridge("commit-msg", path.as_posix())
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(path.as_posix(), result.stderr)
+                self.assertFalse(self.argv_log.exists())
+
+    def test_commit_msg_preserves_newlines_in_directory_comparison(self) -> None:
+        git_dir = self.prepare_message_repo("repository")
+        other_dir = git_dir.with_name(".git\n")
+        try:
+            other_dir.mkdir()
+        except OSError as error:
+            self.skipTest(f"cannot create directory with trailing newline: {error}")
+        message = other_dir / "COMMIT_EDITMSG"
+        message.touch()
+        self.argv_log.unlink(missing_ok=True)
+        result = self.bridge("commit-msg", message.as_posix())
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn(message.as_posix().replace("\n", r"\n"), result.stderr)
+        self.assertFalse(self.argv_log.exists())
+
+    def test_commit_msg_rejects_empty_or_missing_file(self) -> None:
+        git_dir = self.prepare_message_repo("repository with spaces")
+        for item in ("", (git_dir / "MERGE_MSG").as_posix()):
+            with self.subTest(item=item):
+                self.argv_log.unlink(missing_ok=True)
+                result = self.bridge("commit-msg", item)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.argv_log.exists())
 
     def test_agent_hook_files_are_in_the_form_lefthook_rewrites_them_to(self) -> None:
         # `lefthook uninstall` (v2.1.14 internal/command/uninstall_ai.go) re-marshals
@@ -574,10 +976,19 @@ class LefthookBridgeTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.repo = Path(temporary.name)
         self.log = self.repo / "bridge.log"
+        self.argv_log = self.repo / "bridge.argv"
         self.bash = shutil.which("bash") or "/bin/bash"
         self.git = shutil.which("git") or "/usr/bin/git"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        self.env["BRIDGE_LOG"] = str(self.log)
+        self.env.update(
+            BRIDGE_LOG=str(self.log),
+            BRIDGE_ARGV_LOG=str(self.argv_log),
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+        )
+        self.init_repo()
+
+    def init_repo(self) -> None:
         run_command(
             (self.git, "init", "--quiet"),
             allowed_executables=(self.git,),
@@ -616,6 +1027,34 @@ class LefthookBridgeTests(unittest.TestCase):
 
     def calls(self) -> list[str]:
         return self.log.read_text(encoding="utf-8").splitlines()
+
+    def argv_calls(self) -> list[list[str]]:
+        # Each call starts with argc so even an empty argument keeps its position.
+        fields = iter(self.argv_log.read_bytes().decode("utf-8").removesuffix("\0").split("\0"))
+        return [[next(fields) for _ in range(int(argc))] for argc in fields]
+
+    def test_hook_dir_follows_core_hooks_path(self) -> None:
+        self.stub(".venv/bin/pre-commit")
+        message = ".git/COMMIT_EDITMSG"
+        (self.repo / message).touch()
+        for hooks_path in ("custom-hooks", (self.repo / "absolute-hooks").as_posix()):
+            with self.subTest(hooks_path=hooks_path):
+                self.log.unlink(missing_ok=True)
+                self.argv_log.unlink(missing_ok=True)
+                run_command(
+                    (self.git, "config", "--local", "core.hooksPath", hooks_path),
+                    allowed_executables=(self.git,),
+                    cwd=self.repo,
+                    env=self.env,
+                    check=True,
+                    timeout_seconds=60,
+                )
+                for args in (("commit-msg", message), ("pre-push", "origin", "url")):
+                    result = self.bridge(*args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [args for args in self.argv_calls() if args[0] == "hook-impl"]
+                hook_dirs = [args[args.index("--hook-dir") + 1] for args in calls]
+                self.assertEqual(hook_dirs, [hooks_path, hooks_path])
 
     def test_repository_virtualenv_layouts_win_and_activate_their_tools(self) -> None:
         for layout in (".venv/bin/pre-commit", ".venv/Scripts/pre-commit.exe"):
@@ -671,19 +1110,60 @@ class LefthookBridgeTests(unittest.TestCase):
             script_text,
         )
 
+    def test_commit_msg_forwards_message_file(self) -> None:
+        self.stub(".venv/bin/pre-commit")
+        message = self.repo / ".git" / "COMMIT_EDITMSG"
+        message.write_text("fix: subject\n", encoding="utf-8")
+        result = self.bridge("commit-msg", message.as_posix())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.argv_calls(),
+            [
+                ["install-hooks"],
+                [
+                    "hook-impl",
+                    "--config=.pre-commit-config.yaml",
+                    "--hook-type=commit-msg",
+                    "--hook-dir",
+                    ".git/hooks",
+                    "--",
+                    message.as_posix(),
+                ],
+            ],
+        )
+
+    def test_commit_msg_requires_message_file_argument(self) -> None:
+        self.stub(".venv/bin/pre-commit")
+        missing = self.bridge("commit-msg")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("framework-hooks.sh: commit-msg needs the message file", missing.stderr)
+        extra = self.bridge("commit-msg", "one", "two")
+        self.assertEqual(extra.returncode, 2)
+        self.assertIn("framework-hooks.sh: commit-msg takes one message file", extra.stderr)
+
     def test_pre_push_forwards_remote_arguments_and_push_refs(self) -> None:
         self.stub(".venv/bin/pre-commit")
         refs = "refs/heads/topic 1111 refs/heads/topic 0000\n"
-        result = self.bridge("pre-push", "origin", "https://example.invalid/x.git", stdin=refs)
+        url = "https://example.invalid/x.git"
+        result = self.bridge("pre-push", "origin", url, stdin=refs)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls()
-        self.assertEqual(calls[0].split("|")[1], "install-hooks")
-        self.assertIn(
-            "hook-impl --config=.pre-commit-config.yaml --hook-type=pre-push "
-            "--hook-dir .git/hooks -- origin https://example.invalid/x.git",
-            calls[1],
+        self.assertEqual(
+            self.argv_calls(),
+            [
+                ["install-hooks"],
+                [
+                    "hook-impl",
+                    "--config=.pre-commit-config.yaml",
+                    "--hook-type=pre-push",
+                    "--hook-dir",
+                    ".git/hooks",
+                    "--",
+                    "origin",
+                    url,
+                ],
+            ],
         )
-        self.assertEqual(calls[2] + "\n", refs)
+        self.assertEqual(self.calls()[2] + "\n", refs)
 
     def test_path_fallback_missing_framework_and_unknown_stage(self) -> None:
         tools = self.repo / "tools"
@@ -711,9 +1191,10 @@ class LefthookBridgeTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("pre-commit is missing", missing.stderr)
         self.stub(".venv/bin/pre-commit")
-        unknown = self.bridge("commit-msg")
+        unknown = self.bridge("post-merge")
         self.assertEqual(unknown.returncode, 2)
         self.assertIn("unknown stage", unknown.stderr)
+        self.assertIn("expected pre-commit, commit-msg or pre-push", unknown.stderr)
 
 
 if __name__ == "__main__":
