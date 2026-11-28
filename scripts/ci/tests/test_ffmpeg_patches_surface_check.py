@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from scripts.ci import extract_tree_blobs  # noqa: E402
+from scripts.lib import git_env  # noqa: E402
 from scripts.lib.safe_subprocess import TextCommandResult  # noqa: E402
 from scripts.lib.safe_subprocess import run as run_command  # noqa: E402
 from scripts.lib.scratch_program import remove_tree  # noqa: E402
@@ -44,7 +45,7 @@ PROBE_HEADER_WITHOUT_SYM = "#ifndef VMAF_FIXTURE_PROBE_H_\n#define VMAF_FIXTURE_
 
 def _clean_env(**extra: str) -> dict[str, str]:
     """Return the caller environment without GIT_* and with a fixture-only identity."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env = git_env.drop()
     env.update(
         GIT_CONFIG_GLOBAL=os.devnull,
         GIT_CONFIG_SYSTEM=os.devnull,
@@ -110,6 +111,7 @@ def _run_script(script: Path, cwd: Path, *args: str, **extra: str) -> TextComman
 FIXTURE_REPO_FILES = (
     "scripts/__init__.py",
     "scripts/lib/__init__.py",
+    "scripts/lib/git_env.py",
     "scripts/lib/safe_subprocess.py",
     "scripts/lib/new_scanner_findings.py",
     "scripts/ci/extract_tree_blobs.py",

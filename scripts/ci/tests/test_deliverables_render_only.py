@@ -14,7 +14,6 @@ the render of the fragments, and ``_order.txt`` stay refused.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -24,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from scripts.lib import git_env
 from scripts.lib.safe_subprocess import TextCommandResult
 from scripts.lib.safe_subprocess import run as run_command
 
@@ -82,7 +82,7 @@ class RenderOnlyGateTest(unittest.TestCase):
 
         Prepares commits, tags, and branches in the fixture repository.
         """
-        env = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, **IDENT}
+        env = {**git_env.drop(), **IDENT}
         done = subprocess.run(  # noqa: S603 -- fixed argv, no shell, fixture repo
             [GIT, *args],
             cwd=self.repo,
@@ -110,16 +110,10 @@ class RenderOnlyGateTest(unittest.TestCase):
 
         ADR-3295: runs the gate to verify render-only PR qualification.
         """
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env = git_env.hermetic()
         for key in ("PR_BODY", "BASE_SHA", "HEAD_SHA"):
             env.pop(key, None)
-        env.update(
-            GIT_CONFIG_GLOBAL="/dev/null",
-            GIT_CONFIG_SYSTEM="/dev/null",
-            PR_BODY=body,
-            BASE_SHA=self.base,
-            HEAD_SHA=self.git("rev-parse", "HEAD").strip(),
-        )
+        env.update(PR_BODY=body, BASE_SHA=self.base, HEAD_SHA=self.git("rev-parse", "HEAD").strip())
         return run_command(
             [BASH, str(GATE)],
             allowed_executables=(BASH,),

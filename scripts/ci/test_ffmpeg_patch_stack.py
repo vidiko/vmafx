@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.ci import ffmpeg_shared_series_fixture as shared_series
+from scripts.lib import git_env
 from scripts.lib.safe_subprocess import run as run_command
 from scripts.lib.scratch_program import remove_file, remove_tree, walk_tree
 from scripts.lib.test_scratch_program import windows_rmtree
@@ -187,7 +188,7 @@ class BashInputsLineEndings(unittest.TestCase):
             [git, "-C", str(repo), "check-attr", "eol", "--", *paths],
             allowed_executables={git},
             # The caller's GIT_DIR or GIT_WORK_TREE would point git at another repository.
-            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            env=git_env.drop(),
             capture_output=True,
             text=True,
             check=True,
@@ -327,9 +328,7 @@ class RealReplay(unittest.TestCase):
     def git(self, path: Path, *args: str) -> str:
         # Fixed Git executable and fixture-owned arguments; no shell.
         # Fixture setup needs isolation too: -C does not override hook GIT_*.
-        environment = {
-            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
-        }
+        environment = git_env.drop()
         environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
         git = shutil.which("git")
         self.assertIsNotNone(git)

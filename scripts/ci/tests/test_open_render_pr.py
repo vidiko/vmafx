@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Tests for the scheduled render pull request opener (ADR-3373).
 
+
 Verifies author and cross-repository filtering for open PRs, auto-merge arming
 on parent==base early exit, queued render refresh and fail-closed queue reads,
 detection of untracked files in rendered paths, and required environment
@@ -15,10 +16,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from scripts.lib import git_env
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "ci" / "open-render-pr.sh"
@@ -159,7 +165,7 @@ RENDERED_FILES = (
 
 def fixture_env() -> dict[str, str]:
     """Environment for fixture git calls, without the caller's GIT_* variables."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env = git_env.drop()
     env.update(
         GIT_CONFIG_GLOBAL="/dev/null",
         GIT_CONFIG_NOSYSTEM="1",
@@ -302,7 +308,7 @@ class OpenRenderPrTest(unittest.TestCase):
         remove_env: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         """Execute the open-render-pr script with test harness environment and stubs."""
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env = git_env.drop()
         env.update(
             GIT_CONFIG_GLOBAL="/dev/null",
             GIT_CONFIG_NOSYSTEM="1",
