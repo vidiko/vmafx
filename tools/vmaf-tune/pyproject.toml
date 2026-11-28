@@ -69,6 +69,9 @@ markers = [
     "slow: marks tests as slow (deselect with -m 'not slow')",
 ]
 
+# This package runs ruff's default rule set; extending the root file would
+# replace it with the root `select`, and ruff has no selector for its default
+# set; measured with ruff 0.17.3 on 2026-11-22 (findings under the root rules: 1529).
 [tool.ruff.lint.per-file-ignores]
 # Tests legitimately compare to literal expected values; PLR2004 is noise here.
 "tests/*.py" = ["PLR2004"]
