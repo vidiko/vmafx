@@ -24,6 +24,13 @@ workflow_paths = (
     ".github/workflows/docker-publish-production.yml",
     ".github/workflows/docker-publish-operator-node.yml",
 )
+# The tester workflow publishes images too; its `validate` job is the ref gate
+# (there is no `validate-release` job there).
+DOCKER_WORKFLOW_PATHS = (
+    ".github/workflows/docker-publish-production.yml",
+    ".github/workflows/docker-publish-operator-node.yml",
+    ".github/workflows/docker-publish-tester.yml",
+)
 # ADR-1356: GitHub-native build provenance. Job -> (the job whose `hashes`
 # output names the subjects, the workflow artifact carrying the bundle).
 PROVENANCE_JOBS = {
@@ -57,6 +64,11 @@ VERIFY_TARGETS = {
         '${{ needs.publish-node.outputs.digest }}"',
         '"${{ env.REGISTRY }}/${{ env.NODE_IMAGE }}@'
         '${{ needs.publish-node-sycl.outputs.digest }}"',
+    ),
+    "docker-publish-tester.yml": (
+        '"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@'
+        '${{ steps.index.outputs.digest }}"',
+        '"${IMAGE}@${DIGEST}"',
     ),
 }
 
@@ -329,16 +341,8 @@ def validate_attachment(block: str) -> None:
             raise AssertionError(f"supply-chain.yml does not attach {artifact_path}")
 
 
-def validate_docker_identities(relative_path: str, text: str) -> None:
-    if "--certificate-identity-regexp" in text or "@.*" in text:
-        raise AssertionError(f"{relative_path}: broad certificate identity remains")
-    # The signer is this run's own workflow at GITHUB_REF: the release tag, or
-    # the default branch for an ADR-1347 recovery dispatch. validate-release
-    # admits no other ref, so the identity stays exact without a regexp.
-    expected_identity = (
-        "https://github.com/vidiko/vmafx/.github/workflows/"
-        f"{Path(relative_path).name}@${{GITHUB_REF}}"
-    )
+def _collect_cosign_commands(relative_path: str, text: str) -> list[list[str]]:
+    """Collect one line group per ``cosign verify`` command in an active workflow."""
     lines = text.splitlines()
     commands: list[list[str]] = []
     index = 0
@@ -352,6 +356,58 @@ def validate_docker_identities(relative_path: str, text: str) -> None:
                 command.append(lines[index])
             commands.append(command)
         index += 1
+    return commands
+
+
+def _validate_cosign_verifier(
+    relative_path: str,
+    verifier_index: int,
+    command: list[str],
+    expected_target: str,
+    expected_identity: str,
+    expected_issuer: str,
+) -> None:
+    """Require each verifier to bind identity, issuer and digest in that order."""
+    raw = [line.strip() for line in command]
+    normalized: list[str] = []
+    index = 0
+    while index < len(raw):
+        if raw[index] == "--certificate-identity \\" and index + 1 < len(raw):
+            normalized.append(f"--certificate-identity {raw[index + 1]}")
+            index += 2
+            continue
+        normalized.append(raw[index])
+        index += 1
+    expected_command = [
+        "cosign verify \\",
+        f"--certificate-identity {expected_identity} \\",
+        expected_issuer,
+        expected_target,
+    ]
+    if normalized != expected_command:
+        raise AssertionError(
+            f"{relative_path}: verifier {verifier_index} command drifted; "
+            f"expected {expected_command}, got {normalized}"
+        )
+
+
+def validate_docker_identities(relative_path: str, text: str) -> None:
+    if "--certificate-identity-regexp" in text or "@.*" in text:
+        raise AssertionError(f"{relative_path}: broad certificate identity remains")
+    if re.search(r"""(?:-R|--repo)(?:=|\s+)["']?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+""", text):
+        raise AssertionError(f"{relative_path}: attestation verifier hardcodes a repository slug")
+    if (
+        Path(relative_path).name == "docker-publish-tester.yml"
+        and '-R "${GITHUB_REPOSITORY}"' not in text
+    ):
+        raise AssertionError(
+            f"{relative_path}: attestation verifier does not use the executing repository"
+        )
+    # The signer is this run's own workflow at GITHUB_REF. GITHUB_WORKFLOW_REF
+    # carries owner/repo/workflow@ref, so the identity follows a fork running
+    # the same workflow instead of naming the upstream repository.
+    expected_identity = '"https://github.com/${GITHUB_WORKFLOW_REF}"'
+    commands = _collect_cosign_commands(relative_path, text)
 
     expected_targets = VERIFY_TARGETS[Path(relative_path).name]
     if len(commands) != len(expected_targets):
@@ -379,25 +435,21 @@ def validate_docker_identities(relative_path: str, text: str) -> None:
     for verifier_index, (command, expected_target) in enumerate(
         zip(commands, expected_targets, strict=True), start=1
     ):
-        normalized = [line.strip() for line in command]
-        expected_command = [
-            "cosign verify \\",
-            "--certificate-identity \\",
-            f'"{expected_identity}" \\',
-            expected_issuer,
+        _validate_cosign_verifier(
+            relative_path,
+            verifier_index,
+            command,
             expected_target,
-        ]
-        if normalized != expected_command:
-            raise AssertionError(
-                f"{relative_path}: verifier {verifier_index} command drifted; "
-                f"expected {expected_command}, got {normalized}"
-            )
+            expected_identity,
+            expected_issuer,
+        )
 
 
 def validate(texts: dict[str, str]) -> None:
     parsed = {
         relative_path: jobs(active_text(text))
         for relative_path, text in texts.items()
+        if relative_path in workflow_paths
     }
     for relative_path, blocks in parsed.items():
         if "    environment:" in blocks["validate-release"]:
@@ -446,7 +498,7 @@ def validate(texts: dict[str, str]) -> None:
     if missing_jobs:
         raise AssertionError(f"supply-chain.yml lost provenance jobs {sorted(missing_jobs)}")
     validate_attachment(supply_blocks["attach-to-release"])
-    for relative_path in workflow_paths[1:]:
+    for relative_path in DOCKER_WORKFLOW_PATHS:
         validate_docker_identities(relative_path, active_text(texts[relative_path]))
 
 
@@ -518,7 +570,7 @@ def check_crate_version_queries(block: str) -> None:
 
 texts = {
     relative_path: (root / relative_path).read_text(encoding="utf-8")
-    for relative_path in workflow_paths
+    for relative_path in (*workflow_paths, DOCKER_WORKFLOW_PATHS[-1])
 }
 validate(texts)
 
@@ -552,14 +604,11 @@ verify_with_creds[supply_path] = verify_with_creds[supply_path].replace(
 expect_rejected("Rust crate verifier with id-token permission", verify_with_creds)
 
 production_path = workflow_paths[1]
+expected_identity = '"https://github.com/${GITHUB_WORKFLOW_REF}"'
 bad_identity = deepcopy(texts)
-expected_identity = (
-    "https://github.com/vidiko/vmafx/.github/workflows/"
-    "docker-publish-production.yml@${GITHUB_REF}"
-)
 bad_identity[production_path] = bad_identity[production_path].replace(
     expected_identity,
-    "https://github.com/evil/other/.github/workflows/other.yml@refs/tags/${PUBLISH_TAG}",
+    '"https://github.com/evil/other/.github/workflows/other.yml@refs/tags/${PUBLISH_TAG}"',
     1,
 )
 expect_rejected("one wrong certificate identity", bad_identity)
@@ -583,29 +632,63 @@ expect_rejected("the vmafx PyPI job outside pypi-publish", wrong_pypi_environmen
 tag_bound_identity = deepcopy(texts)
 tag_bound_identity[production_path] = tag_bound_identity[production_path].replace(
     expected_identity,
-    expected_identity.replace("${GITHUB_REF}", "refs/tags/${PUBLISH_TAG}"),
+    '"https://github.com/vidiko/vmafx/.github/workflows/'
+    'docker-publish-production.yml@refs/tags/${PUBLISH_TAG}"',
     1,
 )
 expect_rejected("a verifier bound to the tag ref", tag_bound_identity)
 
+# A verifier that names a fixed repository fails on every fork that runs it.
+# Plant the fixed slug next to the existing dynamic flag: replacing the flag
+# would also trip the "does not use the executing repository" guard and hide
+# whether the slug detector itself works.
+fixed_repository = deepcopy(texts)
+tester_path = DOCKER_WORKFLOW_PATHS[-1]
+fixed_repository[tester_path] = fixed_repository[tester_path].replace(
+    '-R "${GITHUB_REPOSITORY}"',
+    '-R "${GITHUB_REPOSITORY}" \\\n            -R vidiko/vmafx',
+    1,
+)
+assert '-R "${GITHUB_REPOSITORY}"' in fixed_repository[tester_path]
+assert fixed_repository[tester_path] != texts[tester_path]
+expect_rejected("a verifier hardcoding a fixed repository", fixed_repository)
+
+# The identity is the same string in every verifier, so swapping two of them
+# would be a no-op. Plant the defect the per-command comparison exists for:
+# the second verifier's identity clause is detached and parked after its target,
+# where the old `text.count(IDENTITY) == n` check would still have passed.
 misbound_identities = deepcopy(texts)
-identity_clause_pattern = re.compile(
-    rf'(?m)^[ \t]+--certificate-identity \\\n'
-    rf'[ \t]+"{re.escape(expected_identity)}" \\\n'
-)
-identity_clauses = list(identity_clause_pattern.finditer(misbound_identities[production_path]))
-if len(identity_clauses) != 3:
+production_text = misbound_identities[production_path]
+production_lines = production_text.splitlines(keepends=True)
+command_starts = [
+    index
+    for index, line in enumerate(production_lines)
+    if re.match(r"^\s+cosign verify \\$", line)
+]
+if len(command_starts) != 3:
     raise AssertionError("identity-clause fixture anchors are absent")
-first_clause = identity_clauses[0].group(0)
-second_clause = identity_clauses[1]
-misbound = (
-    misbound_identities[production_path][: second_clause.start()]
-    + misbound_identities[production_path][second_clause.end() :]
+second_start = command_starts[1]
+second_end = second_start + 1
+while second_end < len(production_lines) and production_lines[
+    second_end - 1
+].rstrip().endswith("\\"):
+    second_end += 1
+if production_lines[second_end - 1].rstrip().endswith("\\"):
+    raise AssertionError(f"{production_path}: truncated cosign verifier")
+second_block = "".join(production_lines[second_start:second_end])
+identity_clause = re.search(
+    r'(?m)^[ \t]+--certificate-identity \\\n'
+    rf'[ \t]+{re.escape(expected_identity)} \\\n',
+    second_block,
 )
+if identity_clause is None:
+    raise AssertionError("identity-clause fixture anchor is absent from verifier 2")
+stripped_second = second_block.replace(identity_clause.group(0), "", 1)
 misbound_identities[production_path] = (
-    misbound[: identity_clauses[0].end()]
-    + first_clause
-    + misbound[identity_clauses[0].end() :]
+    "".join(production_lines[:second_start])
+    + stripped_second
+    + identity_clause.group(0)
+    + "".join(production_lines[second_end:])
 )
 expect_rejected("certificate identities detached from verifiers", misbound_identities)
 
