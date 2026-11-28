@@ -107,6 +107,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import BinaryIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -129,6 +130,26 @@ MAX_COMMIT_MESSAGE_LINES = 1_459 * 4
 # Git's scissors line; in editor mode, a verbose diff follows comment lines below it.
 SCISSORS_TAIL = b" ------------------------ >8 ------------------------"
 VERBOSE_DIFF_HEAD = b"diff --git "
+DIFF_EXTENDED_HEADERS = (
+    b"old mode ",
+    b"new mode ",
+    b"deleted file mode ",
+    b"new file mode ",
+    b"copy from ",
+    b"copy to ",
+    b"rename from ",
+    b"rename to ",
+    b"similarity index ",
+    b"dissimilarity index ",
+    b"index ",
+)
+DIFF_NO_NEWLINE = b"\\ No newline at end of file"
+DIFF_HUNK_RE = re.compile(rb"^@@ -[0-9]{1,9}(?:,([0-9]{1,9}))? \+[0-9]{1,9}(?:,([0-9]{1,9}))? @@")
+DIFF_HUNK_DELTAS: dict[bytes, tuple[int, int]] = {
+    b" ": (1, 1),
+    b"-": (1, 0),
+    b"+": (0, 1),
+}
 # Characters Git's core.commentChar=auto may pick (builtin/commit.c, git v2.56.1).
 AUTO_COMMENT_CANDIDATES = tuple("#;@!$%^&|:")
 # PRs 2906-3395, 300 bodies (corpus sha256 5a4d6f5c3cbf), measured 2026-11-11;
@@ -1108,38 +1129,239 @@ def scissors_prefix(raw: bytes, prefixes: tuple[str, ...]) -> str | None:
     return None
 
 
+@dataclass
+class _ScissorsBlock:
+    start: int | None = None
+    prefix: str = ""
+    has_comment: bool = False
+
+
+@dataclass
+class _DiffState:
+    phase: str = "start"
+    old_rem: int = 0
+    new_rem: int = 0
+    can_noeol: bool = False
+    pending_pos: int | None = None
+
+
+def _is_diff_git_line(line: bytes) -> bool:
+    """Match a non-empty 'diff --git ' file header line."""
+    return line.startswith(VERBOSE_DIFF_HEAD) and len(line) > len(VERBOSE_DIFF_HEAD)
+
+
+def _is_binary_diff_line(line: bytes) -> bool:
+    """Match Git's 'Binary files <a-path> and <b-path> differ' summary line."""
+    return (
+        line.startswith(b"Binary files ")
+        and line.endswith(b" differ")
+        and len(line) > len(b"Binary files  differ")
+    )
+
+
+def _start_hunk(line: bytes, state: _DiffState, pos: int) -> bool:
+    """Parse a unified-diff hunk header and initialize its expected line counts."""
+    match = DIFF_HUNK_RE.match(line)
+    if match is None:
+        return False
+    old_text, new_text = match.group(1), match.group(2)
+    state.old_rem = 1 if old_text is None else int(old_text)
+    state.new_rem = 1 if new_text is None else int(new_text)
+    state.can_noeol = False
+    if state.old_rem == 0 and state.new_rem == 0:
+        state.phase = "after_hunk"
+        state.pending_pos = None
+    else:
+        state.phase = "in_hunk"
+        if state.pending_pos is None:
+            state.pending_pos = pos
+    return True
+
+
+def _step_header_phase(line: bytes, state: _DiffState, pos: int) -> bool:
+    """Advance from a 'diff --git ' or extended-header state."""
+    if state.phase == "ext_header" and _is_diff_git_line(line):
+        state.phase = "diff_head"
+        state.pending_pos = pos
+        return True
+    if line.startswith(DIFF_EXTENDED_HEADERS):
+        state.phase = "ext_header"
+        state.pending_pos = None
+        return True
+    if line.startswith(b"--- "):
+        state.phase = "need_plus"
+        if state.pending_pos is None:
+            state.pending_pos = pos
+        return True
+    if _is_binary_diff_line(line):
+        state.phase = "after_binary"
+        state.pending_pos = None
+        return True
+    return _start_hunk(line, state, pos)
+
+
+def _step_hunk_line(line: bytes, state: _DiffState) -> bool:
+    """Consume one counted hunk body line or a legal no-newline marker."""
+    if line == DIFF_NO_NEWLINE:
+        ok = state.can_noeol and 0 in (state.old_rem, state.new_rem)
+        state.can_noeol = False
+        return ok
+    delta = DIFF_HUNK_DELTAS.get(line[:1])
+    if delta is None or state.old_rem < delta[0] or state.new_rem < delta[1]:
+        return False
+    state.old_rem -= delta[0]
+    state.new_rem -= delta[1]
+    state.can_noeol = True
+    if state.old_rem == 0 and state.new_rem == 0:
+        state.phase = "after_hunk"
+        state.pending_pos = None
+    return True
+
+
+def _step_after_hunk(line: bytes, state: _DiffState, pos: int) -> bool:
+    """Advance from a completed hunk to no-newline, next hunk, or next file."""
+    if line == DIFF_NO_NEWLINE and state.can_noeol:
+        state.can_noeol = False
+        return True
+    if _is_diff_git_line(line):
+        state.can_noeol = False
+        state.phase = "diff_head"
+        state.pending_pos = pos
+        return True
+    return _start_hunk(line, state, pos)
+
+
+def _step_diff_line(raw: bytes, state: _DiffState, pos: int) -> bool:
+    """Advance the diff grammar by one raw line; return False when the grammar breaks."""
+    line = raw.removesuffix(b"\n").removesuffix(b"\r")
+    if state.phase in ("start", "after_binary"):
+        result = _is_diff_git_line(line)
+        if result:
+            state.phase = "diff_head"
+            state.pending_pos = pos
+    elif state.phase in ("diff_head", "ext_header"):
+        result = _step_header_phase(line, state, pos)
+    elif state.phase == "need_plus":
+        state.phase = "need_hunk"
+        result = line.startswith(b"+++ ")
+    elif state.phase == "need_hunk":
+        result = _start_hunk(line, state, pos)
+    elif state.phase == "in_hunk":
+        result = _step_hunk_line(line, state)
+    else:
+        result = _step_after_hunk(line, state, pos)
+    return result
+
+
+def _append_bounded(data: bytearray, chunk: bytes, path: Path) -> None:
+    """Append chunk to data and enforce MAX_COMMIT_MESSAGE_BYTES."""
+    data += chunk
+    if len(data) > MAX_COMMIT_MESSAGE_BYTES:
+        raise InputBoundError(
+            f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+        )
+
+
+def _read_tail_into(stream: BinaryIO, data: bytearray, path: Path) -> None:
+    """Read every remaining byte after a broken diff suffix as message text."""
+    remaining = MAX_COMMIT_MESSAGE_BYTES + 1 - len(data)
+    if remaining > 0:
+        _append_bounded(data, stream.read(remaining), path)
+    if stream.read(1):
+        raise InputBoundError(
+            f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+        )
+
+
+def _consume_diff_suffix(
+    stream: BinaryIO, first_raw: bytes, first_pos: int, path: Path
+) -> int | None:
+    """Validate verbose diff lines to EOF; return None on full match or rewind offset."""
+    state = _DiffState()
+    if not _step_diff_line(first_raw, state, first_pos):
+        return first_pos
+    # HISS-02: bounded by MAX_COMMIT_MESSAGE_BYTES + 1 diff lines before refusing truncation.
+    for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
+        pos = stream.tell()
+        raw = stream.readline(MAX_COMMIT_LOG_BYTES + 1)
+        if not raw:
+            return state.pending_pos
+        if len(raw) > MAX_COMMIT_LOG_BYTES:
+            raise InputBoundError(
+                f"{path}: diff line exceeds MAX_COMMIT_LOG_BYTES ({MAX_COMMIT_LOG_BYTES})"
+            )
+        if not _step_diff_line(raw, state, pos):
+            return pos if state.pending_pos is None else state.pending_pos
+    if stream.read(1):
+        raise InputBoundError(
+            f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+        )
+    return state.pending_pos
+
+
+def _finish_diff_or_tail(
+    stream: BinaryIO,
+    data: bytearray,
+    block_start: int,
+    block_prefix: str,
+    first_raw: bytes,
+    first_pos: int,
+    path: Path,
+) -> tuple[str, str]:
+    """Return message before a valid diff suffix, or check remaining bytes on break."""
+    if not first_raw.endswith(b"\n"):
+        first_raw += stream.readline(MAX_COMMIT_LOG_BYTES + 1 - len(first_raw))
+        if len(first_raw) > MAX_COMMIT_LOG_BYTES:
+            raise InputBoundError(
+                f"{path}: diff line exceeds MAX_COMMIT_LOG_BYTES ({MAX_COMMIT_LOG_BYTES})"
+            )
+    resume = _consume_diff_suffix(stream, first_raw, first_pos, path)
+    if resume is None:
+        return data[:block_start].decode("utf-8"), block_prefix
+    stream.seek(resume)
+    _read_tail_into(stream, data, path)
+    return data.decode("utf-8"), ""
+
+
+def _step_scissors_block(
+    raw: bytes, block: _ScissorsBlock, data_len: int, prefixes: tuple[str, ...]
+) -> int | None:
+    """Update scissors-block state; return block start when raw begins a verbose diff."""
+    if block.start is not None:
+        if block.has_comment and raw.startswith(VERBOSE_DIFF_HEAD):
+            return block.start
+        block.has_comment = True
+        if not raw.startswith(block.prefix.encode("utf-8")):
+            block.start = None
+            block.prefix = ""
+            block.has_comment = False
+    matched = scissors_prefix(raw, prefixes)
+    if matched is not None:
+        block.start = data_len
+        block.prefix = matched
+        block.has_comment = False
+    return None
+
+
 def read_pending_message(path: Path, prefixes: tuple[str, ...], editor: bool) -> tuple[str, str]:
-    """Read a pending message, stopping before Git's verbose diff block in editor mode."""
+    """Read a pending message, exempting only proven verbose diff output in editor mode."""
     active_prefixes = prefixes if editor else ()
     data = bytearray()
-    block_start: int | None = None
-    block_prefix = ""
-    has_comment = False
+    block = _ScissorsBlock()
     try:
         with path.open("rb") as stream:
             # HISS-02: each line adds at least one byte, so the byte bound ends the loop first.
             for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
+                line_pos = stream.tell()
                 raw = stream.readline(MAX_COMMIT_MESSAGE_BYTES + 1)
                 if not raw:
                     break
-                if block_start is not None:
-                    if has_comment and raw.startswith(VERBOSE_DIFF_HEAD):
-                        return data[:block_start].decode("utf-8"), block_prefix
-                    has_comment = True
-                    if not raw.startswith(block_prefix.encode("utf-8")):
-                        block_start = None
-                        block_prefix = ""
-                        has_comment = False
-                matched = scissors_prefix(raw, active_prefixes)
-                if matched is not None:
-                    block_start = len(data)
-                    block_prefix = matched
-                    has_comment = False
-                data += raw
-                if len(data) > MAX_COMMIT_MESSAGE_BYTES:
-                    raise InputBoundError(
-                        f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+                cut_at = _step_scissors_block(raw, block, len(data), active_prefixes)
+                if cut_at is not None:
+                    return _finish_diff_or_tail(
+                        stream, data, cut_at, block.prefix, raw, line_pos, path
                     )
+                _append_bounded(data, raw, path)
         return data.decode("utf-8"), ""
     except (OSError, UnicodeError) as exc:
         raise UsageError(f"{path}: {exc}") from exc
