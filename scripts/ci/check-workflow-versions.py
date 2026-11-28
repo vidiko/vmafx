@@ -66,6 +66,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import yaml  # type: ignore[import-untyped]
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.ci import lint_exceptions
@@ -504,6 +506,8 @@ def check_rust_pins(root: Path, rust_want: str | None) -> list[str]:
 
 
 NODE_VERSION_RE = re.compile(r"node-version:[ \t]*['\"]?([0-9][0-9.]*)['\"]?")
+COSIGN_ANY_RE = re.compile(r"cosign-release:")
+COSIGN_RELEASE_EXPRESSION_RE = re.compile(r"v\$\{\{\s*env\.COSIGN_VERSION\s*\}\}")
 NODE_PRECOMMIT_RE = re.compile(
     r"^default_language_version:[ \t]*\n(?:[ \t]+.*\n)*?[ \t]+node:[ \t]*['\"]?([^'\"\s]+)['\"]?",
     re.MULTILINE,
@@ -573,6 +577,115 @@ def check_node_pins(root: Path, node_want: str | None) -> list[str]:
     return problems
 
 
+def _cosign_mirror_count(text: str) -> int:
+    """Count COSIGN_VERSION keys in the workflow's top-level ``env`` mapping."""
+    root = yaml.compose(text)
+    if not isinstance(root, yaml.MappingNode):
+        return 0
+    for key, value in root.value:
+        if isinstance(key, yaml.ScalarNode) and key.value == "env":
+            if not isinstance(value, yaml.MappingNode):
+                return 0
+            return sum(
+                isinstance(item_key, yaml.ScalarNode) and item_key.value == "COSIGN_VERSION"
+                for item_key, _ in value.value
+            )
+    return 0
+
+
+def _cosign_workflow_shape(document: object) -> tuple[int, int, bool]:
+    """Return installer count, bad inputs and any job/step mirror override."""
+    installers = 0
+    bad_inputs = 0
+    nested = False
+    if not isinstance(document, dict):
+        return installers, bad_inputs, nested
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return installers, bad_inputs, nested
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        job_env = job.get("env")
+        if isinstance(job_env, dict) and "COSIGN_VERSION" in job_env:
+            nested = True
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            step_env = step.get("env")
+            if isinstance(step_env, dict) and "COSIGN_VERSION" in step_env:
+                nested = True
+            uses = step.get("uses")
+            if not isinstance(uses, str) or not uses.strip().lower().startswith(
+                "sigstore/cosign-installer"
+            ):
+                continue
+            installers += 1
+            with_ = step.get("with")
+            if not isinstance(with_, dict):
+                bad_inputs += 1
+                continue
+            release = with_.get("cosign-release")
+            if not isinstance(release, str) or not COSIGN_RELEASE_EXPRESSION_RE.fullmatch(
+                release.strip()
+            ):
+                bad_inputs += 1
+    return installers, bad_inputs, nested
+
+
+def check_cosign_pins(root: Path, cosign_want: str | None) -> list[str]:
+    """Every cosign-installer input is derived from COSIGN_VERSION.
+
+    `with:` inputs cannot source build-config.env at parse time, so each
+    workflow carries one top-level `COSIGN_VERSION` mirror and every
+    `cosign-release:` input must be `v${{ env.COSIGN_VERSION }}`. The workflow
+    is parsed as YAML so flow mappings, quoted keys, duplicate keys and a
+    trailing comment on a literal input resolve the way GitHub reads them.
+    """
+    if not cosign_want:
+        return ["build-config.env defines no COSIGN_VERSION"]
+    workflows = root / ".github" / "workflows"
+    if not workflows.is_dir():
+        return []
+    problems: list[str] = []
+    for path in sorted(workflows.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(root)
+        try:
+            document = yaml.safe_load(text)
+            mirror_count = _cosign_mirror_count(text)
+        except yaml.YAMLError as exc:
+            problems.append(f"{rel}: cannot parse workflow as YAML ({exc})")
+            continue
+        installers, bad_inputs, nested = _cosign_workflow_shape(document)
+        if installers == 0:
+            continue
+        if nested:
+            problems.append(
+                f"{rel}: COSIGN_VERSION is set below the top level; a job or step "
+                "override shadows the workflow mirror"
+            )
+        if mirror_count != 1:
+            problems.append(f"{rel} must declare COSIGN_VERSION exactly once")
+        else:
+            env = document.get("env") if isinstance(document, dict) else None
+            value = env.get("COSIGN_VERSION") if isinstance(env, dict) else None
+            if str(value) != cosign_want:
+                problems.append(
+                    f"{rel} pins COSIGN_VERSION '{value}'; "
+                    f"build-config.env says '{cosign_want}'"
+                )
+        if bad_inputs:
+            problems.append(
+                f"{rel}: {bad_inputs} cosign-installer step(s) do not set "
+                "cosign-release from env.COSIGN_VERSION"
+            )
+    return problems
+
+
 def _read_intel_neo_lock(lock_path: Path) -> tuple[dict[str, object] | None, str | None]:
     try:
         document = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -632,6 +745,7 @@ def main() -> int:
     ver_want = cfg.get("VMAFX_VERSION")
     rust_want = cfg.get("RUST_VERSION")
     node_want = cfg.get("NODE_VERSION")
+    cosign_want = cfg.get("COSIGN_VERSION")
 
     problems: list[str] = []
     problems.extend(check_level_zero_container(root))
@@ -642,6 +756,7 @@ def main() -> int:
     problems.extend(check_mypy_python_version(root, py_want))
     problems.extend(check_rust_pins(root, rust_want))
     problems.extend(check_node_pins(root, node_want))
+    problems.extend(check_cosign_pins(root, cosign_want))
     problems.extend(check_intel_neo_lock(root, neo_want, lz_want))
 
     for problem in problems:
@@ -654,7 +769,7 @@ def main() -> int:
         return 1
     print(
         f"check-workflow-versions: OK (Level Zero {lz_want}, Python CI {py_want}, "
-        f"Rust {rust_want}, Node {node_want}, VMAFx {ver_want})"
+        f"Rust {rust_want}, Node {node_want}, cosign {cosign_want}, VMAFx {ver_want})"
     )
     return 0
 
