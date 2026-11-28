@@ -115,6 +115,8 @@ from scripts.ci import check_python_dependency_locks, ci_tier, lint_exceptions
 from scripts.lib.safe_subprocess import (
     CommandOutputLimitExceeded,
     CommandTimedOut,
+    CommandValidationError,
+    TextCommandResult,
     run,
 )
 
@@ -150,6 +152,8 @@ DIFF_HUNK_DELTAS: dict[bytes, tuple[int, int]] = {
     b"-": (1, 0),
     b"+": (0, 1),
 }
+DIFF_LINE_ERE_SPECIAL = re.compile(r"([.\[\\()*+?{|^$])")
+MAX_DIFF_ATTRIBUTION_LINES = 64
 # Characters Git's core.commentChar=auto may pick (builtin/commit.c, git v2.56.1).
 AUTO_COMMENT_CANDIDATES = tuple("#;@!$%^&|:")
 # PRs 2906-3395, 300 bodies (corpus sha256 5a4d6f5c3cbf), measured 2026-11-11;
@@ -238,15 +242,15 @@ class Commit:
     message: str
 
 
-def run_git(
+def run_git_result(
     args: list[str],
     stdin: str | None = None,
     max_output_bytes: int = MAX_COMMIT_LOG_BYTES,
     bound_name: str = "MAX_COMMIT_LOG_BYTES",
-) -> str:
-    """Run bounded Git; failure never becomes an empty successful answer."""
+) -> TextCommandResult:
+    """Run bounded Git and return the completed process without checking its exit status."""
     try:
-        done = run(
+        return run(
             [GIT, *args],
             allowed_executables=(GIT,),
             input_data=stdin,
@@ -265,8 +269,20 @@ def run_git(
         raise InputBoundError(
             f"git output exceeds {bound_name} ({max_output_bytes}){detail}"
         ) from exc
-    except (OSError, CommandTimedOut) as exc:
+    except (OSError, CommandTimedOut, CommandValidationError) as exc:
         raise UsageError(f"git {' '.join(args)}: {exc}") from exc
+
+
+def run_git(
+    args: list[str],
+    stdin: str | None = None,
+    max_output_bytes: int = MAX_COMMIT_LOG_BYTES,
+    bound_name: str = "MAX_COMMIT_LOG_BYTES",
+) -> str:
+    """Run bounded Git; failure never becomes an empty successful answer."""
+    done = run_git_result(
+        args, stdin=stdin, max_output_bytes=max_output_bytes, bound_name=bound_name
+    )
     if done.returncode != 0:
         raise UsageError(f"git {' '.join(args)} exited {done.returncode}: {done.stderr.strip()}")
     return done.stdout
@@ -314,17 +330,7 @@ def list_head_commit(head: str) -> list[Commit]:
 
 def is_ancestor(base: str, head: str) -> bool:
     """Return True if base is an ancestor of head, False if not or not a valid object."""
-    try:
-        done = run(
-            [GIT, "merge-base", "--is-ancestor", base, head],
-            allowed_executables=(GIT,),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout_seconds=GIT_TIMEOUT_S,
-        )
-    except (OSError, CommandTimedOut) as exc:
-        raise UsageError(f"git merge-base --is-ancestor: {exc}") from exc
+    done = run_git_result(["merge-base", "--is-ancestor", base, head])
     if done.returncode == 0:
         return True
     if done.returncode in (1, 128):
@@ -1299,6 +1305,103 @@ def _consume_diff_suffix(
     return state.pending_pos
 
 
+def _git_exits_zero(args: list[str]) -> bool:
+    """Return True only when bounded Git exits 0; errors and timeouts fail closed."""
+    try:
+        return run_git_result(args).returncode == 0
+    except (InputBoundError, UsageError) as _:
+        return False
+
+
+def _commit_exists(rev: str) -> bool:
+    """Return True when rev resolves to an existing commit object."""
+    return _git_exits_zero(["rev-parse", "-q", "--verify", f"{rev}^{{commit}}"])
+
+
+def _grep_whole_line(patterns: tuple[str, str], target: tuple[str, ...]) -> bool:
+    """Return True only when git grep finds an exact whole-line match (exit 0)."""
+    return _git_exits_zero(
+        [
+            "grep",
+            "-E",
+            "--no-ignore-case",
+            "-q",
+            "-e",
+            patterns[0],
+            "-e",
+            patterns[1],
+            *target,
+            "--",
+        ]
+    )
+
+
+def _line_in_repo(text: str, rev_cache: dict[str, bool]) -> bool:
+    """Check index, HEAD, HEAD^, and tracked worktree files for whole-line text."""
+    escaped = DIFF_LINE_ERE_SPECIAL.sub(r"\\\1", text)
+    # git grep has no -x/--line-regexp switch; anchored POSIX ERE matches whole lines.
+    patterns = (f"^{escaped}$", f"^{escaped}\r$")
+    # GIT_INDEX_FILE set by commit -a or a pathspec commit is honoured by grep --cached
+    # without extra code.
+    if _grep_whole_line(patterns, ("--cached",)):
+        return True
+    # HISS-02: bounded by 2 revisions (HEAD and HEAD^).
+    for rev in ("HEAD", "HEAD^"):
+        exists = rev_cache.get(rev)
+        if exists is None:
+            exists = _commit_exists(rev)
+            rev_cache[rev] = exists
+        if exists and _grep_whole_line(patterns, (rev,)):
+            return True
+    return _grep_whole_line(patterns, ())
+
+
+def _hunk_line_backed(
+    line: str, in_hunk: bool, matched: set[str], rev_cache: dict[str, bool]
+) -> bool:
+    """Confirm one flagged diff line is a hunk body line present in the repository."""
+    if not in_hunk or line[:1] not in ("+", "-", " "):
+        return False
+    text = line[1:]
+    if text in matched:
+        return True
+    if not _line_in_repo(text, rev_cache):
+        return False
+    matched.add(text)
+    return True
+
+
+def _diff_region_backed(stream: BinaryIO, first_pos: int, end_pos: int | None) -> bool:
+    """Verify attributed lines in an exempted diff region match repository content."""
+    stream.seek(first_pos)
+    state = _DiffState()
+    rev_cache: dict[str, bool] = {}
+    matched: set[str] = set()
+    attributed = 0
+    # HISS-02: _consume_diff_suffix bounded diff lines to MAX_COMMIT_MESSAGE_BYTES + 1.
+    for _ in range(MAX_COMMIT_MESSAGE_BYTES + 2):
+        pos = stream.tell()
+        if pos == end_pos:
+            return True
+        raw = stream.readline(MAX_COMMIT_LOG_BYTES + 1)
+        if not raw:
+            return True
+        in_hunk = state.phase == "in_hunk"
+        if not _step_diff_line(raw, state, pos):
+            return False
+        # A verbose diff may show non-UTF-8 file bytes; a flagged line with a replacement
+        # character never matches repository content, so the exemption fails closed.
+        line = raw.removesuffix(b"\n").removesuffix(b"\r").decode("utf-8", errors="replace")
+        if line_attribution_reason(line, "commit message") is None:
+            continue
+        attributed += 1
+        if attributed > MAX_DIFF_ATTRIBUTION_LINES or not _hunk_line_backed(
+            line, in_hunk, matched, rev_cache
+        ):
+            return False
+    return False
+
+
 def _finish_diff_or_tail(
     stream: BinaryIO,
     data: bytearray,
@@ -1316,6 +1419,10 @@ def _finish_diff_or_tail(
                 f"{path}: diff line exceeds MAX_COMMIT_LOG_BYTES ({MAX_COMMIT_LOG_BYTES})"
             )
     resume = _consume_diff_suffix(stream, first_raw, first_pos, path)
+    if (resume is None or resume > first_pos) and not _diff_region_backed(
+        stream, first_pos, resume
+    ):
+        resume = first_pos
     if resume is None:
         return data[:block_start].decode("utf-8"), block_prefix
     stream.seek(resume)
