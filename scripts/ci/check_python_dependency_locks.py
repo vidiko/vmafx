@@ -134,6 +134,14 @@ class ContractError(RuntimeError):
     """A lock or install surface violates the repository contract."""
 
 
+class BoundedReadError(ContractError):
+    """A file cannot be read within the scan's size contract."""
+
+
+MAX_READ_SIZE_BYTES = 4 * 1024 * 1024  # 4 MiB
+MAX_AGGREGATE_CONSUMER_BYTES = 32 * 1024 * 1024  # 32 MiB
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -446,11 +454,37 @@ def parse_manifest(text: str, *, parse_float: Callable[[str], object] = float) -
     return data
 
 
+def read_bounded(path: Path, relative: str, *, max_bytes: int | None = None) -> bytes:
+    """Read at most the cap from a regular file; refuse anything larger."""
+    limit = MAX_READ_SIZE_BYTES if max_bytes is None else max_bytes
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise BoundedReadError(f"{relative}: not a regular file")
+        with path.open("rb") as handle:
+            # One open, and at most one byte past the cap: a file that grows
+            # between a stat and a read, or a path swapped for another file,
+            # is still never loaded past the cap (issue #3688 review).
+            data = handle.read(limit + 1)
+    except OSError as error:
+        raise BoundedReadError(f"{relative}: {error}") from error
+    if len(data) > limit:
+        raise BoundedReadError(f"{relative}: exceeds maximum read limit of {limit} bytes")
+    return data
+
+
+def read_bounded_text(path: Path, relative: str, *, max_bytes: int | None = None) -> str:
+    """Return UTF-8 text through the same size-checked reader."""
+    try:
+        return read_bounded(path, relative, max_bytes=max_bytes).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise BoundedReadError(f"{relative}: {error}") from error
+
+
 def load_manifest(root: Path) -> dict[str, Any]:
     try:
-        text = (root / MANIFEST_PATH).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise ContractError(f"{MANIFEST_PATH}: {error}") from error
+        text = read_bounded_text(root / MANIFEST_PATH, str(MANIFEST_PATH))
+    except BoundedReadError as error:
+        raise ContractError(str(error)) from error
     return parse_manifest(text)
 
 
@@ -525,10 +559,7 @@ def find_uv_input_pins(root: Path, inputs: Iterable[str]) -> list[tuple[str, int
     """Return each exact uv pin with its relative path and line number or TOML key."""
     pins: list[tuple[str, int | str, str]] = []
     for relative in inputs:
-        try:
-            text = (root / relative).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            raise ContractError(f"{relative}: {error}") from error
+        text = read_bounded_text(root / relative, relative)
         for location, requirement in _input_requirements(relative, text):
             match = EXACT_INPUT_PIN_RE.fullmatch(requirement.strip())
             if match and re.sub(r"[-_.]+", "-", match[1]).lower() == "uv":
@@ -563,7 +594,11 @@ def fingerprint_content(relative: str, content: bytes) -> bytes:
         return content
     kept: list[str] = []
     table = ""
-    for line in content.decode("utf-8").splitlines(keepends=True):
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise BoundedReadError(f"{relative}: {error}") from error
+    for line in text.splitlines(keepends=True):
         stripped = line.strip()
         header = _TABLE_HEADER.match(stripped)
         if header:
@@ -585,10 +620,7 @@ def entry_digest(root: Path, entry: dict[str, Any]) -> str:
     digest.update(b"\0")
     for relative in inputs:
         path = root / relative
-        try:
-            content = fingerprint_content(relative, path.read_bytes())
-        except OSError as error:
-            raise ContractError(f"{relative}: {error}") from error
+        content = fingerprint_content(relative, read_bounded(path, relative))
         digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(content)
@@ -1787,6 +1819,47 @@ def scan_uv_version_echo(relative: Path, content: Iterable[str] | str) -> list[s
     return problems
 
 
+def _scan_consumers(root: Path, manifest: dict[str, Any], all_tracked: list[Path]) -> list[str]:
+    """Scan every tracked consumer under the per-file and aggregate caps.
+
+    Each consumer is read first (so the aggregate counts bytes actually read,
+    under the per-file cap) and only then scanned; when the aggregate cap is
+    crossed, the finding names the file that crossed it and how many consumers
+    were left unscanned (issue #3688 review).
+    """
+    problems: list[str] = []
+    consumer_bytes = 0
+    consumers = list(tracked_consumer_paths(root, all_paths=all_tracked))
+    for index, relative in enumerate(consumers):
+        path = root / relative
+        try:
+            raw = read_bounded(path, str(relative))
+        except BoundedReadError as error:
+            problems.append(str(error))
+            continue
+        consumer_bytes += len(raw)
+        if consumer_bytes > MAX_AGGREGATE_CONSUMER_BYTES:
+            problems.append(
+                f"aggregate consumer size {consumer_bytes} exceeds limit of "
+                f"{MAX_AGGREGATE_CONSUMER_BYTES} bytes; the consumer that crossed "
+                f"it is {relative}; {len(consumers) - index - 1} consumers left unscanned"
+            )
+            break
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            problems.append(f"{relative}: {error}")
+            continue
+        consumer_targets = get_manifest_lock_targets_for_consumer(relative, manifest, root)
+        problems.extend(scan_install_commands(relative, text, consumer_targets, root=root))
+        if relative.parts[:2] == (".github", "workflows") and relative.suffix.lower() in {
+            ".yml",
+            ".yaml",
+        }:
+            problems.extend(scan_workflow_checkout_ordering(relative, text, root=root))
+    return problems
+
+
 def _scan_guides(root: Path, all_tracked: list[Path]) -> list[str]:
     """Scan tracked non-history Markdown guides for restated uv versions."""
     problems: list[str] = []
@@ -1858,11 +1931,14 @@ def validate_lock(root: Path, manifest: dict[str, Any], entry: dict[str, Any]) -
     output = entry["output"]
     path = root / output
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as error:
-        return [f"{output}: {error}"]
+        text = read_bounded_text(path, output)
+    except BoundedReadError as error:
+        return [str(error)]
     metadata = read_lock_metadata(text)
-    expected = entry_digest(root, entry)
+    try:
+        expected = entry_digest(root, entry)
+    except BoundedReadError as error:
+        return [*problems, str(error)]
     if metadata.get("input-sha256") != expected:
         problems.append(f"{output}: source fingerprint is stale; run make python-locks-write")
     if metadata.get("uv-version") != manifest.get("uv_version"):
@@ -1960,13 +2036,13 @@ def _check_alias_liveness(root: Path, entries: list[dict[str, Any]]) -> list[str
                     )
                 else:
                     try:
-                        content = consumer_path.read_text(encoding="utf-8")
+                        content = read_bounded_text(consumer_path, consumer)
                         if alias_str not in content:
                             problems.append(
                                 f"{entry['output']}: install alias {alias_str!r} is not used in declared consumer {consumer!r}"
                             )
-                    except (OSError, UnicodeDecodeError) as error:
-                        problems.append(f"{consumer}: {error}")
+                    except BoundedReadError as error:
+                        problems.append(str(error))
     return problems
 
 
@@ -1987,20 +2063,7 @@ def check(root: Path) -> int:
 
         all_tracked = tracked_paths(root)
         problems.extend(_scan_guides(root, all_tracked))
-
-        for relative in tracked_consumer_paths(root, all_paths=all_tracked):
-            try:
-                text = (root / relative).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as error:
-                problems.append(f"{relative}: {error}")
-                continue
-            consumer_targets = get_manifest_lock_targets_for_consumer(relative, manifest, root)
-            problems.extend(scan_install_commands(relative, text, consumer_targets, root=root))
-            if relative.parts[:2] == (".github", "workflows") and relative.suffix.lower() in {
-                ".yml",
-                ".yaml",
-            }:
-                problems.extend(scan_workflow_checkout_ordering(relative, text, root=root))
+        problems.extend(_scan_consumers(root, manifest, all_tracked))
     except (ContractError, subprocess.CalledProcessError) as error:
         problems = [str(error)]
 
@@ -2058,7 +2121,7 @@ def stamp_lock(
     root: Path, manifest: dict[str, Any], entry: dict[str, Any], generated: Path
 ) -> None:
     output = entry["output"]
-    lines = generated.read_text(encoding="utf-8").splitlines()
+    lines = read_bounded_text(generated, str(generated)).splitlines()
     while lines and lines[0].startswith("#"):
         lines.pop(0)
     body = "\n".join(lines).lstrip("\n")
