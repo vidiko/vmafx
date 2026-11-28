@@ -27,8 +27,8 @@ therefore cannot break hooks in the surviving checkout.
 `scripts/git-hooks/framework-hooks.sh`, next to the praetor governance checks
 (`compile-context --verify`, `audit`, `hiss coverage --verify`, `dedupe scan`).
 `post-commit` synchronises private state. The dispatchers keep `commit-msg`
-(Conventional Commits) and `pre-rebase` (worktree drift guard). Install
-lefthook first, then the dispatchers:
+(Conventional Commits and the DCO sign-off) and `pre-rebase` (worktree drift
+guard). Install lefthook first, then the dispatchers:
 
 ```bash
 lefthook install
@@ -135,7 +135,7 @@ change; see `T-HOOKS-WINDOWS-POSIX-FIXTURES-2026-09-30` in
 | Git event | Framework mode, the default | Native mode |
 | --- | --- | --- |
 | `pre-commit` | Configured formatters and checks | Three native formatters |
-| `commit-msg` | Configured Conventional Commits validation | Same framework check |
+| `commit-msg` | Configured Conventional Commits validation and DCO sign-off | Same framework checks |
 | `pre-push` | All configured push checks | Same framework checks |
 | `pre-rebase` | Agent worktree drift guard | Same guard |
 

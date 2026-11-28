@@ -28,6 +28,49 @@ git push --force-with-lease
 field; a sign-off for somebody else does not count. The line must sit in the
 last block of the message, as git writes it.
 
+## Check when committing
+
+The `dco-sign-off-commit-msg` hook checks each message when a commit is made.
+It requires a sign-off matching the author or committer and refuses model or
+coding tool attribution. Merge commits are exempt. For a new commit use
+`git commit -s`; to repair the last commit use `git commit --amend -s --no-edit`.
+
+The hook reads `GIT_EDITOR`, which Git sets to `:` when no editor runs (`-m`,
+`-F`, `--no-edit`). Without an editor, every line is checked as Git stores it.
+With an editor, the sign-off is checked on the text Git keeps, which is the
+text above Git's first scissors line with `-v` or `commit.cleanup=scissors` and
+the whole text otherwise, with comment lines removed unless `commit.cleanup`
+keeps them. Attribution is checked on all text except a verbose diff suffix
+that `-v` writes (a scissors line, comment lines with the same prefix, and
+lines from `diff --git` onward that parse as Git diff output); a `diff --git`
+line directly below a scissors line or any suffix that breaks the diff grammar
+is still checked.
+Under `core.commentChar=auto`, the hook uses the comment string of Git's own
+template lines. The hook reads `commit.cleanup` from Git configuration. If you
+override it with `--cleanup=<mode>` (see `git help commit`), the hook can check
+more or less text than Git stores. For example, when you edit a message with
+`commit.cleanup=scissors` and `--cleanup=strip`, the hook can accept a sign-off
+above the scissors line even if Git keeps a later paragraph that moves the
+sign-off out of the final trailer block. The hook still checks attribution
+below a plain scissors line.
+The binding pull request range check, also run on pre-push, reads stored commit
+messages through `list_head_commit()` in `scripts/ci/check-dco.py`. It catches
+the misplaced sign-off and any forbidden attribution in the stored message.
+
+Limits:
+
+- With `-e` and an exported `GIT_EDITOR=:`, the hook treats the message as
+  unedited.
+- In a verbose diff suffix, up to 64 flagged attribution lines
+  (`MAX_DIFF_ATTRIBUTION_LINES` in `scripts/ci/check-dco.py`) stay exempt only
+  when each is a hunk body line whose whole-line text matches the index,
+  `HEAD`, `HEAD^`, or a tracked worktree file; otherwise the hook checks the
+  whole file as message text. An attribution line copied verbatim from a
+  tracked file, the index, `HEAD`, or `HEAD^` into a hunk body stays exempt in
+  the hook, and the range check (`list_head_commit()`) still reads the stored
+  message and catches it.
+- Git 2.56 deprecates `core.commentChar=auto` (removal planned for Git 3.0).
+
 ## Check before you push
 
 The `dco-sign-off` pre-push hook in `.pre-commit-config.yaml` runs the check on

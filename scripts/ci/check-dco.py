@@ -74,6 +74,8 @@ Usage::
 
     python3 scripts/ci/check-dco.py --merge-base origin/master [--head <rev>]
 
+    python3 scripts/ci/check-dco.py --message-file <path>
+
 ``--merge-base REF`` is the pre-push mode, named like the other pre-push hooks'
 option: it checks the commits the push adds on top of ``REF``, those reachable
 from the outgoing commit but not from ``REF``. The outgoing commit is
@@ -105,6 +107,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import BinaryIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -112,6 +115,8 @@ from scripts.ci import check_python_dependency_locks, ci_tier, lint_exceptions
 from scripts.lib.safe_subprocess import (
     CommandOutputLimitExceeded,
     CommandTimedOut,
+    CommandValidationError,
+    TextCommandResult,
     run,
 )
 
@@ -124,6 +129,33 @@ MAX_COMMITS = 5000
 # origin/master 20fa27ac625e, 6290 messages, measured 2026-11-11; 4x headroom.
 MAX_COMMIT_MESSAGE_BYTES = 70_469 * 4
 MAX_COMMIT_MESSAGE_LINES = 1_459 * 4
+# Git's scissors line; in editor mode, a verbose diff follows comment lines below it.
+SCISSORS_TAIL = b" ------------------------ >8 ------------------------"
+VERBOSE_DIFF_HEAD = b"diff --git "
+DIFF_EXTENDED_HEADERS = (
+    b"old mode ",
+    b"new mode ",
+    b"deleted file mode ",
+    b"new file mode ",
+    b"copy from ",
+    b"copy to ",
+    b"rename from ",
+    b"rename to ",
+    b"similarity index ",
+    b"dissimilarity index ",
+    b"index ",
+)
+DIFF_NO_NEWLINE = b"\\ No newline at end of file"
+DIFF_HUNK_RE = re.compile(rb"^@@ -[0-9]{1,9}(?:,([0-9]{1,9}))? \+[0-9]{1,9}(?:,([0-9]{1,9}))? @@")
+DIFF_HUNK_DELTAS: dict[bytes, tuple[int, int]] = {
+    b" ": (1, 1),
+    b"-": (1, 0),
+    b"+": (0, 1),
+}
+DIFF_LINE_ERE_SPECIAL = re.compile(r"([.\[\\()*+?{|^$])")
+MAX_DIFF_ATTRIBUTION_LINES = 64
+# Characters Git's core.commentChar=auto may pick (builtin/commit.c, git v2.56.1).
+AUTO_COMMENT_CANDIDATES = tuple("#;@!$%^&|:")
 # PRs 2906-3395, 300 bodies (corpus sha256 5a4d6f5c3cbf), measured 2026-11-11;
 # largest 58,966 bytes (PR 3045) and 544 lines (PR 3041); 4x headroom.
 MAX_PR_BODY_BYTES = 58_966 * 4
@@ -210,15 +242,15 @@ class Commit:
     message: str
 
 
-def run_git(
+def run_git_result(
     args: list[str],
     stdin: str | None = None,
     max_output_bytes: int = MAX_COMMIT_LOG_BYTES,
     bound_name: str = "MAX_COMMIT_LOG_BYTES",
-) -> str:
-    """Run bounded Git; failure never becomes an empty successful answer."""
+) -> TextCommandResult:
+    """Run bounded Git and return the completed process without checking its exit status."""
     try:
-        done = run(
+        return run(
             [GIT, *args],
             allowed_executables=(GIT,),
             input_data=stdin,
@@ -237,8 +269,20 @@ def run_git(
         raise InputBoundError(
             f"git output exceeds {bound_name} ({max_output_bytes}){detail}"
         ) from exc
-    except (OSError, CommandTimedOut) as exc:
+    except (OSError, CommandTimedOut, CommandValidationError) as exc:
         raise UsageError(f"git {' '.join(args)}: {exc}") from exc
+
+
+def run_git(
+    args: list[str],
+    stdin: str | None = None,
+    max_output_bytes: int = MAX_COMMIT_LOG_BYTES,
+    bound_name: str = "MAX_COMMIT_LOG_BYTES",
+) -> str:
+    """Run bounded Git; failure never becomes an empty successful answer."""
+    done = run_git_result(
+        args, stdin=stdin, max_output_bytes=max_output_bytes, bound_name=bound_name
+    )
     if done.returncode != 0:
         raise UsageError(f"git {' '.join(args)} exited {done.returncode}: {done.stderr.strip()}")
     return done.stdout
@@ -286,17 +330,7 @@ def list_head_commit(head: str) -> list[Commit]:
 
 def is_ancestor(base: str, head: str) -> bool:
     """Return True if base is an ancestor of head, False if not or not a valid object."""
-    try:
-        done = run(
-            [GIT, "merge-base", "--is-ancestor", base, head],
-            allowed_executables=(GIT,),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout_seconds=GIT_TIMEOUT_S,
-        )
-    except (OSError, CommandTimedOut) as exc:
-        raise UsageError(f"git merge-base --is-ancestor: {exc}") from exc
+    done = run_git_result(["merge-base", "--is-ancestor", base, head])
     if done.returncode == 0:
         return True
     if done.returncode in (1, 128):
@@ -443,6 +477,11 @@ def judge(
         return reason
     if is_exempt_bot_commit(commit, author, author_type):
         return None
+    return signoff_reason(commit)
+
+
+def signoff_reason(commit: Commit) -> str | None:
+    """Require a trailer matching the author or committer."""
     emails = signoff_emails(commit.message)
     if not emails:
         return "no 'Signed-off-by: Name <email>' trailer"
@@ -1033,6 +1072,487 @@ def check(args: argparse.Namespace) -> int:
     return check_pr(args)
 
 
+def message_identity(kind: str) -> tuple[str, str]:
+    """Read the identity Git will use for this commit."""
+    identity = run_git(["var", f"GIT_{kind}_IDENT"]).strip()
+    match = re.match(r"^(.*?)\s+<([^<>\s]+@[^<>\s]+)>\s+\d+\s+[+-]\d{4}$", identity)
+    if not match:
+        raise UsageError(f"git var GIT_{kind}_IDENT: unparseable identity")
+    return match.group(1), match.group(2)
+
+
+def report_message_failure(commit: Commit, reason: str) -> None:
+    """Print advice for a commit that Git has not created yet."""
+    signoff_failed = is_signoff_reason(reason)
+    title = "DCO sign-off" if signoff_failed else "DCO attribution"
+    print(f"::error title={title}::{commit.sha} {commit.subject}: {reason}")
+    print("dco: the commit being made is refused.")
+    if signoff_failed:
+        print("  New commit: git commit -s")
+        print("  Amend: git commit --amend -s --no-edit")
+    else:
+        print(
+            "  Remove model/tool attribution from the message or author identity and commit again."
+        )
+
+
+def git_config_values(keys: tuple[str, ...]) -> dict[str, str]:
+    """Return the last configured value for each matching Git config key."""
+    wanted = {key.lower() for key in keys}
+    values: dict[str, str] = {}
+    # git config --list -z output is bounded by MAX_COMMIT_LOG_BYTES in run_git.
+    for entry in run_git(["config", "--list", "-z"]).split("\0"):
+        key, _, setting = entry.partition("\n")
+        lower = key.lower()
+        if lower in wanted:
+            values.pop(lower, None)
+            values[lower] = setting
+    return values
+
+
+def comment_prefixes() -> tuple[str, ...]:
+    """Return Git's comment string, or every candidate when Git picks one itself."""
+    values = git_config_values(("core.commentchar", "core.commentstring"))
+    value = next(reversed(values.values()), "#")
+    # Git matches core.commentChar/String "auto" without regard to case.
+    if value.isascii() and value.lower() == "auto":
+        return AUTO_COMMENT_CANDIDATES
+    return (value,)
+
+
+def cleanup_mode() -> str:
+    """Return Git's configured commit.cleanup mode in lower case, or empty when unset."""
+    return git_config_values(("commit.cleanup",)).get("commit.cleanup", "").lower()
+
+
+def scissors_prefix(raw: bytes, prefixes: tuple[str, ...]) -> str | None:
+    """Return the comment prefix of a Git scissors line, or None when raw is not one."""
+    line = raw.rstrip(b"\r\n")
+    # Bounded by len(prefixes), at most len(AUTO_COMMENT_CANDIDATES).
+    for prefix in prefixes:
+        if line == prefix.encode("utf-8") + SCISSORS_TAIL:
+            return prefix
+    return None
+
+
+@dataclass
+class _ScissorsBlock:
+    start: int | None = None
+    prefix: str = ""
+    has_comment: bool = False
+
+
+@dataclass
+class _DiffState:
+    phase: str = "start"
+    old_rem: int = 0
+    new_rem: int = 0
+    can_noeol: bool = False
+    pending_pos: int | None = None
+
+
+def _is_diff_git_line(line: bytes) -> bool:
+    """Match a non-empty 'diff --git ' file header line."""
+    return line.startswith(VERBOSE_DIFF_HEAD) and len(line) > len(VERBOSE_DIFF_HEAD)
+
+
+def _is_binary_diff_line(line: bytes) -> bool:
+    """Match Git's 'Binary files <a-path> and <b-path> differ' summary line."""
+    return (
+        line.startswith(b"Binary files ")
+        and line.endswith(b" differ")
+        and len(line) > len(b"Binary files  differ")
+    )
+
+
+def _start_hunk(line: bytes, state: _DiffState, pos: int) -> bool:
+    """Parse a unified-diff hunk header and initialize its expected line counts."""
+    match = DIFF_HUNK_RE.match(line)
+    if match is None:
+        return False
+    old_text, new_text = match.group(1), match.group(2)
+    state.old_rem = 1 if old_text is None else int(old_text)
+    state.new_rem = 1 if new_text is None else int(new_text)
+    state.can_noeol = False
+    if state.old_rem == 0 and state.new_rem == 0:
+        state.phase = "after_hunk"
+        state.pending_pos = None
+    else:
+        state.phase = "in_hunk"
+        if state.pending_pos is None:
+            state.pending_pos = pos
+    return True
+
+
+def _step_header_phase(line: bytes, state: _DiffState, pos: int) -> bool:
+    """Advance from a 'diff --git ' or extended-header state."""
+    if state.phase == "ext_header" and _is_diff_git_line(line):
+        state.phase = "diff_head"
+        state.pending_pos = pos
+        return True
+    if line.startswith(DIFF_EXTENDED_HEADERS):
+        state.phase = "ext_header"
+        state.pending_pos = None
+        return True
+    if line.startswith(b"--- "):
+        state.phase = "need_plus"
+        if state.pending_pos is None:
+            state.pending_pos = pos
+        return True
+    if _is_binary_diff_line(line):
+        state.phase = "after_binary"
+        state.pending_pos = None
+        return True
+    return _start_hunk(line, state, pos)
+
+
+def _step_hunk_line(line: bytes, state: _DiffState) -> bool:
+    """Consume one counted hunk body line or a legal no-newline marker."""
+    if line == DIFF_NO_NEWLINE:
+        ok = state.can_noeol and 0 in (state.old_rem, state.new_rem)
+        state.can_noeol = False
+        return ok
+    delta = DIFF_HUNK_DELTAS.get(line[:1])
+    if delta is None or state.old_rem < delta[0] or state.new_rem < delta[1]:
+        return False
+    state.old_rem -= delta[0]
+    state.new_rem -= delta[1]
+    state.can_noeol = True
+    if state.old_rem == 0 and state.new_rem == 0:
+        state.phase = "after_hunk"
+        state.pending_pos = None
+    return True
+
+
+def _step_after_hunk(line: bytes, state: _DiffState, pos: int) -> bool:
+    """Advance from a completed hunk to no-newline, next hunk, or next file."""
+    if line == DIFF_NO_NEWLINE and state.can_noeol:
+        state.can_noeol = False
+        return True
+    if _is_diff_git_line(line):
+        state.can_noeol = False
+        state.phase = "diff_head"
+        state.pending_pos = pos
+        return True
+    return _start_hunk(line, state, pos)
+
+
+def _step_diff_line(raw: bytes, state: _DiffState, pos: int) -> bool:
+    """Advance the diff grammar by one raw line; return False when the grammar breaks."""
+    line = raw.removesuffix(b"\n").removesuffix(b"\r")
+    if state.phase in ("start", "after_binary"):
+        result = _is_diff_git_line(line)
+        if result:
+            state.phase = "diff_head"
+            state.pending_pos = pos
+    elif state.phase in ("diff_head", "ext_header"):
+        result = _step_header_phase(line, state, pos)
+    elif state.phase == "need_plus":
+        state.phase = "need_hunk"
+        result = line.startswith(b"+++ ")
+    elif state.phase == "need_hunk":
+        result = _start_hunk(line, state, pos)
+    elif state.phase == "in_hunk":
+        result = _step_hunk_line(line, state)
+    else:
+        result = _step_after_hunk(line, state, pos)
+    return result
+
+
+def _append_bounded(data: bytearray, chunk: bytes, path: Path) -> None:
+    """Append chunk to data and enforce MAX_COMMIT_MESSAGE_BYTES."""
+    data += chunk
+    if len(data) > MAX_COMMIT_MESSAGE_BYTES:
+        raise InputBoundError(
+            f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+        )
+
+
+def _read_tail_into(stream: BinaryIO, data: bytearray, path: Path) -> None:
+    """Read every remaining byte after a broken diff suffix as message text."""
+    remaining = MAX_COMMIT_MESSAGE_BYTES + 1 - len(data)
+    if remaining > 0:
+        _append_bounded(data, stream.read(remaining), path)
+    if stream.read(1):
+        raise InputBoundError(
+            f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+        )
+
+
+def _consume_diff_suffix(
+    stream: BinaryIO, first_raw: bytes, first_pos: int, path: Path
+) -> int | None:
+    """Validate verbose diff lines to EOF; return None on full match or rewind offset."""
+    state = _DiffState()
+    if not _step_diff_line(first_raw, state, first_pos):
+        return first_pos
+    # HISS-02: bounded by MAX_COMMIT_MESSAGE_BYTES + 1 diff lines before refusing truncation.
+    for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
+        pos = stream.tell()
+        raw = stream.readline(MAX_COMMIT_LOG_BYTES + 1)
+        if not raw:
+            return state.pending_pos
+        if len(raw) > MAX_COMMIT_LOG_BYTES:
+            raise InputBoundError(
+                f"{path}: diff line exceeds MAX_COMMIT_LOG_BYTES ({MAX_COMMIT_LOG_BYTES})"
+            )
+        if not _step_diff_line(raw, state, pos):
+            return pos if state.pending_pos is None else state.pending_pos
+    if stream.read(1):
+        raise InputBoundError(
+            f"{path}: exceeds MAX_COMMIT_MESSAGE_BYTES ({MAX_COMMIT_MESSAGE_BYTES})"
+        )
+    return state.pending_pos
+
+
+def _git_exits_zero(args: list[str]) -> bool:
+    """Return True only when bounded Git exits 0; errors and timeouts fail closed."""
+    try:
+        return run_git_result(args).returncode == 0
+    except (InputBoundError, UsageError) as _:
+        return False
+
+
+def _commit_exists(rev: str) -> bool:
+    """Return True when rev resolves to an existing commit object."""
+    return _git_exits_zero(["rev-parse", "-q", "--verify", f"{rev}^{{commit}}"])
+
+
+def _grep_whole_line(patterns: tuple[str, str], target: tuple[str, ...]) -> bool:
+    """Return True only when git grep finds an exact whole-line match (exit 0)."""
+    return _git_exits_zero(
+        [
+            "grep",
+            "-E",
+            "--no-ignore-case",
+            "-q",
+            "-e",
+            patterns[0],
+            "-e",
+            patterns[1],
+            *target,
+            "--",
+        ]
+    )
+
+
+def _line_in_repo(text: str, rev_cache: dict[str, bool]) -> bool:
+    """Check index, HEAD, HEAD^, and tracked worktree files for whole-line text."""
+    escaped = DIFF_LINE_ERE_SPECIAL.sub(r"\\\1", text)
+    # git grep has no -x/--line-regexp switch; anchored POSIX ERE matches whole lines.
+    patterns = (f"^{escaped}$", f"^{escaped}\r$")
+    # GIT_INDEX_FILE set by commit -a or a pathspec commit is honoured by grep --cached
+    # without extra code.
+    if _grep_whole_line(patterns, ("--cached",)):
+        return True
+    # HISS-02: bounded by 2 revisions (HEAD and HEAD^).
+    for rev in ("HEAD", "HEAD^"):
+        exists = rev_cache.get(rev)
+        if exists is None:
+            exists = _commit_exists(rev)
+            rev_cache[rev] = exists
+        if exists and _grep_whole_line(patterns, (rev,)):
+            return True
+    return _grep_whole_line(patterns, ())
+
+
+def _hunk_line_backed(
+    line: str, in_hunk: bool, matched: set[str], rev_cache: dict[str, bool]
+) -> bool:
+    """Confirm one flagged diff line is a hunk body line present in the repository."""
+    if not in_hunk or line[:1] not in ("+", "-", " "):
+        return False
+    text = line[1:]
+    if text in matched:
+        return True
+    if not _line_in_repo(text, rev_cache):
+        return False
+    matched.add(text)
+    return True
+
+
+def _diff_region_backed(stream: BinaryIO, first_pos: int, end_pos: int | None) -> bool:
+    """Verify attributed lines in an exempted diff region match repository content."""
+    stream.seek(first_pos)
+    state = _DiffState()
+    rev_cache: dict[str, bool] = {}
+    matched: set[str] = set()
+    attributed = 0
+    # HISS-02: _consume_diff_suffix bounded diff lines to MAX_COMMIT_MESSAGE_BYTES + 1.
+    for _ in range(MAX_COMMIT_MESSAGE_BYTES + 2):
+        pos = stream.tell()
+        if pos == end_pos:
+            return True
+        raw = stream.readline(MAX_COMMIT_LOG_BYTES + 1)
+        if not raw:
+            return True
+        in_hunk = state.phase == "in_hunk"
+        if not _step_diff_line(raw, state, pos):
+            return False
+        # A verbose diff may show non-UTF-8 file bytes; a flagged line with a replacement
+        # character never matches repository content, so the exemption fails closed.
+        line = raw.removesuffix(b"\n").removesuffix(b"\r").decode("utf-8", errors="replace")
+        if line_attribution_reason(line, "commit message") is None:
+            continue
+        attributed += 1
+        if attributed > MAX_DIFF_ATTRIBUTION_LINES or not _hunk_line_backed(
+            line, in_hunk, matched, rev_cache
+        ):
+            return False
+    return False
+
+
+def _finish_diff_or_tail(
+    stream: BinaryIO,
+    data: bytearray,
+    block_start: int,
+    block_prefix: str,
+    first_raw: bytes,
+    first_pos: int,
+    path: Path,
+) -> tuple[str, str]:
+    """Return message before a valid diff suffix, or check remaining bytes on break."""
+    if not first_raw.endswith(b"\n"):
+        first_raw += stream.readline(MAX_COMMIT_LOG_BYTES + 1 - len(first_raw))
+        if len(first_raw) > MAX_COMMIT_LOG_BYTES:
+            raise InputBoundError(
+                f"{path}: diff line exceeds MAX_COMMIT_LOG_BYTES ({MAX_COMMIT_LOG_BYTES})"
+            )
+    resume = _consume_diff_suffix(stream, first_raw, first_pos, path)
+    if (resume is None or resume > first_pos) and not _diff_region_backed(
+        stream, first_pos, resume
+    ):
+        resume = first_pos
+    if resume is None:
+        return data[:block_start].decode("utf-8"), block_prefix
+    stream.seek(resume)
+    _read_tail_into(stream, data, path)
+    return data.decode("utf-8"), ""
+
+
+def _step_scissors_block(
+    raw: bytes, block: _ScissorsBlock, data_len: int, prefixes: tuple[str, ...]
+) -> int | None:
+    """Update scissors-block state; return block start when raw begins a verbose diff."""
+    if block.start is not None:
+        if block.has_comment and raw.startswith(VERBOSE_DIFF_HEAD):
+            return block.start
+        block.has_comment = True
+        if not raw.startswith(block.prefix.encode("utf-8")):
+            block.start = None
+            block.prefix = ""
+            block.has_comment = False
+    matched = scissors_prefix(raw, prefixes)
+    if matched is not None:
+        block.start = data_len
+        block.prefix = matched
+        block.has_comment = False
+    return None
+
+
+def read_pending_message(path: Path, prefixes: tuple[str, ...], editor: bool) -> tuple[str, str]:
+    """Read a pending message, exempting only proven verbose diff output in editor mode."""
+    active_prefixes = prefixes if editor else ()
+    data = bytearray()
+    block = _ScissorsBlock()
+    try:
+        with path.open("rb") as stream:
+            # HISS-02: each line adds at least one byte, so the byte bound ends the loop first.
+            for _ in range(MAX_COMMIT_MESSAGE_BYTES + 1):
+                line_pos = stream.tell()
+                raw = stream.readline(MAX_COMMIT_MESSAGE_BYTES + 1)
+                if not raw:
+                    break
+                cut_at = _step_scissors_block(raw, block, len(data), active_prefixes)
+                if cut_at is not None:
+                    return _finish_diff_or_tail(
+                        stream, data, cut_at, block.prefix, raw, line_pos, path
+                    )
+                _append_bounded(data, raw, path)
+        return data.decode("utf-8"), ""
+    except (OSError, UnicodeError) as exc:
+        raise UsageError(f"{path}: {exc}") from exc
+
+
+def strip_comments(message: str, prefix: str) -> str:
+    """Clean a message as Git does when it drops the lines starting with prefix."""
+    args = ["-c", f"core.commentChar={prefix}", "stripspace", "--strip-comments"]
+    return run_git(args, stdin=message)
+
+
+def selected_comment(text: str, prefixes: tuple[str, ...], block_prefix: str) -> str:
+    """Pick the single comment string Git uses for an edited commit message."""
+    if len(prefixes) == 1:
+        return prefixes[0]
+    if block_prefix:
+        return block_prefix
+    lines = text.splitlines()
+    # Bounded by len(lines) * len(prefixes) (within MAX_COMMIT_MESSAGE_BYTES).
+    for line in reversed(lines):
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                return prefix
+    return "#"
+
+
+def editor_signoff_text(text: str, q: str, cleanup: str, truncate: bool) -> str:
+    """Clean the sign-off portion Git keeps; scissors cuts only when truncate is set."""
+    scissors = q + SCISSORS_TAIL.decode("utf-8")
+    kept: list[str] = []
+    lines = text.split("\n")
+    # Bounded by len(lines) (at most MAX_COMMIT_MESSAGE_BYTES + 1).
+    for line in lines:
+        if truncate and line.rstrip("\r") == scissors:
+            break
+        kept.append(line)
+    cut = "\n".join(kept)
+    if cleanup in ("whitespace", "verbatim", "scissors"):
+        return run_git(["stripspace"], stdin=cut)
+    return strip_comments(cut, q)
+
+
+def check_message_file(path: str) -> int:
+    """Check a pending commit message with Git's effective identities."""
+    editor = os.environ.get("GIT_EDITOR") != ":"
+    prefixes = comment_prefixes() if editor else ()
+    try:
+        text, block_prefix = read_pending_message(Path(path), prefixes, editor)
+    except UsageError as exc:
+        raise UsageError(f"commit message file {path}: {exc}") from exc
+    merge_path = Path(run_git(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())
+    if merge_path.is_file():
+        print("dco: merge commit is exempt.")
+        return 0
+    author_name, author_email = message_identity("AUTHOR")
+    committer_name, committer_email = message_identity("COMMITTER")
+    message = run_git(["stripspace"], stdin=text)
+    if editor:
+        cleanup = cleanup_mode()
+        q = selected_comment(text, prefixes, block_prefix)
+        truncate = bool(block_prefix) or cleanup == "scissors"
+        signoff_text = editor_signoff_text(text, q, cleanup, truncate)
+    else:
+        signoff_text = message
+    stored = signoff_text.splitlines()
+    subject = stored[0] if stored else ""
+    commit = Commit(
+        "(commit being made)",
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+        subject,
+        message,
+    )
+    signoff_commit = replace(commit, message=signoff_text)
+    reason = commit_attribution_reason(commit) or signoff_reason(signoff_commit)
+    if reason:
+        report_message_failure(commit, reason)
+        return 1
+    print("dco: PASS - commit message")
+    return 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse revision, identity, body-source, and enforcement options with environment defaults."""
     env = os.environ.get
@@ -1053,8 +1573,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--landed", action="store_true")
     parser.add_argument("--merge-base", default="", metavar="REF")
+    parser.add_argument("--message-file", default=None, metavar="PATH")
     parser.add_argument("--landing-identity", default=env("LANDING_IDENTITY", ""))
     args = parser.parse_args(argv)
+    if args.message_file == "":
+        parser.error("--message-file needs a path")
     if args.head is None:
         # --merge-base names the pushed commit itself; HEAD_SHA must not replace it.
         args.head = "" if args.merge_base else env("HEAD_SHA", "")
@@ -1064,7 +1587,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     """Validate required inputs and return distinct statuses for policy and usage failures."""
     args = parse_args(argv)
-    if not args.merge_base and (not args.base or not args.head):
+    if args.message_file and any(
+        arg == option or arg.startswith(option + "=")
+        for arg in argv
+        for option in (
+            "--base",
+            "--head",
+            "--merge-base",
+            "--landed",
+            "--pr-body-file",
+            "--pr-body",
+            "--pr-body-from-event",
+        )
+    ):
+        print(
+            "check-dco: --message-file cannot be combined with range, landed or PR body options",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.message_file and not args.merge_base and (not args.base or not args.head):
         print(
             "check-dco: --base and --head (or BASE_SHA and HEAD_SHA), or --merge-base,"
             " are required",
@@ -1078,7 +1619,7 @@ def main(argv: list[str]) -> int:
         )
         return 2
     try:
-        return check(args)
+        return check_message_file(args.message_file) if args.message_file else check(args)
     except InputBoundError as exc:
         print(f"check-dco: {exc}", file=sys.stderr)
         return 1
