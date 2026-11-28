@@ -32,7 +32,7 @@ MAX_COMMAND_LINES = 256
 MAX_STEP_LINES = 10000
 # Skip quoted strings and expansions when finding shell command boundaries or comments.
 WORKFLOW_BOUNDARY_RE = re.compile(
-    r"""\\.|'[^']*'|"(?:\\.|`(?:\\.|[^`\\]++)*`|\$\([^()]*\)|\$\{[^}]*\}|\$|[^"\\$`]++)*"|"""
+    r"""\\.\#?|'[^']*'|"(?:\\.|`(?:\\.|[^`\\]++)*`|\$\([^()]*\)|\$\{[^}]*\}|\$|[^"\\$`]++)*"|"""
     r"""`(?:\\.|[^`\\]++)*`|\$\([^()]*\)|\$\{[^}]*\}|"""
     r"""(?P<stop>\|\||[;|]|&&|(?<![<>])&(?!>)|(?<!\S)\#.*|\Z)"""
 )
@@ -60,8 +60,7 @@ CONTAINER_FORBIDDEN_RE = re.compile(
 )
 CONTAINER_ORT_ASSIGN_RE = re.compile(r"^(?:export\s+)?ORT_VERSION=([0-9]+(?:\.[0-9]+)+)$")
 CONTAINER_HELPER_CMD_RE = re.compile(
-    r"^(?:ORT_VERSION=([0-9]+(?:\.[0-9]+)+)\s+)?"
-    r"python3\s+(?:/build/vmaf/)?scripts/ci/ort_nuget_install\.py"
+    r"^python3\s+(?:/build/vmaf/)?scripts/ci/ort_nuget_install\.py"
     r"((?:\s+--[a-z-]+(?:=|\s+)(?!-)\S+)+)$"
 )
 CONTAINER_HELPER_VERSION_REF_RE = re.compile(
@@ -472,10 +471,10 @@ def _parse_container_segment(raw_seg: str, persistent: list[str], calls: list[st
         return False
     if "ort_nuget_install.py" in seg:
         cmd_match = CONTAINER_HELPER_CMD_RE.fullmatch(seg)
-        if cmd_match is None or not _valid_container_helper_flags(cmd_match.group(2)):
+        if cmd_match is None or not _valid_container_helper_flags(cmd_match.group(1)):
             return False
-        override = cmd_match.group(1) or (persistent[-1].split("=", 1)[1] if persistent else None)
-        tail = cmd_match.group(2)
+        override = persistent[-1].split("=", 1)[1] if persistent else None
+        tail = cmd_match.group(1)
         if override is not None:
             tail = CONTAINER_HELPER_VERSION_REF_RE.sub(rf"\g<1>{override}", tail)
         calls.append(f"ort_nuget_install.py{tail}")
@@ -523,7 +522,7 @@ def _container_helper_calls(lines: list[str], site_idx: int) -> list[str] | None
       { or } outside ${ORT_VERSION}, eval, sh -c, bash -c, env , and quotes outside
       "${ORT_VERSION}" or "$ORT_VERSION"
     - helper simple command matches fullmatch:
-      [ORT_VERSION=<literal>] python3 [/build/vmaf/]scripts/ci/ort_nuget_install.py <flags>
+      python3 [/build/vmaf/]scripts/ci/ort_nuget_install.py <flags>
       (/build/vmaf/ allowed for dev/Containerfile:745), with flags from ort_nuget_install.py
       (--package, --version, --prefix, --pkgconfig-dir, --cache-dir, --print-pin), each at
       most once, and --version in {<literal>, $ORT_VERSION, ${ORT_VERSION}, "${ORT_VERSION}",
@@ -828,44 +827,68 @@ def _load_pins_for_check(
     return packages, pin_findings
 
 
+def _resolve_target_files(root: Path | None, files: list[Path] | None) -> list[Path]:
+    """Return explicit target files or discover candidate files under root."""
+    if files:
+        return files
+    return _find_target_files(root if root else DEFAULT_ROOT)
+
+
+def _scan_target_files(
+    target_files: list[Path],
+    packages: dict[str, dict[str, Any]],
+) -> tuple[list[str], list[tuple[str, str, str, str, Path, int]]]:
+    """Scan candidate files other than the NuGet pin table."""
+    all_findings: list[str] = []
+    all_sites: list[tuple[str, str, str, str, Path, int]] = []
+    for path in target_files:
+        if path.name == "ort-nuget-pins.json":
+            continue
+        findings, sites = scan_file(path, packages=packages)
+        all_findings.extend(findings)
+        all_sites.extend(sites)
+    return all_findings, all_sites
+
+
+def _check_cross_site_digests(
+    all_sites: list[tuple[str, str, str, str, Path, int]],
+) -> list[str]:
+    """Report conflicting SHA-256 digests across sites sharing (name, flavour, version)."""
+    findings: list[str] = []
+    known_pairs: dict[tuple[str, str, str], tuple[str, Path, int]] = {}
+    for entry_name, flavour, version, sha_val, path, line_no in all_sites:
+        key = (entry_name, flavour, version)
+        if key not in known_pairs:
+            known_pairs[key] = (sha_val, path, line_no)
+            continue
+        orig_sha, orig_path, orig_line = known_pairs[key]
+        if orig_sha != sha_val:
+            findings.append(
+                f"{path}:{line_no}: {entry_name}: conflicting sha256 for ({flavour}, {version}): "
+                f"'{sha_val}' vs '{orig_sha}' at {orig_path}:{orig_line}"
+            )
+    return findings
+
+
 def check_tarball_pins(
     root: Path | None = None,
     files: list[Path] | None = None,
 ) -> tuple[int, list[str]]:
     """Scan candidate files for tracked download verification."""
-    target_files = files if files else _find_target_files(root if root else DEFAULT_ROOT)
-    all_findings: list[str] = []
-    all_sites: list[tuple[str, str, str, str, Path, int]] = []
-
+    target_files = _resolve_target_files(root, files)
     try:
         packages, pin_findings = _load_pins_for_check(root, files)
-        all_findings.extend(pin_findings)
     except (OSError, ValueError, KeyError, TypeError) as err:
         return EXIT_ERROR, [f"check_ort_tarball_pins: error: {err}"]
 
-    for path in target_files:
-        if path.name == "ort-nuget-pins.json":
-            continue
-        try:
-            findings, sites = scan_file(path, packages=packages)
-            all_findings.extend(findings)
-            all_sites.extend(sites)
-        except OSError as err:
-            return EXIT_ERROR, [f"check_ort_tarball_pins: error: {err}"]
+    all_findings = list(pin_findings)
+    try:
+        scan_findings, all_sites = _scan_target_files(target_files, packages)
+    except OSError as err:
+        return EXIT_ERROR, [f"check_ort_tarball_pins: error: {err}"]
 
-    known_pairs: dict[tuple[str, str, str], tuple[str, Path, int]] = {}
-    for entry_name, flavour, version, sha_val, path, line_no in all_sites:
-        key = (entry_name, flavour, version)
-        if key in known_pairs:
-            orig_sha, orig_path, orig_line = known_pairs[key]
-            if orig_sha != sha_val:
-                all_findings.append(
-                    f"{path}:{line_no}: {entry_name}: conflicting sha256 for ({flavour}, {version}): "
-                    f"'{sha_val}' vs '{orig_sha}' at {orig_path}:{orig_line}"
-                )
-        else:
-            known_pairs[key] = (sha_val, path, line_no)
-
+    all_findings.extend(scan_findings)
+    all_findings.extend(_check_cross_site_digests(all_sites))
     if all_findings:
         return EXIT_FINDINGS, all_findings
     return EXIT_SUCCESS, []
