@@ -119,6 +119,21 @@ python ai/scripts/measure_quant_drop.py --all
 python ai/scripts/validate_model_registry.py
 ```
 
+## Implementation status postscript (#3606)
+
+The decision above records the original per-model bundle expectation. The
+supply-chain workflow signs the native release archive rather than individual
+ONNX files, so no per-model `<onnx>.sigstore.json` bundles exist.
+[#3606](https://github.com/vidiko/vmafx/issues/3606) removes the registry
+declarations that named bundles before they were produced; per-model signing
+and release integration remain tracked by
+[#1246](https://github.com/vidiko/vmafx/issues/1246) and #3606.
+
+`--tiny-model-verify` remains opt-in and off by default. Enabling it for any
+current entry fails closed. Current usage and requirements are documented in
+[model-registry.md](../ai/model-registry.md) and
+[security.md](../ai/security.md#layer-4-signature-verification-opt-in).
+
 ## References
 
 - [ADR-0129](0129-tinyai-ptq-quantization.md) — PTQ policy.
