@@ -49,12 +49,12 @@ commit-msg:
     framework-hooks:
       # ADR-1249: lefthook owns commit-msg and delegates to the commit-msg stage
       # that .pre-commit-config.yaml declares (conventional-pre-commit --strict).
-      # On POSIX, '{1}' preserves spaces. The bridge accepts only COMMIT_EDITMSG or
-      # MERGE_MSG in this worktree's git dir, so an altered directory fails closed.
-      # This invocation is unproven on Windows (ADR-2012).
+      # Lefthook substitutes git args into sh -c without shell-escaping custom
+      # templates, so the bridge resolves COMMIT_EDITMSG or MERGE_MSG in this
+      # worktree's git dir itself and no path enters shell source (ADR-2012).
       # Allow for first-run framework environment installation. Lefthook fails the job on expiry.
       timeout: 300s
-      run: bash scripts/git-hooks/framework-hooks.sh commit-msg '{1}'
+      run: bash scripts/git-hooks/framework-hooks.sh commit-msg
 
 post-commit:
   commands:

@@ -80,7 +80,10 @@ Two lefthook behaviours affect every checkout that shares the Git directory:
 Keep every `run:` value in `lefthook.yml` on one line and free of double quotes.
 On Windows lefthook passes it to `sh -c` without escaping, so a double quote
 ends the script early; put logic in a script under `scripts/git-hooks/`
-instead. The same test rejects both.
+instead. Lefthook also substitutes custom `{1}` placeholders into `sh -c`
+without shell-escaping Git's hook arguments, so `commit-msg` omits `{1}` and
+`framework-hooks.sh` resolves the message file from Git itself. The same test
+enforces both rules.
 
 ## Windows hosts
 
@@ -140,21 +143,24 @@ change; see `T-HOOKS-WINDOWS-POSIX-FIXTURES-2026-09-30` in
 | Git event | Lefthook (`lefthook.yml`) | Dispatcher (`Framework` mode, default) | Dispatcher (`Native` mode) |
 | --- | --- | --- | --- |
 | `pre-commit` | `framework-hooks.sh pre-commit` plus governance checks | Configured formatters and checks | Three native formatters |
-| `commit-msg` | `framework-hooks.sh commit-msg '{1}'` (Conventional Commits) | Configured Conventional Commits validation | Same framework check |
+| `commit-msg` | `framework-hooks.sh commit-msg` (Conventional Commits) | Configured Conventional Commits validation | Same framework check |
 | `pre-push` | `framework-hooks.sh pre-push {1} {2}` plus governance checks | All configured push checks | Same framework checks |
 | `pre-rebase` | Not declared (`make install-hooks` owns it) | Agent worktree drift guard | Same guard |
 
-Both `framework-hooks.sh` (`commit-msg` and `pre-push`) and the ADR-1241
-dispatcher forward Git's arguments and pushed-ref input to
-`pre-commit hook-impl`. The framework selects checks and changed files
-from `.pre-commit-config.yaml`.
+`framework-hooks.sh` (`pre-push`) and the ADR-1241 dispatcher forward Git's
+arguments and pushed-ref input to `pre-commit hook-impl`. The framework selects
+checks and changed files from `.pre-commit-config.yaml`.
 
-On POSIX, the single quotes keep a message-file path with spaces in one
-argument. The bridge accepts only an existing regular file named
-`COMMIT_EDITMSG` or `MERGE_MSG` in the current worktree's Git directory.
-If apostrophe parsing changes the directory, the bridge rejects the path
-before starting the framework. An unmatched quote stops the shell before
-the bridge runs. This invocation is unproven on Windows.
+At `commit-msg`, `lefthook.yml` passes no `{1}` placeholder to
+`framework-hooks.sh`: lefthook substitutes Git hook arguments raw into its
+`sh -c` command string without shell-escaping custom templates, so an
+apostrophe in a repository or linked-worktree path would break quoting or
+expand shell syntax. Called without a file argument, the bridge resolves the
+newer existing regular file between `COMMIT_EDITMSG` and `MERGE_MSG` in
+`git rev-parse --absolute-git-dir` (`COMMIT_EDITMSG` on equal timestamps) and
+passes it directly to `pre-commit hook-impl`. Direct callers that pass one file
+argument are still validated against those two filenames in the current
+worktree's Git directory.
 
 The Lefthook job allows 300 seconds for the framework, including its first-run
 environment installation. Lefthook fails the job when that time expires.

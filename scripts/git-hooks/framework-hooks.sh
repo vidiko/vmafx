@@ -15,7 +15,7 @@
 # value; scripts/githooks/tests/test_install.py enforces that.
 #
 # Usage: framework-hooks.sh pre-commit
-#        framework-hooks.sh commit-msg MESSAGE_FILE
+#        framework-hooks.sh commit-msg [MESSAGE_FILE]
 #        framework-hooks.sh pre-push REMOTE URL   (push refs on stdin)
 set -euo pipefail
 
@@ -77,17 +77,34 @@ physical_dir() {
   CDPATH='' cd -P -- "$1" && pwd -P && printf .
 }
 
-stage=${stage:-${1:-}}
-if [ "$stage" = commit-msg ]; then
-  if [ "$#" -gt 0 ]; then
-    shift
-  fi
-  if [ "$#" -eq 0 ] || [ -z "$1" ]; then
+resolve_commit_msg_file() {
+  # Git writes the message file right before invoking commit-msg, so the newer
+  # regular file between COMMIT_EDITMSG and MERGE_MSG in this worktree's git
+  # dir is the active one (automerge and pull merge write MERGE_MSG; commit,
+  # amend, rebase reword, squash and conflicted-merge commit write
+  # COMMIT_EDITMSG). On equal mtimes, `-nt` is false and COMMIT_EDITMSG wins.
+  local git_output git_dir edit_msg merge_msg
+  if ! git_output=$(git rev-parse --absolute-git-dir 2>/dev/null && printf .); then
     echo "framework-hooks.sh: commit-msg needs the message file" >&2
     exit 2
   fi
-  if [ "$#" -ne 1 ]; then
-    echo "framework-hooks.sh: commit-msg takes one message file, got $#" >&2
+  git_dir=${git_output%$'\n.'}
+  edit_msg="$git_dir/COMMIT_EDITMSG"
+  merge_msg="$git_dir/MERGE_MSG"
+  if [ -f "$merge_msg" ] && { [ ! -f "$edit_msg" ] || [ "$merge_msg" -nt "$edit_msg" ]; }; then
+    msg_file=$merge_msg
+  elif [ -f "$edit_msg" ]; then
+    msg_file=$edit_msg
+  else
+    echo "framework-hooks.sh: commit-msg needs the message file" >&2
+    exit 2
+  fi
+}
+
+validate_commit_msg_file() {
+  local name parent git_output expected received git_dir
+  if [ -z "$1" ]; then
+    echo "framework-hooks.sh: commit-msg needs the message file" >&2
     exit 2
   fi
   # Git supplies one of two files in this worktree's git dir. Compare physical
@@ -105,6 +122,23 @@ if [ "$stage" = commit-msg ]; then
       "${1//$'\n'/\\n}" "${git_dir//$'\n'/\\n}" >&2
     exit 2
   fi
+  msg_file=$1
+}
+
+msg_file=
+stage=${stage:-${1:-}}
+if [ "$stage" = commit-msg ]; then
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+  if [ "$#" -eq 0 ]; then
+    resolve_commit_msg_file
+  elif [ "$#" -eq 1 ]; then
+    validate_commit_msg_file "$1"
+  else
+    echo "framework-hooks.sh: commit-msg takes one message file, got $#" >&2
+    exit 2
+  fi
 fi
 
 # Installing hook environments also drops GIT_INDEX_FILE (pre-commit/pre-commit#3609).
@@ -116,7 +150,7 @@ case "$stage" in
     ;;
   commit-msg)
     exec "$fw" hook-impl --config=.pre-commit-config.yaml --hook-type=commit-msg \
-      --hook-dir "$(git rev-parse --git-path hooks)" -- "$1"
+      --hook-dir "$(git rev-parse --git-path hooks)" -- "$msg_file"
     ;;
   pre-push)
     if [ "$#" -gt 0 ]; then
